@@ -31,106 +31,170 @@ def test_custom_profile_path_is_respected(tmp_path: Path, monkeypatch) -> None:
 def test_browser_channel_uses_web_chat_not_public_preview() -> None:
     assert TelegramBrowserAdapter.channel_web_url("https://t.me/example_channel") == "https://web.telegram.org/k/#@example_channel"
     assert TelegramBrowserAdapter.channel_web_url("https://t.me/example_channel/123") == "https://web.telegram.org/k/#@example_channel"
+    assert PipelineConfig().source_channel_url == "https://t.me/free_3d_models_download"
 
 
-def test_browser_attachment_regex_matches_file_extension(tmp_path: Path) -> None:
-    class FakeLocator:
-        def __init__(self, selector):
-            self.pattern = None
-            self.selector = selector
-        def count(self):
-            return 0
-        def filter(self, has_text):
-            self.pattern = has_text
+def test_missing_channel_messages_distinguishes_network_wait() -> None:
+    reason = TelegramBrowserAdapter._missing_messages_reason("Waiting for network...")
+    assert "网络" in reason and "代理" in reason
+    assert "登录态" in TelegramBrowserAdapter._missing_messages_reason("Log in with QR")
+
+
+def test_channel_page_and_message_wait_use_configured_timeout(tmp_path: Path) -> None:
+    class Nodes:
+        @property
+        def first(self):
             return self
-    class FakeMessage:
-        def __init__(self):
-            self.locators = []
-        def locator(self, selector):
-            result = FakeLocator(selector)
-            self.locators.append(result)
-            return result
-    message = FakeMessage()
-    TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")._attachment_locators(message)
-    button_result = message.locators[3]
-    assert button_result.pattern.search("商品.rar")
-    assert button_result.pattern.search("下载")
-    assert "[class*='media']" not in message.locators[0].selector
-
-
-def test_browser_prefers_document_card_over_media(tmp_path: Path) -> None:
-    class FakeLocator:
-        def __init__(self, selector):
-            self.selector = selector
+        def wait_for(self, **kwargs):
+            assert kwargs == {"timeout": 180000}
         def count(self):
             return 1
-    class FakeMessage:
+    class Page:
+        url = ""
+        nodes = Nodes()
+        navigations = []
+        def set_default_timeout(self, timeout):
+            assert timeout == 180000
+        def goto(self, url, **kwargs):
+            self.navigations.append((url, kwargs))
+            self.url = url
+        def title(self):
+            return "Telegram Web"
         def locator(self, selector):
-            return FakeLocator(selector)
-    locator = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")._attachment_locators(FakeMessage())
-    assert "document-container" in locator.selector
-    assert "[class*='media']" not in locator.selector
+            assert selector == adapter.message_selector
+            return self.nodes
+    adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox", timeout_seconds=180)
+    page = Page()
+    assert adapter._open_channel_messages(page, "https://t.me/free_3d_models_download") is page.nodes
+    assert page.navigations == [
+        ("https://web.telegram.org/k/", {"wait_until": "domcontentloaded", "timeout": 180000}),
+        ("https://web.telegram.org/k/#@free_3d_models_download",
+         {"wait_until": "domcontentloaded", "timeout": 180000}),
+    ]
+
+
+def test_only_named_zip_rar_cards_are_parsed(tmp_path: Path) -> None:
+    adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")
+    cards = adapter._parse_archive_cards([
+        {"name": "商品.rar", "source": "document"},
+        {"name": "asset.zip", "source": "link"},
+        {"name": "picture.png", "source": "document"},
+        {"name": "../wrong.rar", "source": "name"},
+        {"name": "archive.rar", "source": "unknown"},
+    ])
+    assert [(card.name, card.source) for card in cards] == [
+        ("商品.rar", "document"), ("asset.zip", "link")]
 
 
 def test_unique_messages_count_by_id_not_dom_nodes() -> None:
-    class Node:
-        def __init__(self, mid):
-            self.mid = mid
-        def get_attribute(self, name, timeout=5000):
-            return str(self.mid) if name == "data-mid" else None
     class Nodes:
-        def __init__(self):
-            self.items = [Node(1), Node(1), Node(2), Node(3), Node(3)]
-        def count(self):
-            return len(self.items)
+        def evaluate_all(self, script, selector=""):
+            return [{"message_id": None, "mid": str(mid), "text": f"{mid}.zip",
+                     "cards": [{"name": f"{mid}.zip", "source": "document"}]}
+                    for mid in (1, 1, 2, 3, 3)]
         def nth(self, index):
-            return self.items[index]
-    assert [mid for mid, _ in TelegramBrowserAdapter._unique_message_nodes(Nodes(), 2)] == [2, 3]
+            raise AssertionError("动态列表不能逐个按下标读取")
+    adapter = TelegramBrowserAdapter(Path("profile"), Path("inbox"))
+    assert [item.message_id for item in adapter._unique_message_nodes(Nodes(), 2)] == [2, 3]
 
 
 def test_unique_messages_keep_outer_node_for_duplicate_id() -> None:
-    class Node:
-        def __init__(self, mid, name):
-            self.mid = mid
-            self.name = name
-        def get_attribute(self, name, timeout=5000):
-            return str(self.mid) if name == "data-mid" else None
     class Nodes:
-        items = [Node(10, "outer"), Node(10, "inner"), Node(11, "outer")]
-        def count(self):
-            return len(self.items)
-        def nth(self, index):
-            return self.items[index]
-    result = TelegramBrowserAdapter._unique_message_nodes(Nodes(), 2)
-    assert [(mid, node.name) for mid, node in result] == [(10, "outer"), (11, "outer")]
+        def evaluate_all(self, script, selector=""):
+            return [{"message_id": None, "mid": f"channel-{mid}", "text": name, "cards": []}
+                    for mid, name in ((10, "outer"), (10, "inner"), (11, "outer"))]
+    result = TelegramBrowserAdapter(Path("profile"), Path("inbox"))._unique_message_nodes(Nodes(), 2)
+    assert [(item.message_id, item.text) for item in result] == [(10, "outer"), (11, "outer")]
 
 
 def test_archive_message_filter_and_scan_newest_first(tmp_path: Path) -> None:
-    class Node:
-        def __init__(self, mid, text):
-            self.mid, self.text = mid, text
-        def get_attribute(self, name, timeout=5000):
-            return str(self.mid) if name == "data-mid" else None
-        def inner_text(self, timeout=5000):
-            return self.text
+    class Locator:
+        @property
+        def first(self):
+            return self
+        def and_(self, other):
+            return self
         def evaluate(self, script):
             return None
     class Nodes:
-        items = [Node(1, "old.rar"), Node(2, "skip.png"), Node(3, "new.zip"), Node(4, "latest.rar")]
-        def count(self):
-            return len(self.items)
-        def nth(self, index):
-            return self.items[index]
+        def evaluate_all(self, script, selector=""):
+            return [{"message_id": None, "mid": str(mid), "text": text,
+                     "cards": [{"name": text, "source": "document"}] if card else []}
+                    for mid, text, card in ((1, "old.rar", True), (2, "skip.png", False),
+                                            (3, "new.zip", True), (4, "latest.rar", True))]
     class Mouse:
         def wheel(self, x, y):
             return None
     class Page:
         mouse = Mouse()
+        def locator(self, selector):
+            return Locator()
         def wait_for_timeout(self, ms):
             return None
     adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")
     assert adapter._scan_archive_ids(Page(), Nodes(), 2) == [3, 4]
-    assert not adapter._archive_message(Nodes.items[1])
+
+
+def test_scan_survives_virtual_list_replacement(tmp_path: Path) -> None:
+    class Nodes:
+        round = 0
+        def evaluate_all(self, script, selector=""):
+            if self.round == 0:
+                return [{"message_id": str(mid), "mid": None, "text": text,
+                         "cards": [{"name": text, "source": "document"}] if card else []}
+                        for mid, text, card in ((3, "older.png", False), (4, "latest.zip", True))]
+            return [{"message_id": str(mid), "mid": None, "text": text,
+                     "cards": [{"name": text, "source": "document"}] if card else []}
+                    for mid, text, card in ((1, "old.rar", True), (2, "skip.png", False),
+                                            (3, "older.png", False))]
+        def nth(self, index):
+            raise AssertionError("扫描不应逐个读取已变动的 nth(index)")
+    nodes = Nodes()
+    class Locator:
+        @property
+        def first(self):
+            return self
+        def and_(self, other):
+            return self
+        def evaluate(self, script, timeout=None):
+            return None
+    class Mouse:
+        def wheel(self, x, y):
+            nodes.round += 1
+    class Page:
+        mouse = Mouse()
+        def locator(self, selector):
+            return Locator()
+        def wait_for_timeout(self, ms):
+            return None
+    adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")
+    assert adapter._scan_archive_ids(Page(), nodes, 2) == [1, 4]
+
+
+def test_locate_message_can_scroll_back_more_than_twelve_steps(tmp_path: Path) -> None:
+    class Nodes:
+        position = 0
+        def evaluate_all(self, script, selector=""):
+            return [{"message_id": str(self.position), "mid": None, "text": "", "cards": []}]
+    nodes = Nodes()
+    class Locator:
+        @property
+        def first(self):
+            return self
+        def and_(self, other):
+            return self
+    class Page:
+        class Mouse:
+            def wheel(self, x, y):
+                nodes.position += 1
+        mouse = Mouse()
+        def wait_for_timeout(self, ms):
+            return None
+        def locator(self, selector):
+            return Locator()
+    adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox", scan_limit=30)
+    assert adapter._locate_message(Page(), nodes, 20) is not None
+    assert nodes.position == 20
 
 
 def test_uuid_download_uses_card_name_only_after_zip_validation(tmp_path: Path) -> None:

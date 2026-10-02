@@ -12,7 +12,7 @@ class PipelineConfig:
     """流水线配置；默认仅生成待审核结果，不直接发布闲鱼。"""
 
     source_chat: str = ""
-    source_channel_url: str = ""
+    source_channel_url: str = "https://t.me/free_3d_models_download"
     fetch_mode: str = "message_ids"
     recent_message_limit: int = 20
     telegram_run_mode: str = "once"
@@ -26,6 +26,8 @@ class PipelineConfig:
     telegram_access_mode: str = "api"
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
+    telegram_api_proxy_url: str = ""
+    telegram_api_dc2_server: str = ""
     telegram_session: str = "data/telegram.session"
     telegram_browser_profile: Path = Path("data/telegram_browser_profile")
     browser_executable_path: str = ""
@@ -80,6 +82,10 @@ class PipelineConfig:
             app_data = os.environ.get("LOCALAPPDATA")
             if app_data:
                 payload["telegram_browser_profile"] = Path(app_data) / "XianYuMaterialPipeline" / "telegram_browser_profile"
+        if payload.get("telegram_session") == base_dir / "sample_data/telegram.session":
+            app_data = os.environ.get("LOCALAPPDATA")
+            if app_data:
+                payload["telegram_session"] = str(Path(app_data) / "XianYuMaterialPipeline" / "telegram_api.session")
         if "allowed_file_extensions" in payload:
             payload["allowed_file_extensions"] = tuple(payload["allowed_file_extensions"])
         return cls(**payload)

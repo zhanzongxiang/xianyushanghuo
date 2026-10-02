@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
+from typing import Callable
 from uuid import UUID
 
 
 class DownloadStartTimeout(RuntimeError):
+    pass
+
+
+class DownloadCancelled(RuntimeError):
     pass
 
 
@@ -35,10 +41,16 @@ class ChromiumDownload:
 
 
 class BrowserDownloadMonitor:
-    """Observe Chromium download events without blocking Playwright's event loop."""
+    """Observe Chromium download events without blocking Playwright's event loop.
 
-    def __init__(self, page, context, staging_dir: Path):
+    on_progress receives copies of raw CDP entries for the unambiguous active GUID.
+    CDP completion is transfer completion only, not archive validation success.
+    """
+
+    def __init__(self, page, context, staging_dir: Path,
+                 on_progress: Callable[[dict], None] | None = None):
         self.page = page
+        self.on_progress = on_progress
         self.staging_dir = staging_dir.resolve()
         self.session = context.browser.new_browser_cdp_session()
         self.entries: dict[str, dict] = {}
@@ -53,9 +65,21 @@ class BrowserDownloadMonitor:
     def _begin(self, event: dict) -> None:
         self.entries[event["guid"]] = {**event, "state": "inProgress"}
         logging.info("浏览器下载开始: guid=%s; 文件名=%s", event["guid"], event.get("suggestedFilename"))
+        self._notify(event["guid"])
 
     def _progress(self, event: dict) -> None:
         self.entries.setdefault(event["guid"], {}).update(event)
+        self._notify(event["guid"])
+
+    def _notify(self, guid: str) -> None:
+        # Ignore old GUIDs and ambiguous clicks; never associate another file's bytes.
+        active = getattr(self, "active_guids", None)
+        if self.on_progress is None or active is None or set(self.entries).difference(active) != {guid}:
+            return
+        try:
+            self.on_progress(dict(self.entries[guid]))
+        except (Exception, asyncio.CancelledError):
+            logging.exception("浏览器下载进度回调失败，继续传输")
 
     def _tick(self) -> None:
         if self.page.is_closed():
@@ -72,6 +96,8 @@ class BrowserDownloadMonitor:
 
     def start(self, button, timeout_seconds: int, grace_seconds: int, stop_event=None):
         self.active_guids = set(self.entries)
+        if stop_event is not None and stop_event.is_set():
+            raise DownloadCancelled("已停止等待下载开始")
         started = time.monotonic()
         next_log = started + 10
         warned = False
@@ -80,7 +106,7 @@ class BrowserDownloadMonitor:
             now = time.monotonic()
             if stop_event is not None and stop_event.is_set():
                 self.cancel_pending()
-                raise RuntimeError("已停止等待下载开始")
+                raise DownloadCancelled("已停止等待下载开始")
             if now - started >= timeout_seconds and not warned:
                 warned = True
                 logging.warning("下载事件尚未出现；继续观察 %s 秒，不重复点击、不切换附件", grace_seconds)
@@ -107,10 +133,13 @@ class BrowserDownloadMonitor:
         except OSError:
             logging.exception("永久文件已保留，但浏览器暂存文件清理失败: %s", download.path())
 
-    def wait_complete(self, download, timeout_seconds: int) -> None:
+    def wait_complete(self, download, timeout_seconds: int, stop_event=None) -> None:
         deadline = time.monotonic() + timeout_seconds
         next_log = 0
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                self.cancel_pending()
+                raise DownloadCancelled("已请求停止浏览器下载")
             entries = [entry for guid, entry in self.entries.items() if guid not in self.active_guids]
             if len(entries) > 1:
                 self.cancel_pending()
@@ -126,7 +155,7 @@ class BrowserDownloadMonitor:
                                  entry.get("receivedBytes"), entry.get("totalBytes"))
                     return
                 if state == "canceled":
-                    raise RuntimeError(f"浏览器传输已取消: {download.failure()}")
+                    raise DownloadCancelled(f"浏览器传输已取消: {download.failure()}")
                 if time.monotonic() >= next_log:
                     logging.info("传输中: 已接收=%s 字节; 总大小=%s 字节",
                                  entry.get("receivedBytes", 0), entry.get("totalBytes", "未知"))

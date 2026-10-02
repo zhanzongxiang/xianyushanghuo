@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--config", default="config/pipeline.example.json")
     parser.add_argument("--quark-login", action="store_true", help="打开可见浏览器完成夸克登录，不上传文件")
     parser.add_argument("--telegram-login", action="store_true", help="打开可见 Telegram Web 完成首次登录，不下载文件")
+    parser.add_argument("--telegram-api-login", action="store_true", help="在当前终端交互登录 Telegram API，不下载文件")
     parser.add_argument("--browser-check", action="store_true", help="启动并关闭配置的浏览器，仅检查启动和专用目录")
     parser.add_argument("--web-ui", action="store_true", help="启动本地参数和日志界面")
     parser.add_argument("--web-port", type=int, default=8765, help="本地界面端口")
@@ -49,6 +50,15 @@ def main() -> None:
         from xianyu_pipeline.adapters import telegram_browser_login
         telegram_browser_login(config.telegram_browser_profile, config.source_channel_url, config.browser_executable_path)
         return
+    if args.telegram_api_login:
+        telegram = TelethonTelegramAdapter(config.telegram_api_id, config.telegram_api_hash,
+                                           config.telegram_session, config.inbox_dir,
+                                           proxy_url=config.telegram_api_proxy_url,
+                                           dc2_server=config.telegram_api_dc2_server,
+                                           download_start_timeout_seconds=config.download_start_timeout_seconds,
+                                           download_transfer_timeout_seconds=config.download_transfer_timeout_seconds)
+        telegram.login()
+        return
     if config.source_chat or config.source_channel_url:
         if config.telegram_access_mode == "browser":
             telegram = TelegramBrowserAdapter(
@@ -70,7 +80,16 @@ def main() -> None:
                 config.telegram_api_hash,
                 config.telegram_session,
                 config.inbox_dir,
+                scan_limit=config.telegram_scan_limit,
+                archive_test_executable_path=config.archive_test_executable_path,
+                archive_test_timeout_seconds=config.archive_test_timeout_seconds,
+                proxy_url=config.telegram_api_proxy_url,
+                dc2_server=config.telegram_api_dc2_server,
+                download_start_timeout_seconds=config.download_start_timeout_seconds,
+                download_transfer_timeout_seconds=config.download_transfer_timeout_seconds,
             )
+            if config.telegram_run_mode == "watch":
+                raise SystemExit("Telegram API 模式目前仅支持抓取一次")
     else:
         telegram = LocalTelegramAdapter(config.inbox_dir)
 

@@ -285,6 +285,106 @@ def test_real_browser_delayed_download_and_durable_copy(tmp_path, browser_path, 
             assert archive.testzip() is None
 
 
+def test_real_browser_scan_with_dynamic_message_nodes(tmp_path, browser_path):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=browser_path)
+        try:
+            page = browser.new_page()
+            page.set_content("<main id='messages'></main>")
+            page.evaluate("""() => {
+                const list = document.querySelector('#messages');
+                for (let i = 1; i <= 100; i++) {
+                    const el = document.createElement('article');
+                    el.setAttribute('data-mid', `channel-${i}`);
+                    if (i % 4 === 0) {
+                        el.innerHTML = `<div class="document-container"><span class="document-name">asset-${i}.rar</span></div>`;
+                    } else {
+                        el.textContent = `mention-${i}.rar`;
+                    }
+                    list.appendChild(el);
+                }
+                window.setInterval(() => {
+                    const item = list.firstElementChild;
+                    list.appendChild(item);
+                    list.insertBefore(item, list.firstElementChild);
+                }, 1);
+            }""")
+            adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")
+            nodes = page.locator(adapter.message_selector)
+            for _ in range(5):
+                snapshots = adapter._unique_message_nodes(nodes, 200)
+                assert len(snapshots) == 100
+                assert sum(bool(item.cards) for item in snapshots) == 25
+                assert adapter._message_locator(page, snapshots[-1]).inner_text(timeout=1000)
+                assert adapter._scan_archive_ids(page, nodes, 20)
+        finally:
+            browser.close()
+
+
+def test_real_browser_card_scan_ignores_caption_and_other_files(tmp_path, browser_path):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=browser_path)
+        try:
+            page = browser.new_page()
+            page.set_content("""
+                <article data-mid="1">Please download report.rar <button>Download</button></article>
+                <article data-mid="2">See guide.zip
+                  <div class="document-container"><span class="document-name">guide.pdf</span></div>
+                  <div class="document-container" id="rar"><span class="document-name">asset.rar</span></div>
+                </article>
+                <article data-mid="3">
+                  <span class="file-name" id="zip">archive.zip</span>
+                  <div class="document-container"><span class="document-name">photo.jpg</span></div>
+                </article>
+                <article data-mid="4"><a download="saved.rar" href="#" id="link">Download</a></article>
+                <article data-mid="5">duplicate.rar
+                  <div class="document-container"><span class="document-name">duplicate.rar</span></div>
+                  <div class="document-container"><span class="document-name">duplicate.rar</span></div>
+                </article>
+            """)
+            adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox")
+            nodes = page.locator(adapter.message_selector)
+            snapshots = adapter._unique_message_nodes(nodes, 10)
+            assert [item.message_id for item in snapshots if item.cards] == [2, 3, 4, 5]
+            assert [item.cards[0].name for item in snapshots if item.cards] == [
+                "asset.rar", "archive.zip", "saved.rar", "duplicate.rar"]
+            assert adapter._scan_archive_ids(page, nodes, 4) == [2, 3, 4, 5]
+            for mid, target in ((2, "rar"), (3, "zip"), (4, "link")):
+                message = adapter._locate_message(page, nodes, mid)
+                cards = adapter._archive_cards(message)
+                assert len(cards) == 1
+                button = adapter._card_locator(message, cards[0])
+                assert button.count() == 1 and adapter._card_still_matches(button, cards[0])
+                assert button.get_attribute("id") == target
+            duplicate = adapter._archive_cards(adapter._locate_message(page, nodes, 5))
+            assert len(duplicate) == 2 and duplicate[0].name == duplicate[1].name
+        finally:
+            browser.close()
+
+
+def test_real_browser_custom_attachment_selector_needs_filename(tmp_path, browser_path):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, executable_path=browser_path)
+        try:
+            page = browser.new_page()
+            page.set_content("""
+                <article data-mid="1"><div class="download-card">Only text: file.rar</div></article>
+                <article data-mid="2"><div class="download-card"><span>asset.zip</span></div></article>
+            """)
+            adapter = TelegramBrowserAdapter(tmp_path / "profile", tmp_path / "inbox",
+                                             attachment_selector=".download-card")
+            nodes = page.locator(adapter.message_selector)
+            assert adapter._scan_archive_ids(page, nodes, 1) == [2]
+            card = adapter._archive_cards(adapter._locate_message(page, nodes, 2))[0]
+            button = adapter._card_locator(adapter._locate_message(page, nodes, 2), card)
+            assert button.count() == 1 and adapter._card_still_matches(button, card)
+        finally:
+            browser.close()
+
+
 def test_real_rar_integrity_and_password(tmp_path):
     rar = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "WinRAR/Rar.exe"
     if not rar.is_file():

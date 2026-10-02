@@ -26,4 +26,5 @@ test.local.json
 **/telegram_browser_profile*/
 **/quark_browser_profile*/
 **/.browser-downloads/
+**/.telegram-api-downloads/
 **/.unverified/

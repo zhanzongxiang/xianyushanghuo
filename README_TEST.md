@@ -1,5 +1,116 @@
 # 跨电脑测试说明
 
+## v34：可配置下载目录
+
+使用 `XianYuMaterialPipeline_v34_download_directory/start_ui.cmd`。在“设置”中的
+“浏览器与下载”填写“下载保存目录”（完整绝对路径）并保存。保存前检查目标目录可创建且可写；
+不能选磁盘根目录，任务进行时不能更改设置。新下载的素材、暂存与预览使用新目录，
+“下载目录”按钮随之打开新位置。
+
+已下载的素材与预览不会自动移动，历史任务仍使用原路径并可打开、预览或上传；
+目录切换后重启也保持原位置。若新目录已有素材，工作台会导入；与旧本地任务同名时
+保留旧任务并写警告日志，避免静默覆盖。便携分发 ZIP 仍不包含本机配置或下载文件。
+
+## v33：前置图集预览
+
+使用 `XianYuMaterialPipeline_v33_preview_album/start_ui.cmd`。API 下载优先读取压缩包之前
+最近的一条实际消息：照片属于图集时，只取紧邻且同组的最多 5 张；单张照片只取这一张。
+消息 ID 可不连续，不跨过文字、其他文件、视频或另一图集。图片按消息顺序展示，
+详情中显示“前置图集（自动关联）”及图片消息 ID，便于人工核对归属。
+
+历史查询最多等待 5 秒，每张图片最多 8 秒，整个前置配图阶段最多 25 秒。
+部分图片失败时保留成功的图片；全部失败时回退到附件缩略图及 ZIP 内图片，
+不会因为预览失败将压缩包判定为下载失败。配图等待不占用压缩包的传输超时。
+RAR 的前置图集不依赖解压。图片仅用于工作台展示，不会自动上传为商品主图。
+
+本功能仅用于 API 工作台的新扫描或指定消息重试；Web 模式保持原行为。
+没有 Telegram 消息 ID 的历史本地文件不会按文件名猜测补图。旧版运行任务需先停止，
+不要让多个版本同时下载或修改同一份任务记录。保留个人配置和会话；分发 ZIP 仍为干净配置。
+
+## v32：素材工作台
+
+使用 `XianYuMaterialPipeline_v32_workbench/start_ui.cmd`。主界面分为下载任务、上传任务、
+素材库、任务记录和设置，保留原来的 Telegram API/Web、浏览器路径、代理、超时和登录配置。
+“扫描并下载”只下载与校验素材；在上传任务中勾选文件后手动上传原始 ZIP/RAR，不再因缺少展示图阻止上传。
+命令行原流水线和 `/api/run` 保持兼容。
+
+下载列表显示真实字节、速度、剩余时间与错误。没有总大小时显示不定进度；夸克网页未提供可靠
+字节进度时只显示阶段。展示图取自对应 Telegram 附件缩略图或 ZIP 内有大小限制的图片，
+不猜测相邻消息图片的归属。RAR 无缩略图时显示文件图标，不解压不可信预览内容。
+
+已下载素材进入上传列表。选择“本地模拟”仅复制到本地，不代表已上传夸克。
+可能已发出上传但未获取分享链接的任务标记为结果待确认，重试只查询原目标中的文件分享链接，
+不会重复上传。若网盘中实际没有文件，请人工核对目标和上传结果后处理。
+夸克选择器仍需按实际账号网页配置，程序不会猜测。
+
+任务状态保存在输出目录 `workbench-tasks.json`，预览保存在下载目录 `.previews`；刷新或重启后保留，
+中断任务显示需处理。旧下载目录中的 ZIP/RAR 可导入，上传前重新校验。
+便携 ZIP 只包含干净配置，个人凭证、会话、日志和素材不会被打包。升级时先停止旧版下载任务。
+
+## v31：修复 API 下载进度监控
+
+v30 在首个数据块等待期间会因 `last_report` 变量作用域错误抛出
+`UnboundLocalError`，与代理或 RAR 文件无关。v31 修复该错误并增加正常等待首块的
+回归测试。使用 `XianYuMaterialPipeline_v31_api_progress_fix/start_ui.cmd`；
+不要继续使用 v30 进行 API 下载。真实跨 DC 传输仍需在代理网络中验证。
+
+## v30：API 跨 DC 下载监控
+
+选择 DC 2 生产节点时，跨 DC 下载连接也使用 `149.154.167.50:443`；已有
+账号会话所在 DC 不会被改写。Telegram API 下载每隔一段时间记录已接收字节。
+`download_start_timeout_seconds` 在 API 模式下是连续无进展上限，默认 180 秒；
+`download_transfer_timeout_seconds` 是单个文件总时限，默认 3600 秒。页面上可调整。
+超时或点击“停止监测”会取消当前 API 下载；非空文件保留在 `.unverified`，
+零字节暂存文件直接清理。网络代理中断、节点路由错误仍需在 FlClash 中解决。
+旧 v29 正在进行的 API 下载不受新版本的停止按钮控制；先结束旧任务，再启动
+`XianYuMaterialPipeline_v30_api_download_watchdog/start_ui.cmd`。
+
+## v29：API 生产节点与代理
+
+Telegram API 模式可选填写 `socks5://主机:端口` 或 `http://主机:端口` 作为
+`telegram_api_proxy_url`，不支持在 URL 中填写代理账号密码。DC 2 节点可选择图中
+的生产地址 `149.154.167.50:443`，v29 只在当前会话没有授权密钥、且属于 DC 2
+时应用；已有会话的节点与密钥不覆盖，登录后跨数据中心迁移仍由 Telethon 处理。
+测试地址 `149.154.167.40:443` 不用于正式账号。当前电脑直连生产地址、测试地址及
+Telethon 默认地址均超时，因此仅切换生产 IP 并不能解决网络问题，需配置实际可用
+的代理或其他能够让 API 进程连通的网络。不要把截图里的公钥粘贴进程序。
+使用 `XianYuMaterialPipeline_v29_api_network/start_ui.cmd`，便携包不含个人配置和会话。
+
+## v28：Telegram API 获取压缩包
+
+界面可选 Telegram Web 或 Telegram API。API 模式需在本机配置 API ID/Hash，点击
+“首次登录 Telegram”后在新终端完成手机号、验证码及可能的二次验证；Web 登录态不能
+代替 API 会话。API 模式按频道最新消息扫描上限查找 ZIP/RAR 文件名，先下载到暂存目录，
+校验大小和 ZIP CRC 或 RAR 测试命令后才放进下载目录。失败文件留在 `.unverified`。
+目前 API 模式支持抓取一次，不支持持续监测。缺少 RAR 校验工具时需安装 7-Zip/WinRAR。
+使用 `XianYuMaterialPipeline_v28_telegram_api/start_ui.cmd`。便携 ZIP 不包含凭证、会话和下载内容。
+
+## v27：延长 Telegram 消息等待
+
+Telegram Web 页面导航及首条频道消息出现的单步等待使用配置项
+`telegram_browser_timeout_seconds`，默认 180 秒，可在界面设为 30–600 秒。
+之前首条消息等待固定最多 30 秒，页面导航也可能被默认导航超时提前中断。
+网络或代理不可用、登录失效以及频道页面未加载时，延长等待不会自动解决连接问题。
+使用 `XianYuMaterialPipeline_v27_message_wait/start_ui.cmd` 启动，旧版目录和登录态保留。
+
+## v26：按文件卡片扫描 ZIP/RAR
+
+默认频道为 `https://t.me/free_3d_models_download`。扫描消息时只把文件卡片中的
+ZIP/RAR 文件名或带文件名的下载链接计为候选；正文单独提到压缩包不再计数。
+下载前重新确认消息 ID、文件名和唯一的卡片控件；遇到不明确的卡片会跳过并记日志，
+不会猜测并点击通用下载按钮。虚拟列表回滚定位最多按扫描上限继续查找。
+使用 `XianYuMaterialPipeline_v26_archive_card_scan/start_ui.cmd`，浏览器专用登录目录
+仍可复用；便携 ZIP 不包含本机浏览器路径、用户配置和登录会话。真实频道的扫描和下载
+仍需在本人已登录的浏览器及网络环境下验证。
+
+## v25：频道消息列表动态更新
+
+默认频道为 `https://t.me/free_3d_models_download`，可在界面改为其他公开频道。
+修复 Telegram Web 滚动刷新节点时，旧扫描方式在 `nth(index).get_attribute()`
+超时导致流水线失败的问题。新版一次读取当前 DOM 消息快照，按稳定消息 ID 重定位下载控件。
+使用 `XianYuMaterialPipeline_v25_message_snapshot/start_ui.cmd` 启动，脚本自动选择空闲本地端口；升级沿用兼容的
+浏览器专用登录目录。构建后的 ZIP 默认不附带浏览器路径或用户会话数据。
+
 ## v24：修复启动闪退，可运行版本
 
 本节优先于下方历史版本说明。解压完整的 `XianYuMaterialPipeline_v24_profile_isolation`
@@ -150,7 +261,8 @@ XianYuMaterialPipeline.exe --config test.local.json --telegram-login
 
 ### 3.2 Telegram API 模式
 
-现在可以直接填写公开频道链接，检索频道整体最新的 N 条发言（不按某个发言人筛选），再从这 N 条中处理含附件的消息：
+可直接填写公开频道链接，在最多 `telegram_scan_limit` 条最新消息中查找
+`recent_message_limit` 条 ZIP/RAR 文件消息（不按发言人筛选）：
 
 ```json
 {
@@ -160,7 +272,7 @@ XianYuMaterialPipeline.exe --config test.local.json --telegram-login
 }
 ```
 
-程序会使用本机 Telegram 登录会话按频道整体顺序读取最新消息，不读取或筛选发言人；在这 N 条中只下载带附件的消息。公开链接不会绕过登录权限。私有频道需要账号本身有访问权限，私有链接不能仅凭 URL 推断聊天 ID。
+程序使用单独的本机 Telegram API 会话读取频道消息，仅下载 ZIP/RAR 文件。公开链接不会绕过登录权限。私有频道需要账号本身有访问权限，私有链接不能仅凭 URL 推断聊天 ID。
 
 如果仍要指定消息，使用：
 

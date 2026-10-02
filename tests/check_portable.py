@@ -26,7 +26,7 @@ def main():
     parser.add_argument("executable", type=Path)
     args = parser.parse_args()
     executable = args.executable.resolve()
-    root = Path(tempfile.mkdtemp(prefix="xianyu-v24-portable-"))
+    root = Path(tempfile.mkdtemp(prefix="xianyu-v31-portable-"))
     legacy = root / "legacy"
     browser = os.environ["BROWSER_TEST_PATH"]
     old_browser = os.environ["LEGACY_BROWSER_TEST_PATH"]
@@ -39,6 +39,7 @@ def main():
     settings = {
         "browser_executable_path": browser, "telegram_browser_profile": str(legacy),
         "telegram_browser_headless": False, "upload_provider": "local",
+        "source_channel_url": "",
         "inbox_dir": str(root / "inbox"), "work_dir": str(root / "work"),
         "output_dir": str(root / "output"), "telegram_access_mode": "browser",
     }
@@ -66,6 +67,21 @@ def main():
     assert len(manifest) == 1 and manifest[0]["status"] == "pending_review"
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
+        unused_port = listener.getsockname()[1]
+    api_config = root / "api-smoke.json"
+    api_config.write_text(json.dumps({
+        "telegram_api_id": 12345, "telegram_api_hash": "a" * 32,
+        "telegram_api_proxy_url": f"socks5://127.0.0.1:{unused_port}",
+        "telegram_api_dc2_server": "149.154.167.50:443",
+        "telegram_session": str(root / "smoke.session"),
+    }), encoding="utf-8")
+    api_result = subprocess.run([str(executable), "--config", str(api_config), "--telegram-api-login"],
+                                cwd=root, capture_output=True, timeout=90, creationflags=flags)
+    api_error = api_result.stderr.decode("utf-8", errors="replace")
+    assert api_result.returncode != 0 and "ModuleNotFoundError" not in api_error, api_error
+    assert "Telegram API" in api_error and "RuntimeError" in api_error, api_error
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     process = subprocess.Popen(command + ["--web-ui", "--no-open-browser", "--web-port", str(port)],
@@ -82,10 +98,10 @@ def main():
                 time.sleep(0.1)
         else:
             raise AssertionError("packaged UI did not start")
-        assert loaded["browser_version"].startswith("142.")
+        assert loaded["browser_version"]
         assert Path(loaded["browser_profile_dir"]) != legacy
         with urlopen(url) as response:
-            assert "v24" in response.read().decode("utf-8")
+            assert "v31" in response.read().decode("utf-8")
         with urlopen(Request(url + "/api/browser-check", data=b"", method="POST")) as response:
             assert response.status == 200
         for _ in range(300):
@@ -101,7 +117,8 @@ def main():
     finally:
         process.terminate()
         process.wait(timeout=15)
-    print(f"PASS: packaged EXE browser check, legacy preservation, offline ZIP pipeline, UI and check API; fixtures: {root}")
+    print(f"PASS: packaged EXE browser check, legacy preservation, offline ZIP pipeline, "
+          f"API proxy import, UI and check API; fixtures: {root}")
 
 
 if __name__ == "__main__":

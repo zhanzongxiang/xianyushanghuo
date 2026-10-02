@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:,">
+  <title>素材工作台</title>
+  <link rel="stylesheet" href="/static/workbench.css">
+  <script src="/static/lucide.js" defer></script>
+  <script src="/static/workbench.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#page-title">跳转到工作区</a>
+  <div class="app">
+    <aside class="sidebar">
+      <a class="brand" href="?view=download" data-view="download" aria-label="素材工作台，下载任务">
+        <span class="brand-mark"><i data-lucide="layers-2"></i></span><span>素材工作台</span>
+      </a>
+      <div class="brand-sub">MATERIAL WORKSPACE</div>
+      <nav aria-label="主导航">
+        <p class="nav-caption">素材管理</p>
+        <a class="nav-item" href="?view=download" data-view="download" title="下载任务"><i data-lucide="arrow-down-to-line"></i><span>下载任务</span><small id="nav-download">—</small></a>
+        <a class="nav-item" href="?view=upload" data-view="upload" title="上传任务"><i data-lucide="cloud-upload"></i><span>上传任务</span><small id="nav-upload">—</small></a>
+        <a class="nav-item" href="?view=library" data-view="library" title="素材库"><i data-lucide="library"></i><span>素材库</span><small id="nav-library">—</small></a>
+        <a class="nav-item" href="?view=history" data-view="history" title="任务记录"><i data-lucide="history"></i><span>任务记录</span></a>
+        <div class="divider"></div><p class="nav-caption">工作空间</p>
+        <a class="nav-item" href="?view=channels" data-view="channels" title="来源频道"><i data-lucide="radio-tower"></i><span>来源频道</span></a>
+        <a class="nav-item" href="?view=settings" data-view="settings" title="设置"><i data-lucide="settings-2"></i><span>设置</span></a>
+      </nav>
+      <div class="side-bottom">
+        <div class="storage-label"><span>本地存储</span><span id="disk-percent">—</span></div>
+        <div id="disk-track" class="storage-track" hidden><span></span></div>
+        <div id="disk-space" class="disk">等待存储信息</div>
+        <div class="local-workspace"><i data-lucide="monitor"></i><div>本地工作空间<small id="access-mode">获取方式未读取</small></div></div>
+      </div>
+    </aside>
+    <main id="main">
+      <header class="topbar">
+        <div class="breadcrumb">工作空间 <span>/</span><strong id="breadcrumb">下载任务</strong></div>
+        <div class="top-right"><span id="connection" role="status"><span class="status-dot unknown"></span><span>正在读取状态</span></span><button id="refresh" class="icon-button" type="button" title="刷新任务和日志" aria-label="刷新任务和日志"><i data-lucide="refresh-cw"></i></button></div>
+      </header>
+      <div id="errors" class="alerts" aria-live="polite"></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <section class="heading">
+        <div><h1 id="page-title" tabindex="-1">下载任务</h1><p id="page-subtitle">正在读取来源</p></div>
+        <div class="heading-actions">
+          <button id="open-downloads" type="button"><i data-lucide="folder-open"></i><span>下载目录</span></button>
+          <a id="open-cloud" class="button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>打开网盘</a>
+          <button id="stop" type="button" class="danger-button" hidden><i data-lucide="square"></i>停止任务</button>
+          <button id="download" class="primary" type="button"><i data-lucide="refresh-cw"></i>扫描并下载</button>
+          <button id="upload" class="primary" type="button" hidden><i data-lucide="cloud-upload"></i><span>上传选中素材</span></button>
+          <button id="edit-channel" type="button" hidden><i data-lucide="pencil"></i>编辑来源</button>
+        </div>
+      </section>
+      <section id="metrics" class="metrics" aria-label="任务统计"></section>
+      <div id="task-workspace" class="workspace">
+        <section class="main-list" aria-label="素材任务">
+          <div id="filters" class="filters" role="group" aria-label="状态筛选"></div>
+          <div class="search-toolbar">
+            <label class="search-field"><i data-lucide="search"></i><input id="task-search" type="search" aria-label="搜索素材" placeholder="搜索素材、文件或频道" autocomplete="off"></label>
+            <label class="channel-filter"><i data-lucide="list-filter"></i><select id="channel-filter" aria-label="筛选来源频道"><option value="">全部频道</option></select></label>
+          </div>
+          <div id="download-settings" class="destination"><i data-lucide="radio-tower"></i><strong id="download-source">来源尚未读取</strong><button type="button" class="text-button" data-go-settings="source_channel_url"><i data-lucide="settings-2"></i>来源与设置</button></div>
+          <div id="destination" class="destination" hidden><i data-lucide="folder"></i><span>上传至</span><strong id="upload-target">未配置</strong><button type="button" class="icon-button" data-go-settings="upload_provider" title="设置上传目标" aria-label="设置上传目标"><i data-lucide="pencil"></i></button></div>
+          <div class="selection-bar"><label><input id="select-all" type="checkbox">全选当前结果</label><span id="selection-count">未选择</span><button id="clear-selection" class="text-button" type="button" hidden>清除选择</button></div>
+          <div id="task-list"></div>
+          <div id="empty-state" class="empty-state"><i data-lucide="loader-circle"></i><h2 id="empty-title">正在读取任务</h2><p id="empty-description">等待工作台响应</p><button id="clear-filters" type="button" hidden><i data-lucide="filter-x"></i>清除筛选</button><button type="button" data-go-settings="source_channel_url"><i data-lucide="settings-2"></i>前往设置</button></div>
+          <div class="queue-footer"><span id="queue-status"></span><span id="result-count">—</span></div>
+          <button id="activity" class="activity" type="button"><i data-lucide="terminal"></i><span id="latest-log">正在读取日志</span><span class="activity-link">查看日志<i data-lucide="chevron-right"></i></span></button>
+        </section>
+        <aside id="inspector" class="inspector" aria-label="素材详情" tabindex="-1">
+          <div class="inspector-head"><h2>素材详情</h2><button id="close-inspector" class="icon-button" type="button" title="关闭详情" aria-label="关闭详情"><i data-lucide="x"></i></button></div>
+          <div id="detail-empty" class="empty-state compact"><i data-lucide="file"></i><p>尚未选择素材</p></div>
+          <div id="detail-content" hidden>
+            <div id="preview" class="preview"></div>
+            <div class="preview-gallery"><div id="preview-strip" class="preview-strip" aria-label="素材图片"></div><span id="photo-info"></span></div>
+            <h3 id="selected-name" class="selected-name"></h3><p id="selected-filename" class="file-kind"></p>
+            <hr class="detail-divider">
+            <dl class="props"><dt>来源频道</dt><dd id="detail-chat"></dd><dt>消息 ID</dt><dd id="detail-message"></dd><dt>图片来源</dt><dd id="detail-image-source"></dd><dt>图片消息</dt><dd id="detail-image-messages"></dd><dt>文件大小</dt><dd id="detail-size"></dd><dt>下载状态</dt><dd id="detail-download"></dd><dt>完整性校验</dt><dd id="detail-validation"></dd><dt>上传状态</dt><dd id="detail-upload"></dd><dt>本地位置</dt><dd id="detail-path"></dd><dt>上传方式</dt><dd id="detail-provider"></dd><dt>更新时间</dt><dd id="detail-updated"></dd></dl>
+            <div id="detail-progress" class="detail-progress"></div><p id="detail-error" class="error-note" hidden></p>
+            <div id="share-result" class="share-result" hidden><span>分享链接</span><a id="share-link" target="_blank" rel="noopener noreferrer"></a><button id="copy-share" class="icon-button" type="button" title="复制分享链接" aria-label="复制分享链接"><i data-lucide="copy"></i></button></div>
+            <div class="inspector-actions"><a id="source-link" class="button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>来源消息</a><button id="open-task" type="button" hidden><i data-lucide="folder-open"></i>本地目录</button><button id="retry-task" type="button" hidden><i data-lucide="rotate-cw"></i>重新下载</button><button id="retry-link" type="button" hidden><i data-lucide="link"></i>重新获取链接</button></div>
+          </div>
+        </aside>
+      </div>
+      <section id="logs-section" class="logs-section" aria-labelledby="logs-heading" hidden>
+        <div class="section-heading"><h2 id="logs-heading">运行日志</h2><div class="inline-actions"><label class="check-label"><input id="follow-logs" type="checkbox" checked>跟随最新</label><button id="refresh-logs" class="icon-button" type="button" title="刷新日志" aria-label="刷新日志"><i data-lucide="refresh-cw"></i></button><button id="copy-logs" class="icon-button" type="button" title="复制日志" aria-label="复制日志"><i data-lucide="copy"></i></button></div></div>
+        <label class="search-field log-search"><i data-lucide="search"></i><input id="log-search" type="search" aria-label="搜索日志" placeholder="搜索日志"></label><pre id="logs" tabindex="0" aria-label="运行日志内容">正在读取日志</pre>
+      </section>
+      <section id="channels-section" class="channels-section" aria-label="来源频道" hidden><div id="configured-channel"></div><h2 class="section-title">任务中的来源</h2><div id="channel-list"></div></section>
+      <section id="settings-section" class="settings-section" hidden>
+        <form id="config-form" novalidate autocomplete="off">
+          <fieldset id="config-fields" disabled>
+            <section class="form-section"><h2>来源与获取</h2><div class="form-grid">
+              <label>Telegram 频道公开链接<input id="source_channel_url" type="url" placeholder="https://t.me/频道名称" spellcheck="false"></label>
+              <label>Telegram 获取方式<select id="telegram_access_mode"><option value="browser">Telegram Web</option><option value="api">Telegram API</option></select></label>
+              <label>ZIP/RAR 消息数量<input id="recent_message_limit" type="number" min="1" max="100" step="1"></label>
+              <label>运行方式<select id="telegram_run_mode"><option value="once">抓取一次</option><option value="watch">持续监测新 ZIP/RAR</option></select></label>
+              <div id="api-fields" class="wide form-grid" hidden>
+                <label>Telegram API ID<input id="telegram_api_id" type="password" inputmode="numeric" autocomplete="new-password" placeholder="留空保留已保存的值" spellcheck="false"></label>
+                <label>Telegram API Hash<input id="telegram_api_hash" type="password" autocomplete="new-password" placeholder="留空保留已保存的值" spellcheck="false"></label>
+                <label>API 代理地址（可选）<input id="telegram_api_proxy_url" type="text" placeholder="socks5://127.0.0.1:7890" spellcheck="false"></label>
+                <label>DC 2 节点<select id="telegram_api_dc2_server"><option value="">沿用会话 / Telethon 自动选择</option><option value="149.154.167.50:443">生产 149.154.167.50:443</option></select></label>
+                <output id="api-status" class="wide field-hint"></output>
+              </div>
+            </div></section>
+            <section class="form-section"><h2>浏览器与下载</h2><div class="form-grid">
+              <label class="wide">下载保存目录<input id="inbox_dir" type="text" placeholder="D:\TelegramDownloads" spellcheck="false" autocomplete="off"><span class="field-hint">更改后仅新下载使用新目录，已有素材保留在原位置。</span></label>
+              <label id="browser-path-field" class="wide">浏览器程序路径（Chrome / Edge / Chromium）<input id="browser_executable_path" placeholder="浏览器可执行文件的完整路径" spellcheck="false"></label>
+              <div class="wide browser-info-field"><span>浏览器版本与 Telegram 专用目录</span><output id="browser-info">尚未读取</output></div>
+              <label id="telegram-headless-field" class="toggle-field"><span>Telegram 浏览器后台运行</span><input id="telegram_browser_headless" type="checkbox" role="switch"></label>
+              <label id="browser-timeout-field">Telegram 页面和消息等待（秒）<input id="telegram_browser_timeout_seconds" type="number" min="30" max="600" step="1"></label>
+              <label>下载启动 / 无进展等待（秒）<input id="download_start_timeout_seconds" type="number" min="1" max="86400" step="1"></label>
+              <label>下载传输时限（秒）<input id="download_transfer_timeout_seconds" type="number" min="1" max="604800" step="1"></label>
+              <label class="wide">RAR 校验程序路径（可选）<input id="archive_test_executable_path" placeholder="UnRAR.exe 或 7z.exe 的完整路径" spellcheck="false"></label>
+            </div></section>
+            <section class="form-section"><h2>上传与存储</h2><div class="form-grid">
+              <label>上传方式<select id="upload_provider"><option value="local">本地模拟（先验证下载）</option><option value="quark_browser">夸克网页上传</option></select></label>
+              <div id="quark-fields" class="wide form-grid" hidden><label>夸克目标文件夹 URL<input id="quark_folder_url" type="url" placeholder="https://pan.quark.cn/..." spellcheck="false"></label><label class="toggle-field"><span>夸克浏览器后台运行</span><input id="quark_headless" type="checkbox" role="switch"></label></div>
+            </div><dl class="paths"><dt>下载目录</dt><dd id="config-download-dir">—</dd><dt>待检查目录</dt><dd id="config-unverified-dir">—</dd><dt>日志文件</dt><dd id="config-log-path">—</dd></dl></section>
+          </fieldset>
+          <p id="form-error" class="error-note" role="alert" hidden></p>
+          <div class="form-actions"><button id="save-config" type="submit" class="primary" disabled><i data-lucide="save"></i>保存配置</button><button id="browser-check" type="button" disabled><i data-lucide="scan-line"></i>检查浏览器</button><button id="telegram-login" type="button" disabled><i data-lucide="log-in"></i>首次登录 Telegram</button><button id="quark-login" type="button" disabled><i data-lucide="log-in"></i>首次登录夸克</button><button id="reload-config" type="button" hidden><i data-lucide="refresh-cw"></i>重新读取配置</button><span id="config-dirty" role="status"></span></div>
+        </form>
+      </section>
+      <footer class="footer"><span id="footer-context">本地工作空间</span><span id="last-sync">尚未同步</span></footer>
+    </main>
+  </div>
+  <noscript><p class="noscript">工作台需要启用 JavaScript。</p></noscript>
+</body>
+</html>

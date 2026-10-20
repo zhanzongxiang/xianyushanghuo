@@ -41,6 +41,10 @@ def test_package_rejects_sample_with_account_values(tmp_path: Path):
     with pytest.raises(ValueError, match="Sample"):
         package(folder, example, archive)
     assert not archive.exists()
+    example.write_text('{"data_server_token": "PRIVATE"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="Sample"):
+        package(folder, example, archive)
+    assert not archive.exists()
     example.write_text('{"telegram_api_id": 12345}', encoding="utf-8")
     with pytest.raises(ValueError, match="Sample"):
         package(folder, example, archive)

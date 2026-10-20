@@ -1,0 +1,21 @@
+[Unit]
+Description=Xianyu metadata service
+After=network.target
+
+[Service]
+Type=simple
+User=xianyu-data
+Group=xianyu-data
+WorkingDirectory=/opt/xianyu-data
+EnvironmentFile=/etc/xianyu-data.env
+ExecStart=/usr/bin/python3 -m xianyu_pipeline.data_server --host 127.0.0.1 --port 8780 --data-dir /var/lib/xianyu-data
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xianyu-data
+
+[Install]
+WantedBy=multi-user.target

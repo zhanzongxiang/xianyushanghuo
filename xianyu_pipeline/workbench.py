@@ -56,6 +56,7 @@ class TransferStore:
         self.path = config.output_dir / "workbench-tasks.json"
         self.lock = threading.RLock()
         self.tasks: dict[str, dict] = {}
+        self.remote_tasks: list[dict] = []
         self.last_flush = 0.0
         if self.path.exists():
             try:
@@ -317,6 +318,8 @@ class TransferStore:
                 elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(row["updated_at"])).total_seconds()
                 if elapsed > 5:
                     row.update(speed=0, eta=None)
+        with self.lock:
+            rows.extend(copy.deepcopy(self.remote_tasks))
         disk = shutil.disk_usage(self.config.inbox_dir)
         if self.config.upload_provider == "quark_browser":
             upload_target = self.config.quark_folder_url

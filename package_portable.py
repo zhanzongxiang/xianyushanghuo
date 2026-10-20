@@ -14,7 +14,8 @@ def package(folder: Path, example: Path, archive: Path) -> None:
     archive = archive.resolve()
     sample = json.loads(example.read_text(encoding="utf-8"))
     if any(sample.get(key) for key in (
-        "browser_executable_path", "telegram_api_id", "telegram_api_hash", "quark_cookie"
+        "browser_executable_path", "telegram_api_id", "telegram_api_hash", "quark_cookie",
+        "data_server_token", "data_server_enabled",
     )):
         raise ValueError("Sample configuration contains local or account values")
     executable = folder / f"{folder.name}.exe"

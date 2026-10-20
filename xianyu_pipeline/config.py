@@ -22,6 +22,11 @@ class PipelineConfig:
     inbox_dir: Path = Path("data/inbox")
     work_dir: Path = Path("data/work")
     output_dir: Path = Path("data/output")
+    data_server_enabled: bool = False
+    data_server_url: str = ""
+    data_server_token: str = ""
+    data_server_workspace: str = "default"
+    data_server_interval_seconds: int = 10
     cloud_folder: str = ""
     upload_provider: str = "local"
     auto_upload_after_download: bool = False
@@ -88,6 +93,21 @@ class PipelineConfig:
     )
 
     def __post_init__(self) -> None:
+        from .data_protocol import validate_endpoint
+        import re
+        if type(self.data_server_enabled) is not bool:
+            raise ValueError("data_server_enabled 必须为布尔值")
+        self.data_server_url = validate_endpoint(self.data_server_url)
+        if (not isinstance(self.data_server_token, str) or
+                (self.data_server_token and (len(self.data_server_token) < 32
+                 or not self.data_server_token.isascii() or any(char.isspace() for char in self.data_server_token)))):
+            raise ValueError("数据服务令牌须为至少 32 位、不含空白的 ASCII 字符")
+        if not isinstance(self.data_server_workspace, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", self.data_server_workspace):
+            raise ValueError("工作空间须为 1 至 64 位字母、数字、下划线或连字符")
+        if type(self.data_server_interval_seconds) is not int or not 5 <= self.data_server_interval_seconds <= 300:
+            raise ValueError("同步间隔须为 5 至 300 秒")
+        if self.data_server_enabled and (not self.data_server_url or not self.data_server_token):
+            raise ValueError("启用服务器同步时必须填写数据服务地址和令牌")
         if type(self.download_workers) is not int or not 1 <= self.download_workers <= 8:
             raise ValueError("download_workers 必须为 1 到 8 的整数")
         if type(self.download_file_concurrency) is not int or not 1 <= self.download_file_concurrency <= 2:

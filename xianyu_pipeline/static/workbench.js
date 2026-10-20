@@ -17,12 +17,15 @@
   const numberFields = ["quark_share_expire_days", "recent_message_limit", "channel_message_limit", "download_start_timeout_seconds", "download_transfer_timeout_seconds", "download_workers", "download_file_concurrency", "quark_cli_timeout_seconds", "quark_api_file_concurrency", "quark_api_timeout_seconds"];
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
-  const formFields = [...plainFields, ...numberFields, ...booleanFields, "telegram_api_id", "telegram_api_hash", "quark_cookie"];
+  plainFields.push("data_server_url", "data_server_workspace");
+  numberFields.push("data_server_interval_seconds");
+  booleanFields.push("data_server_enabled");
+  const formFields = [...plainFields, ...numberFields, ...booleanFields, "telegram_api_id", "telegram_api_hash", "quark_cookie", "data_server_token"];
   const savedHashMask = "********";
   const state = {
     view: "download", data: null, tasks: new Map(), rows: new Map(), selected: new Set(), active: null,
     images: new Map(), brokenImages: new Set(), filters: {}, errors: new Map(), config: null,
-    configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false,
+    configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false, dataTokenConfigured: false,
     configDirty: false, formRevision: 0, pending: false, logs: null, workbenchOK: false,
     lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null,
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
@@ -55,9 +58,9 @@
   const channelName = (value) => String(value ?? "").replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "").toLowerCase();
   const activeTask = () => state.tasks.get(state.active);
   const isUploadTask = (task) => task.download_status === "completed" || ["uploading", "link_pending", "completed", "local", "failed"].includes(task.upload_status);
-  const canUpload = (task) => task.upload_status === "link_pending" || (task.download_status === "completed"
-    && (["waiting", "failed"].includes(task.upload_status) || (task.upload_status === "local" && ["quark_browser", "quark_cli", "quark_api"].includes(state.config?.upload_provider))));
-  const canRetry = (task) => retryable.has(task.download_status);
+  const canUpload = (task) => !task.remote_device && (task.upload_status === "link_pending" || (task.download_status === "completed"
+    && (["waiting", "failed"].includes(task.upload_status) || (task.upload_status === "local" && ["quark_browser", "quark_cli", "quark_api"].includes(state.config?.upload_provider)))));
+  const canRetry = (task) => !task.remote_device && retryable.has(task.download_status);
   const selectedUploadTasks = () => [...state.selected].map((id) => state.tasks.get(id)).filter((task) => task && canUpload(task));
   const isBusy = () => state.pending || !state.workbenchOK || Boolean(state.data?.running);
   const savedChannels = () => state.channels?.channels || [];
@@ -273,6 +276,7 @@
     row.classList.toggle("checked", state.selected.has(id));
     const checkbox = row.querySelector(".task-checkbox");
     checkbox.checked = state.selected.has(id);
+    checkbox.disabled = Boolean(task.remote_device);
     checkbox.setAttribute("aria-label", `选择 ${taskName(task)}`);
     const title = row.querySelector(".task-title");
     title.textContent = taskName(task);
@@ -280,7 +284,7 @@
     const badge = row.querySelector(".badge");
     badge.textContent = info[0];
     badge.className = `badge ${info[1]}`;
-    row.querySelector(".task-sub").textContent = [task.filename, task.chat ? channelLabel(task.chat) : ""].filter(Boolean).join(" · ") || "来源未提供";
+    row.querySelector(".task-sub").textContent = [task.filename, task.chat ? channelLabel(task.chat) : "", task.remote_device ? "其他设备" : ""].filter(Boolean).join(" · ") || "来源未提供";
     const thumb = row.querySelector(".thumb-button");
     thumb.setAttribute("aria-label", `查看 ${taskName(task)} 的详情`);
     imageSlot(thumb, task.images?.[0]);
@@ -292,7 +296,7 @@
     retry.hidden = !canRetry(task);
     retry.disabled = isBusy();
     const link = row.querySelector(".row-link");
-    link.hidden = task.upload_status !== "link_pending";
+    link.hidden = task.remote_device || task.upload_status !== "link_pending";
     link.disabled = isBusy();
   }
 
@@ -362,6 +366,7 @@
   }
 
   function renderSelection(tasks = taskViews.has(state.view) ? filteredTasks() : []) {
+    tasks = tasks.filter((task) => !task.remote_device);
     const checked = tasks.filter((task) => state.selected.has(String(task.id))).length;
     $("select-all").checked = tasks.length > 0 && checked === tasks.length;
     $("select-all").indeterminate = checked > 0 && checked < tasks.length;
@@ -415,7 +420,7 @@
     text("detail-image-messages", Array.isArray(task.image_message_ids) && task.image_message_ids.length ? task.image_message_ids.join(", ") : "无");
     text("detail-size", bytes(task.size)); text("detail-download", statusInfo(task)[0]);
     text("detail-validation", validationName(task)); text("detail-upload", statusInfo(task, true)[0]);
-    text("detail-path", task.local_path || "暂无本地路径"); text("detail-provider", providerName(task.upload_provider));
+    text("detail-path", task.remote_device ? "文件位于其他设备" : task.local_path || "暂无本地路径"); text("detail-provider", providerName(task.upload_provider));
     text("detail-updated", updated(task.updated_at));
     html($("detail-progress"), progressMarkup(task, state.view === "upload" || task.upload_status === "uploading" || task.upload_status === "link_pending"));
     text("detail-error", redact(task.error || task.naming_error)); $("detail-error").hidden = !(task.error || task.naming_error);
@@ -428,7 +433,7 @@
     if (share) $("share-link").href = share; else $("share-link").removeAttribute("href");
     $("open-task").hidden = !task.local_path; $("open-task").disabled = state.pending || !state.workbenchOK;
     $("retry-task").hidden = !canRetry(task); $("retry-task").disabled = isBusy();
-    $("retry-link").hidden = task.upload_status !== "link_pending"; $("retry-link").disabled = isBusy();
+    $("retry-link").hidden = task.remote_device || task.upload_status !== "link_pending"; $("retry-link").disabled = isBusy();
   }
 
   function renderMetrics() {
@@ -457,7 +462,7 @@
   }
 
   function catalogTask(message) {
-    const tasks = allTasks().filter((task) => Number(task.message_id) === message.message_id
+    const tasks = allTasks().filter((task) => !task.remote_device && Number(task.message_id) === message.message_id
       && channelName(task.chat) === channelName(message.chat));
     return tasks.find((task) => task.download_status === "completed")
       || tasks.find((task) => ["queued", "downloading", "validating"].includes(task.download_status))
@@ -803,7 +808,7 @@
     if (cloudURL) $("open-cloud").href = cloudURL; else $("open-cloud").removeAttribute("href");
     $("upload").hidden = !["upload", "library"].includes(state.view);
     $("open-naming").hidden = !["upload", "library"].includes(state.view);
-    $("open-naming").disabled = isBusy() || !allTasks().some((task) => task.download_status === "completed");
+    $("open-naming").disabled = isBusy() || !allTasks().some((task) => task.download_status === "completed" && !task.remote_device);
     $("edit-channel").hidden = state.view !== "channels";
     $("add-channel").hidden = state.view !== "channels";
     $("add-channel").disabled = isBusy();
@@ -834,6 +839,7 @@
     text("last-sync", state.lastSync ? `${state.workbenchOK ? "最近同步" : "上次成功同步"} ${state.lastSync.toLocaleTimeString("zh-CN", { hour12: false })}` : "尚未同步");
     renderChannelSwitcher();
     renderSourceOptions();
+    renderDataSync();
     renderSelection();
     renderCatalog();
   }
@@ -871,6 +877,26 @@
     input.value = savedChannels().find((row) => row.key === channelName(selected))?.url || "";
   }
 
+  function renderDataSync() {
+    const sync = state.data?.data_sync;
+    const labels = {disabled: "未启用", waiting: "等待同步", syncing: "正在同步", connected: "已连接", offline: "连接失败"};
+    text("data-sync-status", sync ? [labels[sync.stage] || "状态未知",
+      sync.enabled ? `待同步 ${sync.pending || 0} 条` : "",
+      sync.conflicts ? `冲突 ${sync.conflicts} 条` : "",
+      sync.last_sync ? `最近同步 ${updated(sync.last_sync)}` : "", sync.error || ""].filter(Boolean).join(" · ") : "未启用");
+    $("data-sync-now").disabled = state.pending || !sync?.enabled || sync.stage === "syncing";
+    $("data-sync-conflicts").hidden = !sync?.conflicts;
+    const kinds = {channels: "频道", messages: "消息", cursors: "读取游标", tasks: "任务"};
+    html($("data-sync-conflict-list"), (sync?.conflict_rows || []).map((row) =>
+      `<div class="sync-conflict"><strong>${escape(kinds[row.kind] || row.kind)} · ${escape(row.key)}</strong>
+      ${row.local_deleted || row.server_deleted ? `<p>${row.local_deleted ? "本机已删除" : "服务器已删除"}</p>` : ""}
+      ${(row.fields || []).map((field) => `<p><b>${escape(field.field)}</b><br>本机：${escape(field.local)}<br>服务器：${escape(field.server)}</p>`).join("")}</div>`).join(""));
+    for (const id of ["data-sync-server", "data-sync-local"]) {
+      $(id).hidden = !sync?.conflicts;
+      $(id).disabled = state.pending || sync?.stage === "syncing";
+    }
+  }
+
   function render() {
     renderHeader();
     if (taskViews.has(state.view)) { renderMetrics(); renderList(); }
@@ -882,8 +908,8 @@
 
   function openNaming() {
     if (isBusy()) return;
-    const selected = [...state.selected].map((id) => state.tasks.get(id)).filter((task) => task?.download_status === "completed");
-    const tasks = selected.length ? selected : filteredTasks().filter((task) => task.download_status === "completed");
+    const selected = [...state.selected].map((id) => state.tasks.get(id)).filter((task) => task?.download_status === "completed" && !task.remote_device);
+    const tasks = state.selected.size ? selected : filteredTasks().filter((task) => task.download_status === "completed" && !task.remote_device);
     state.namingRows.clear(); state.namingDirty.clear(); state.namingSelected.clear();
     $("naming-list").replaceChildren();
     for (const task of tasks.slice(0, 100)) {
@@ -1184,6 +1210,7 @@
         const config = await request("/api/config");
         if (config.telegram_access_mode !== "api" || !["local", "quark_browser", "quark_cli", "quark_api"].includes(config.upload_provider)) throw new Error("/api/config：缺少有效获取方式或上传方式");
         state.quarkConfigured = config.quark_cookie_configured === true;
+        state.dataTokenConfigured = config.data_server_token_configured === true;
         // Hashes stay server-side; the public API ID can be displayed as saved.
         state.apiConfigured = config.telegram_api_configured === true;
         state.apiIdConfigured = config.telegram_api_id_configured === true || (Number.isInteger(config.telegram_api_id) && config.telegram_api_id > 0);
@@ -1204,6 +1231,7 @@
           $("telegram_api_id").value = Number.isInteger(config.telegram_api_id) && config.telegram_api_id > 0 ? String(config.telegram_api_id) : "";
           $("telegram_api_hash").value = state.apiConfigured ? savedHashMask : "";
           $("quark_cookie").value = state.quarkConfigured ? savedHashMask : "";
+          $("data_server_token").value = state.dataTokenConfigured ? savedHashMask : "";
           $("telegram_api_hash").setAttribute("aria-label", state.apiConfigured ? "Telegram API Hash，已保存并隐藏" : "Telegram API Hash");
           state.configDirty = false;
           text("config-dirty", "");
@@ -1237,6 +1265,20 @@
   function validate(purpose = "save") {
     $("form-error").hidden = true;
     for (const id of formFields) { $(id).classList.remove("field-error"); $(id).removeAttribute("aria-invalid"); }
+    if ($("data_server_enabled").checked) {
+      let endpoint;
+      try { endpoint = new URL($("data_server_url").value.trim()); } catch { return failField("data_server_url", "请填写数据服务地址"); }
+      if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password
+          || endpoint.pathname !== "/" || endpoint.search || endpoint.hash
+          || (endpoint.protocol === "http:" && !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname))) {
+        return failField("data_server_url", "远程使用 HTTPS，SSH 隧道使用 http://127.0.0.1:8780");
+      }
+      const token = $("data_server_token").value.trim();
+      if ((!token && !state.dataTokenConfigured) || (token && !(state.dataTokenConfigured && token === savedHashMask) && !/^[!-~]{32,}$/.test(token))) {
+        return failField("data_server_token", "请填写至少 32 位的访问令牌");
+      }
+    }
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test($("data_server_workspace").value.trim())) return failField("data_server_workspace", "工作空间只能包含字母、数字、下划线或连字符");
     const directory = $("inbox_dir").value.trim();
     if (!directory) return failField("inbox_dir", "请填写下载保存目录");
     if (!/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)/.test(directory)) return failField("inbox_dir", "请填写完整的绝对目录路径");
@@ -1284,6 +1326,8 @@
     if (hash && !(state.apiConfigured && hash === savedHashMask)) output.telegram_api_hash = hash;
     const cookie = $("quark_cookie").value.trim();
     if (cookie && !(state.quarkConfigured && cookie === savedHashMask)) output.quark_cookie = cookie;
+    const token = $("data_server_token").value.trim();
+    if (token && !(state.dataTokenConfigured && token === savedHashMask)) output.data_server_token = token;
     // Omit non-form fields so advanced configuration remains unchanged.
     return output;
   }
@@ -1599,7 +1643,7 @@
   $("channel-load-older").addEventListener("click", () => void scanChannel(true));
   $("channel-empty-action").addEventListener("click", () => void scanChannel());
   $("select-all").addEventListener("change", () => {
-    for (const task of filteredTasks()) { if ($("select-all").checked) state.selected.add(String(task.id)); else state.selected.delete(String(task.id)); }
+    for (const task of filteredTasks().filter((task) => !task.remote_device)) { if ($("select-all").checked) state.selected.add(String(task.id)); else state.selected.delete(String(task.id)); }
     renderList();
   });
   $("clear-selection").addEventListener("click", () => { state.selected.clear(); renderList(); });
@@ -1708,6 +1752,13 @@
     state.configDirty = true; state.formRevision++; text("config-dirty", "未保存更改");
   });
   $("upload_provider").addEventListener("change", markRequired);
+  for (const [id, choice] of [["data-sync-now", null], ["data-sync-server", "server"], ["data-sync-local", "local"]]) {
+    $(id).addEventListener("click", () => {
+      if (state.configDirty) { setError("action", "请先保存服务器设置"); return; }
+      if (choice && !confirm(choice === "server" ? "用服务器版本替换所有冲突记录？" : "用本机版本覆盖所有冲突记录？")) return;
+      void mutation(async () => { await post("/api/data-sync", choice ? {resolve: choice} : {}); notice("已请求同步"); });
+    });
+  }
   $("telegram_api_hash").addEventListener("focus", () => {
     if (state.apiConfigured && $("telegram_api_hash").value === savedHashMask) $("telegram_api_hash").select();
   });

@@ -154,12 +154,22 @@ class Fixture:
                 route.fulfill(json={"message": "fixture removed"})
                 return
             if path == "/api/config":
+                if payload.pop("data_server_token", ""):
+                    payload["data_server_token_configured"] = True
                 self.config.update(payload)
+                if self.config.get("data_server_enabled"):
+                    self.workbench["data_sync"] = {"enabled": True, "stage": "connected", "pending": 0,
+                                                   "conflicts": 0, "error": "", "last_sync": "2026-10-20T01:00:00Z"}
                 channel = next(row for row in self.saved["channels"]
                                if row["url"] == self.config["source_channel_url"])
                 self.saved["active"] = channel["key"]
                 self.catalog = self.empty_catalog(channel["key"])
                 route.fulfill(json={"message": "fixture saved"})
+                return
+            if path == "/api/data-sync":
+                if payload.get("resolve"):
+                    self.workbench["data_sync"].update(conflicts=0, pending=0, stage="connected", error="")
+                route.fulfill(json={"message": "fixture sync requested"})
                 return
             if path == "/api/channel-scan":
                 channel = next(row for row in self.saved["channels"] if row["key"] == self.saved["active"])
@@ -196,7 +206,7 @@ def assert_no_overflow(page, label: str) -> None:
 
 def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> None:
     errors = []
-    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.on("pageerror", lambda error: (errors.append(str(error)), print(f"Browser error: {error}")))
     page.route("**/api/**", fixture.route)
     page.goto(origin + "/?view=messages")
     page.wait_for_function("!document.getElementById('scan-channel').disabled")
@@ -393,6 +403,61 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
     page.wait_for_function("!document.getElementById('scan-channel').disabled")
     assert "自定义模型频道" in picker.inner_text()
     assert_no_overflow(page, f"{label}: final overflow")
+
+    page.locator(".nav-item[data-view='settings']").click()
+    page.locator("#data_server_enabled").check()
+    page.locator("#data_server_url").fill("http://47.113.126.29:8780")
+    page.locator("#data_server_token").fill("offline-sync-token-" + "a" * 32)
+    page.locator("#save-config").click()
+    assert page.locator("#data_server_url").get_attribute("aria-invalid") == "true"
+    page.locator("#data_server_url").fill("http://127.0.0.1:8780")
+    page.locator("#save-config").click()
+    page.wait_for_function("document.getElementById('config-dirty').textContent === ''")
+    assert page.locator("#data_server_token").input_value() == "********"
+    assert "data_server_token" not in fixture.config
+    assert page.locator("#data-sync-now").is_enabled()
+    fixture.workbench["data_sync"].update(stage="offline", pending=3, error="无法连接数据服务")
+    refresh(page, fixture)
+    assert "待同步 3 条" in page.locator("#data-sync-status").inner_text()
+    assert "无法连接数据服务" in page.locator("#data-sync-status").inner_text()
+    page.locator("#data-sync-now").click()
+    page.wait_for_function("!document.getElementById('data-sync-now').disabled")
+    assert any(path == "/api/data-sync" and payload == {} for path, payload in fixture.posts)
+    for choice in ("server", "local"):
+        fixture.workbench["data_sync"].update(stage="connected", conflicts=2)
+        refresh(page, fixture)
+        page.once("dialog", lambda dialog: dialog.accept())
+        page.locator("#data-sync-" + choice).click()
+        page.locator("#data-sync-" + choice).wait_for(state="hidden")
+        assert any(path == "/api/data-sync" and payload == {"resolve": choice} for path, payload in fixture.posts)
+    assert_no_overflow(page, f"{label}: data settings overflow")
+    screenshot = ARTIFACTS / f"data-sync-settings-{unique}-{label}.png"
+    page.screenshot(path=str(screenshot), full_page=True)
+    print(screenshot.resolve())
+    fixture.workbench["tasks"].append({
+        "id": "remote-fixture", "device_id": "a" * 32, "remote_device": True,
+        "chat": "fixture_saved", "message_id": 42, "filename": "remote-only.zip", "title": "Remote only",
+        "download_status": "completed", "upload_status": "link_pending", "size": 100,
+        "received": 100, "images": [], "local_path": "", "validation": "passed",
+    })
+    refresh(page, fixture)
+    page.locator(".nav-item[data-view='download']").click()
+    remote = page.locator("[data-task-id='remote-fixture']")
+    remote.wait_for(state="visible")
+    assert remote.locator(".task-checkbox").is_disabled()
+    assert remote.locator(".row-link").is_hidden()
+    remote.locator(".task-title").click()
+    assert page.locator("#detail-path").inner_text() == "文件位于其他设备"
+    assert page.locator("#open-task").is_hidden() and page.locator("#retry-link").is_hidden()
+    page.keyboard.press("Escape")
+    # A different computer's completed file must not block a new local download.
+    fixture.catalog.update(channel="fixture_saved", messages=[{
+        "message_id": 42, "chat": "fixture_saved", "filename": "remote-only.zip",
+        "size": 100, "cover_url": "", "cover_status": "no_cover", "date": "", "text": "",
+    }])
+    page.locator(".nav-item[data-view='messages']").click()
+    page.locator("[data-message-id='42'] [data-channel-action='download']").wait_for(state="visible")
+    assert page.locator("[data-message-id='42'] [data-channel-action='download']").is_enabled()
     assert not errors, errors
 
 
@@ -445,6 +510,10 @@ def check(executable: Path | None = None) -> None:
                         page.set_default_timeout(5000)
                         try:
                             check_view(page, Fixture(origin), origin, label, unique)
+                        except Exception:
+                            print(page.locator("#errors").inner_text())
+                            print(page.evaluate("document.getElementById('config-fields').disabled"))
+                            raise
                         finally:
                             page.close()
                 finally:

@@ -11,6 +11,7 @@ import threading
 import time
 import webbrowser
 import zipfile
+from dataclasses import replace
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,6 +32,7 @@ from .browser_profiles import check_browser, resolve_browser_profile, version_te
 from .browser_download import DownloadCancelled
 from .channel_catalog import ChannelCatalog
 from .channel_sources import ChannelDirectory, normalize_public_channel
+from .server_sync import ServerSync
 from .local_settings import remember_telegram_settings, restore_telegram_settings
 from .workbench import TransferStore, channel_key, image_type
 from .admin_auth import AuthHandlerMixin, AdminAuth, LOGOUT_HTML
@@ -111,6 +113,11 @@ def config_payload(config: PipelineConfig) -> dict:
         visible_proxy_url = ""
     return {
         "source_chat": "",
+        "data_server_enabled": config.data_server_enabled,
+        "data_server_url": config.data_server_url,
+        "data_server_workspace": config.data_server_workspace,
+        "data_server_interval_seconds": config.data_server_interval_seconds,
+        "data_server_token_configured": bool(config.data_server_token),
         "browser_executable_path": config.browser_executable_path,
         "telegram_api_id": config.telegram_api_id,
         "telegram_api_configured": bool(config.telegram_api_hash),
@@ -173,7 +180,7 @@ def browser_payload(config: PipelineConfig) -> dict:
 def write_config(path: Path, payload: dict) -> None:
     existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     updates = dict(payload)
-    for secret in ("telegram_api_hash", "quark_cookie"):
+    for secret in ("telegram_api_hash", "quark_cookie", "data_server_token"):
         if not updates.get(secret):
             updates.pop(secret, None)
     existing.update(updates)
@@ -289,8 +296,12 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     catalog = ChannelCatalog(PipelineConfig.from_json(config_path).output_dir)
     channels = ChannelDirectory(PipelineConfig.from_json(config_path).output_dir)
     initial_config = PipelineConfig.from_json(config_path)
-    if initial_config.source_channel_url:
+    if initial_config.source_channel_url and (not initial_config.data_server_enabled or not channels.path.exists()):
         channels.ensure(initial_config.source_channel_url)
+    server_sync = ServerSync(initial_config, channels, catalog, transfers,
+                             control_lock=state.control_lock, is_busy=lambda: state.running)
+    if initial_config.data_server_enabled:
+        server_sync.start()
     logging.info("Telegram API 频道工作台; 配置文件=%s", config_path)
 
     auto_upload_candidates: set[str] = set()
@@ -422,7 +433,10 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 self.end_headers()
                 self.wfile.write(body)
             elif path == "/api/workbench":
-                self.json_response({**transfers.snapshot(), **{key: value for key, value in state.snapshot().items() if key != "logs"}})
+                self.json_response({**transfers.snapshot(), **{key: value for key, value in state.snapshot().items() if key != "logs"},
+                                    "data_sync": server_sync.snapshot()})
+            elif path == "/api/data-sync":
+                self.json_response(server_sync.snapshot())
             elif path == "/api/channels":
                 config = PipelineConfig.from_json(config_path)
                 self.json_response(channels.list(config.source_channel_url))
@@ -469,6 +483,15 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     if asset.parent != root or image_type(asset) != "image/jpeg":
                         raise ValueError("频道头像不存在")
                     self.file_response(asset, "image/jpeg")
+                except (ValueError, OSError):
+                    self.send_error(404)
+            elif re.fullmatch(r"/api/synced-image/[a-f0-9]{64}\.(?:jpg|png|gif|webp)", path):
+                asset = (server_sync.root / "assets" / path.rsplit("/", 1)[1]).resolve()
+                try:
+                    mime = image_type(asset)
+                    if asset.parent != (server_sync.root / "assets").resolve() or not mime:
+                        raise ValueError("同步图片不存在")
+                    self.file_response(asset, mime)
                 except (ValueError, OSError):
                     self.send_error(404)
             else:
@@ -527,12 +550,16 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         allowed = set(config_payload(existing)) - {
                             "download_dir", "log_path", "unverified_dir", "telegram_api_configured",
                             "telegram_crypto_backend", "quark_cookie_configured",
+                            "data_server_token_configured",
                         }
-                        allowed.update({"telegram_scan_limit", "cloud_folder", "telegram_api_hash", "quark_cookie"})
+                        allowed.update({"telegram_scan_limit", "cloud_folder", "telegram_api_hash", "quark_cookie", "data_server_token"})
                         payload = {key: value for key, value in arguments.items() if key in allowed}
                         if arguments.get("telegram_access_mode", "api") != "api" or arguments.get("telegram_run_mode", "once") != "once":
                             raise ValueError("仅支持 Telegram API 抓取一次")
                         validate_source_settings({**config_payload(existing), **payload}, existing)
+                        replace(existing, **{key: value for key, value in payload.items()
+                                             if key.startswith("data_server_") and
+                                             (key != "data_server_token" or value)})
                         if "inbox_dir" in payload:
                             payload["inbox_dir"] = str(prepare_download_directory(payload["inbox_dir"]))
                         payload.update({"fetch_mode": "recent", "source_chat": "", "message_ids": [],
@@ -549,12 +576,31 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 }
                             elif saved_config.source_channel_url != existing.source_channel_url:
                                 state.channel_scan = {}
-                        if saved_config.source_channel_url:
+                        if saved_config.source_channel_url and (not saved_config.data_server_enabled
+                                or saved_config.source_channel_url != existing.source_channel_url or not channels.path.exists()):
                             channels.ensure(saved_config.source_channel_url)
                     except (ValueError, RuntimeError, OSError) as exc:
                         self.json_response({"message": str(exc)}, 400)
                         return
+                server_sync.configure(saved_config)
+                if saved_config.data_server_enabled:
+                    server_sync.start()
                 self.json_response({"message": "配置已保存"})
+            elif path == "/api/data-sync":
+                if set(arguments) - {"resolve"}:
+                    self.json_response({"message": "同步参数无效"}, 400)
+                    return
+                if arguments:
+                    try:
+                        server_sync.resolve(arguments.get("resolve"))
+                    except ValueError as exc:
+                        self.json_response({"message": str(exc)}, 400)
+                        return
+                if not server_sync.config.data_server_enabled:
+                    self.json_response({"message": "请先在设置中启用服务器数据同步"}, 400)
+                    return
+                server_sync.wake.set()
+                self.json_response({"message": "已请求同步"})
             elif path == "/api/names/save":
                 with state.control_lock:
                     if state.running:
@@ -1158,4 +1204,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        server.shutdown()
+        pass
+    finally:
+        server_sync.close()
+        if hasattr(server, "server_close"):
+            server.server_close()

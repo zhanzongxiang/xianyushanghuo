@@ -173,6 +173,16 @@
       <section id="settings-section" class="settings-section" hidden>
         <form id="config-form" novalidate autocomplete="off">
           <fieldset id="config-fields" disabled>
+            <section class="form-section"><h2>服务器数据</h2><div class="form-grid">
+              <label class="toggle-field"><span>启用服务器同步</span><input id="data_server_enabled" type="checkbox" role="switch"></label>
+              <label>工作空间<input id="data_server_workspace" type="text" value="default" maxlength="64" autocomplete="off" spellcheck="false"></label>
+              <label>数据服务地址<input id="data_server_url" type="url" placeholder="http://127.0.0.1:8780" autocomplete="off" spellcheck="false"></label>
+              <label>访问令牌<input id="data_server_token" type="password" autocomplete="new-password" spellcheck="false"></label>
+              <label>同步间隔（秒）<input id="data_server_interval_seconds" type="number" min="5" max="300" step="1" value="10"></label>
+              <output id="data-sync-status" class="wide field-hint" role="status">未启用</output>
+              <details id="data-sync-conflicts" class="wide sync-conflicts" hidden><summary>冲突记录对比（最多展示 20 条）</summary><div id="data-sync-conflict-list"></div></details>
+              <div class="wide inline-actions sync-actions"><button id="data-sync-now" type="button"><i data-lucide="refresh-cw"></i>立即同步</button><button id="data-sync-server" type="button" hidden><i data-lucide="cloud-download"></i>冲突采用服务器版本</button><button id="data-sync-local" type="button" hidden><i data-lucide="upload"></i>冲突保留本机版本</button></div>
+            </div></section>
             <section class="form-section"><h2>来源与获取</h2><div class="form-grid">
               <label>来源频道<select id="source_channel_url"><option value="">不选择频道</option></select></label>
               <label>扫描下载数量<input id="recent_message_limit" type="number" min="1" max="100" step="1"></label>

@@ -15,6 +15,7 @@ class PipelineConfig:
     source_channel_url: str = "https://t.me/free_3d_models_download"
     fetch_mode: str = "message_ids"
     recent_message_limit: int = 20
+    channel_message_limit: int = 100
     telegram_run_mode: str = "once"
     telegram_scan_limit: int = 200
     message_ids: list[int] = field(default_factory=list)
@@ -23,7 +24,11 @@ class PipelineConfig:
     output_dir: Path = Path("data/output")
     cloud_folder: str = ""
     upload_provider: str = "local"
+    auto_upload_after_download: bool = False
+    rename_translation_provider: str = "mymemory"
+    rename_glossary: str = ""
     telegram_access_mode: str = "api"
+    exclude_forwarded_posts: bool = False
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
     telegram_api_proxy_url: str = ""
@@ -36,12 +41,17 @@ class PipelineConfig:
     download_start_timeout_seconds: int = 180
     download_start_grace_seconds: int = 30
     download_transfer_timeout_seconds: int = 3600
+    download_workers: int = 4
+    download_file_concurrency: int = 2
     archive_test_executable_path: str = ""
     archive_test_timeout_seconds: int = 600
     telegram_message_selector: str = ""
     telegram_attachment_selector: str = ""
     quark_cookie: str = ""
-    quark_share_expire_days: int = 0
+    quark_api_parent_fid: str = "0"
+    quark_api_timeout_seconds: int = 60
+    quark_api_file_concurrency: int = 2
+    quark_share_expire_days: int = 7
     quark_folder_url: str = ""
     quark_browser_profile: Path = Path("data/quark_browser_profile")
     quark_headless: bool = True
@@ -50,6 +60,17 @@ class PipelineConfig:
     quark_file_row_selector: str = ""
     quark_share_button_selector: str = ""
     quark_share_link_selector: str = ""
+    quark_share_create_button_selector: str = ""
+    quark_folder_ready_selector: str = ""
+    quark_cli_mode: str = "wsl"
+    quark_cli_executable_path: str = "wsl.exe"
+    quark_cli_wsl_distribution: str = ""
+    quark_cli_node_command: str = "node"
+    quark_cli_script_path: str = ""
+    quark_cli_parent_fid: str = ""
+    quark_cli_timeout_seconds: int = 3600
+    quark_cli_share_expired_type: int = 1
+    quark_cli_share_url_type: int = 1
     make_sfx: bool = False
     allow_executable: bool = False
     require_manual_review: bool = True
@@ -65,6 +86,16 @@ class PipelineConfig:
         ".jpeg",
         ".webp",
     )
+
+    def __post_init__(self) -> None:
+        if type(self.download_workers) is not int or not 1 <= self.download_workers <= 8:
+            raise ValueError("download_workers 必须为 1 到 8 的整数")
+        if type(self.download_file_concurrency) is not int or not 1 <= self.download_file_concurrency <= 2:
+            raise ValueError("download_file_concurrency 必须为 1 到 2 的整数")
+        if type(self.quark_api_file_concurrency) is not int or not 1 <= self.quark_api_file_concurrency <= 3:
+            raise ValueError("quark_api_file_concurrency 必须为 1 到 3 的整数")
+        if type(self.quark_api_timeout_seconds) is not int or not 10 <= self.quark_api_timeout_seconds <= 600:
+            raise ValueError("quark_api_timeout_seconds 必须为 10 到 600 的整数秒")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "PipelineConfig":
@@ -103,3 +134,12 @@ class PipelineConfig:
             "archive_test_executable_path": self.archive_test_executable_path,
             "archive_test_timeout_seconds": self.archive_test_timeout_seconds,
         }
+
+    def cloud_upload_target(self) -> str:
+        if self.upload_provider == "quark_api":
+            return self.quark_api_parent_fid
+        if self.upload_provider == "quark_browser":
+            return self.quark_folder_url
+        if self.upload_provider == "quark_cli":
+            return self.quark_cli_parent_fid
+        return self.cloud_folder

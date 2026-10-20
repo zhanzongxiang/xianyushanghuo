@@ -1,4 +1,6 @@
 telethon>=1.36,<2
+cryptg>=0.5,<0.6
 python-socks[asyncio]>=2,<3
 playwright>=1.45,<2
+httpx>=0.28,<0.29
 pyinstaller>=6.0,<7

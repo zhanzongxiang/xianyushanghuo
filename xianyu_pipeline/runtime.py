@@ -6,6 +6,26 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+def telegram_crypto_backend() -> str:
+    from telethon.crypto import aes
+
+    if aes.cryptg is not None:
+        return "cryptg"
+    if aes.libssl.encrypt_ige and aes.libssl.decrypt_ige:
+        return "OpenSSL"
+    return "Python"
+
+
+def check_download_acceleration() -> dict:
+    from telethon.crypto.aes import AES
+
+    data, key, iv = bytes(range(256)) * 16, bytes(range(32)), bytes(range(32, 64))
+    encrypted = AES.encrypt_ige(data, key, iv)
+    if AES.decrypt_ige(encrypted, key, iv) != data:
+        raise RuntimeError("Telegram 下载加速组件加解密自检失败")
+    return {"crypto_backend": telegram_crypto_backend(), "self_test": "passed"}
+
+
 def validate_browser_path(value: str) -> Path:
     value = str(value).strip().strip('"')
     if not value:
@@ -40,5 +60,7 @@ def configure_logging(log_dir: Path, memory_handler: logging.Handler | None = No
         handler._pipeline_handler = True
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
         root.addHandler(handler)
+    from .download_diagnostics import configure_diagnostics
+    configure_diagnostics(log_dir)
     logging.info("运行日志: %s", log_path)
     return log_path

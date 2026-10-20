@@ -36,7 +36,7 @@ def package(folder: Path, example: Path, archive: Path) -> None:
                 raise ValueError("Portable ZIP failed CRC check")
             entries = result.namelist()
             if any("/.local-browsers/" in name or "/sample_data/" in name
-                   or name.endswith((".session", "pipeline-browser.json")) for name in entries):
+                   or name.endswith((".session", "pipeline-browser.json", "telegram-settings.json")) for name in entries):
                 raise ValueError("Portable ZIP contains runtime or browser state")
             if json.loads(result.read(f"{folder.name}/test.local.json")) != sample:
                 raise ValueError("Portable ZIP configuration mismatch")

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import socket
 import shutil
 import sys
 import ctypes
@@ -23,6 +24,9 @@ from .archive_validation import ArchiveValidationError, validate_rar
 from .browser_download import BrowserDownloadMonitor, DownloadCancelled
 from .models import SourceMessage
 from .browser_profiles import launch_browser_context
+from .download_scheduler import DownloadScheduler
+from .download_diagnostics import DownloadTrace
+from .runtime import telegram_crypto_backend
 
 
 class TelegramAdapter(Protocol):
@@ -89,6 +93,8 @@ class _TransferEvents:
                          image_source="", image_message_ids=[], image_group_id="")
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", chat) and chat != "joinchat" and message_id > 0:
             self.data["source_url"] = f"https://t.me/{chat}/{message_id}"
+        elif re.fullmatch(r"-[0-9]+", chat) and int(chat) < -1000000000000 and message_id > 0:
+            self.data["source_url"] = f"https://t.me/c/{-int(chat) - 1000000000000}/{message_id}"
         self.sample_time = None
         self.sample_bytes = 0
         self.terminal = False
@@ -139,6 +145,14 @@ _PREVIEW_TIMEOUT_SECONDS = 3.0
 _PHOTO_LOOKUP_TIMEOUT_SECONDS = 5.0
 _PHOTO_TIMEOUT_SECONDS = 8.0
 _ALBUM_TIMEOUT_SECONDS = 25.0
+_CATALOG_COVER_CONCURRENCY = 4
+_CATALOG_PREVIEW_TIMEOUT_SECONDS = 30.0
+_CATALOG_FULL_TIMEOUT_SECONDS = 90.0
+_CHANNEL_LIST_TIMEOUT_SECONDS = 180.0
+_CHANNEL_AVATAR_TIMEOUT_SECONDS = 4.0
+_CHANNEL_AVATAR_BATCH_TIMEOUT_SECONDS = 30.0
+_ARCHIVE_PARALLEL_MIN_BYTES = 8 * 1024 * 1024
+_ARCHIVE_REQUEST_BYTES = 512 * 1024
 
 
 class TelethonTelegramAdapter:
@@ -153,9 +167,15 @@ class TelethonTelegramAdapter:
                  archive_test_timeout_seconds: int = 600, proxy_url: str = "",
                  dc2_server: str = "", download_start_timeout_seconds: int = 180,
                  download_transfer_timeout_seconds: int = 3600, stop_event: Event | None = None,
-                 on_event: Callable[[dict], None] | None = None):
+                 on_event: Callable[[dict], None] | None = None,
+                 exclude_forwarded_posts: bool = False, download_workers: int = 4,
+                 download_file_concurrency: int = 2):
         if not api_id or not api_hash:
             raise ValueError("Telegram 适配器需要 api_id 和 api_hash")
+        if type(download_workers) is not int or not 1 <= download_workers <= 8:
+            raise ValueError("download_workers 必须为 1 到 8 的整数")
+        if type(download_file_concurrency) is not int or not 1 <= download_file_concurrency <= 2:
+            raise ValueError("download_file_concurrency 必须为 1 到 2 的整数")
         self.api_id = api_id
         self.api_hash = api_hash
         self.session_path = str(session_path)
@@ -167,11 +187,19 @@ class TelethonTelegramAdapter:
         self.dc2_server = parse_telegram_dc2_server(dc2_server)
         self.download_start_timeout_seconds = download_start_timeout_seconds
         self.download_transfer_timeout_seconds = download_transfer_timeout_seconds
+        self.download_workers = download_workers
+        self.download_file_concurrency = download_file_concurrency
         self.stop_event = stop_event
         self.on_event = on_event
+        self.exclude_forwarded_posts = exclude_forwarded_posts
 
     def _client(self):
         from telethon.sync import TelegramClient
+        backend = telegram_crypto_backend()
+        logging.info("Telegram 下载解密组件: %s; 同时下载文件=%d, 单文件分块=%d, 媒体请求上限=%d",
+                     backend, self.download_file_concurrency, self.download_workers, DownloadScheduler.request_limit)
+        if backend == "Python":
+            logging.warning("Telegram 正在使用较慢的 Python 解密，请安装 cryptg 或更新便携包")
         if self.proxy:
             try:
                 import python_socks  # noqa: F401
@@ -224,9 +252,170 @@ class TelethonTelegramAdapter:
             client.disconnect()
         logging.info("Telegram API 登录成功，会话已保存在本机")
 
+    def list_joined_channels(self, *, limit: int | None = None,
+                             avatar_dir: Path | None = None) -> list[dict]:
+        """Read all joined broadcast channels, including archived dialogs."""
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 5000):
+            raise ValueError("已加入频道扫描数量必须为 1 到 5000 的整数")
+        Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
+        client = self._client()
+        rows, avatar_jobs = [], []
+
+        async def resolve(value):
+            return await value if inspect.isawaitable(value) else value
+
+        def check_stop():
+            if self.stop_event and self.stop_event.is_set():
+                raise DownloadCancelled("已请求停止已加入频道扫描")
+
+        async def scan():
+            check_stop()
+            try:
+                await resolve(client.connect())
+            except (ConnectionError, OSError) as exc:
+                raise RuntimeError("Telegram API 无法连接，请检查网络或配置的代理") from exc
+            if not await resolve(client.is_user_authorized()):
+                raise RuntimeError("Telegram API 尚未登录，请先在设置中完成账号授权")
+            # folder=None includes both normal and archived dialogs in Telethon.
+            iterator = client.iter_dialogs(limit=limit, folder=None)
+
+            async def dialogs():
+                if hasattr(iterator, "__aiter__"):
+                    async for dialog in iterator:
+                        yield dialog
+                else:
+                    for dialog in iterator:
+                        yield dialog
+
+            seen = set()
+            async for dialog in dialogs():
+                check_stop()
+                entity = getattr(dialog, "entity", None)
+                if (entity is None or not getattr(entity, "broadcast", False)
+                        or getattr(entity, "megagroup", False)
+                        or getattr(entity, "left", False)
+                        or getattr(entity, "deactivated", False)
+                        or type(entity).__name__ == "ChannelForbidden"):
+                    continue
+                identity = int(getattr(entity, "id", 0) or 0)
+                if identity <= 0 or identity in seen:
+                    continue
+                seen.add(identity)
+                username = str(getattr(entity, "username", "") or "").strip()
+                title = str(getattr(entity, "title", "") or getattr(dialog, "name", "") or "").strip()
+                url = f"https://t.me/{username}" if username else ""
+                # Telethon marks channel peers by adding a 10^12 offset.
+                key = username.lower() if username else str(-(1000000000000 + identity))
+                row = {
+                    "id": identity, "title": title or username or str(identity),
+                    "username": username, "key": key, "target": url or key,
+                    "url": url, "public": bool(username), "avatar_url": "",
+                    "verified": bool(getattr(entity, "verified", False)),
+                    "scam": bool(getattr(entity, "scam", False)),
+                    "fake": bool(getattr(entity, "fake", False)),
+                }
+                rows.append(row)
+                if avatar_dir is not None and getattr(entity, "photo", None):
+                    avatar_jobs.append((entity, row))
+                await asyncio.sleep(0)
+
+        async def avatars():
+            from .workbench import image_type
+
+            semaphore = asyncio.Semaphore(4)
+            root = Path(avatar_dir).resolve()
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logging.warning("频道头像缓存目录不可写，继续展示频道名称")
+                return
+
+            async def photo(entity, row):
+                async with semaphore:
+                    check_stop()
+                    destination = root / f"{row['id']}.jpg"
+                    metadata = root / f"{row['id']}.json"
+                    version = int(getattr(entity.photo, "photo_id", 0) or 0)
+                    avatar_url = f"/api/channel-avatar/{row['id']}?v={version}"
+                    try:
+                        if (version and destination.resolve().parent == root
+                                and metadata.resolve().parent == root
+                                and image_type(destination) == "image/jpeg"
+                                and json.loads(metadata.read_text(encoding="utf-8")).get("photo_id") == version):
+                            row["avatar_url"] = avatar_url
+                            return
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                    candidate = root / f"{row['id']}-{uuid4().hex}.jpg"
+                    try:
+                        returned = await asyncio.wait_for(
+                            resolve(client.download_profile_photo(
+                                entity, file=str(candidate), download_big=False)),
+                            timeout=_CHANNEL_AVATAR_TIMEOUT_SECONDS,
+                        )
+                        source = Path(returned).resolve() if isinstance(returned, (str, Path)) else candidate
+                        if source.parent != root or image_type(source) != "image/jpeg":
+                            return
+                        source.replace(destination)
+                        row["avatar_url"] = avatar_url
+                        if metadata.resolve().parent == root:
+                            temporary = metadata.with_name(f"{row['id']}-{uuid4().hex}.json.tmp")
+                            temporary.write_text(json.dumps({"photo_id": version}), encoding="utf-8")
+                            temporary.replace(metadata)
+                    except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as exc:
+                        logging.debug("频道 %s 头像获取失败: %s", row["id"], exc)
+                    except Exception as exc:
+                        logging.debug("频道 %s 头像不可用: %s", row["id"], exc)
+                    finally:
+                        try:
+                            candidate.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
+            jobs = [asyncio.create_task(photo(entity, row)) for entity, row in avatar_jobs]
+            try:
+                await asyncio.wait_for(asyncio.gather(*jobs),
+                                       timeout=_CHANNEL_AVATAR_BATCH_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logging.info("频道头像获取达到时间限制，频道列表已保留")
+            finally:
+                for job in jobs:
+                    if not job.done():
+                        job.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+
+        async def retrieve():
+            await asyncio.wait_for(scan(), timeout=_CHANNEL_LIST_TIMEOUT_SECONDS)
+            if avatar_jobs:
+                await avatars()
+
+        async def guarded():
+            task = asyncio.create_task(retrieve())
+            try:
+                while True:
+                    check_stop()
+                    done, _ = await asyncio.wait((task,), timeout=0.2)
+                    if done:
+                        return await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await resolve(client.disconnect())
+
+        try:
+            coroutine = guarded()
+            loop = getattr(client, "loop", None)
+            loop.run_until_complete(coroutine) if loop is not None else asyncio.run(coroutine)
+            rows.sort(key=lambda row: (row["title"].casefold(), row["id"]))
+            logging.info("Telegram API 已加入频道扫描完成: %d 个频道", len(rows))
+            return rows
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("获取账号频道超时，请检查网络或代理后重试") from exc
+
     @staticmethod
-    def normalize_channel(channel: str) -> str:
-        value = channel.strip()
+    def normalize_channel(channel: str) -> str | int:
+        value = str(channel).strip()
         if value.startswith("https://t.me/") or value.startswith("http://t.me/"):
             parsed = urlparse(value)
             if parsed.hostname != "t.me":
@@ -238,7 +427,7 @@ class TelethonTelegramAdapter:
         value = value.removeprefix("@").strip()
         if not value or not re.fullmatch(r"[A-Za-z0-9_+\-]+", value):
             raise ValueError("频道链接或用户名格式不正确")
-        return value
+        return int(value) if re.fullmatch(r"-[0-9]+", value) else value
 
     @staticmethod
     def _archive_name(message) -> str | None:
@@ -247,22 +436,103 @@ class TelethonTelegramAdapter:
             return name
         return None
 
-    async def _download_preview(self, client, media, message_id: int, timeout: float) -> str:
-        preview = self.download_dir.resolve() / ".previews" / f"{int(message_id)}-{uuid4().hex}.jpg"
+    @staticmethod
+    def _series_info(filename: str) -> tuple[str, str, int | None]:
+        """Return a stable series key/name/index for split archive volumes."""
+        stem = Path(filename).stem
+        match = re.search(r"(?:[._\- ]?part)[._\- ]?(\d+)$", stem, re.I)
+        if not match:
+            return stem.casefold(), stem, None
+        base = stem[:match.start()].rstrip(" ._-" )
+        return base.casefold(), base, int(match.group(1))
+
+    @classmethod
+    def _annotate_series(cls, rows: list[dict]) -> None:
+        groups: dict[str, list[dict]] = {}
+        for row in rows:
+            key, name, index = cls._series_info(str(row.get("filename", "")))
+            row["series_key"] = key
+            row["series_name"] = name
+            row["series_index"] = index
+            groups.setdefault(key, []).append(row)
+        for members in groups.values():
+            is_series = len(members) > 1 or any(item.get("series_index") is not None for item in members)
+            for item in members:
+                item["series"] = is_series
+                item["series_total"] = len(members) if is_series else 1
+
+    def _is_channel_post(self, message) -> bool:
+        if not message or getattr(message, "post", True) is False:
+            return False
+        return not self.exclude_forwarded_posts or not getattr(message, "fwd_from", None)
+
+    async def _download_preview(self, client, media, message_id: int, timeout: float,
+                                 directory: Path | None = None, thumb: int = -1) -> str:
+        # Telethon 1.45 accepts size-type strings, but _get_thumb does not
+        # accept PhotoSizeProgressive instances even though it can download them.
+        # Resolve by type against this media's sizes instead of passing the object.
+        thumb = getattr(thumb, "type", thumb)
+        preview = (directory or self.download_dir.resolve() / ".previews") / f"{int(message_id)}-{uuid4().hex}.jpg"
         saved = False
         try:
             preview.parent.mkdir(parents=True, exist_ok=True)
 
             async def transfer():
-                result = client.download_media(media, file=str(preview), thumb=-1)
+                result = client.download_media(media, file=str(preview), thumb=thumb)
                 return await result if inspect.isawaitable(result) else result
 
             returned = await asyncio.wait_for(transfer(), timeout=timeout)
-            if not returned or Path(returned).resolve() != preview or not preview.is_file():
+            # Telethon normally returns the requested path, but cached photo sizes
+            # and some document-thumbnail paths may return the bytes or None.
+            # Persist returned bytes before probing the filesystem.
+            if isinstance(returned, (bytes, bytearray, memoryview)) and returned:
+                preview.write_bytes(bytes(returned))
+            elif returned is None and not preview.is_file():
+                # A stale PhotoSize/file reference can make Telethon return None
+                # without creating the requested file. Retry in memory so the
+                # high-resolution preview does not fail only because of a path
+                # naming quirk in the Telegram client.
+                try:
+                    fallback = client.download_media(media, file=bytes, thumb=thumb)
+                    fallback = await asyncio.wait_for(fallback, timeout=timeout) if inspect.isawaitable(fallback) else fallback
+                except (TypeError, ValueError, OSError):
+                    fallback = None
+                if isinstance(fallback, (bytes, bytearray, memoryview)) and fallback:
+                    preview.write_bytes(bytes(fallback))
+            # The file written by the transfer is the source of truth.
+            candidates: list[Path] = []
+            if preview.is_file():
+                candidates.append(preview)
+            if isinstance(returned, (str, Path)):
+                returned_path = Path(returned)
+                if not returned_path.is_absolute():
+                    returned_path = Path.cwd() / returned_path
+                try:
+                    if returned_path.is_file() and returned_path.resolve().parent == preview.resolve().parent:
+                        candidates.append(returned_path)
+                except OSError:
+                    pass
+            try:
+                for sibling in preview.parent.glob(f"{preview.stem}.*"):
+                    if sibling.is_file():
+                        candidates.append(sibling)
+            except OSError:
+                pass
+            source = next((path for path in candidates if path.is_file()), None)
+            if source is None:
+                generated = []
+                try:
+                    generated = [path.name for path in preview.parent.glob(f"{preview.stem}.*")]
+                except OSError:
+                    pass
+                logging.warning(
+                    "预览图未生成预期文件: 请求=%s, 返回=%r, 同前缀文件=%s",
+                    preview, returned, generated,
+                )
                 raise RuntimeError("预览图未生成预期文件")
-            if preview.stat().st_size > 12 * 1024 * 1024:
+            if source.stat().st_size > 12 * 1024 * 1024:
                 raise RuntimeError("预览图超过 12 MiB 限制")
-            with preview.open("rb") as stream:
+            with source.open("rb") as stream:
                 header = stream.read(12)
             # Telegram can return a video thumbnail. Only publish bitmap previews.
             if header.startswith(b"\xff\xd8\xff"):
@@ -274,15 +544,20 @@ class TelethonTelegramAdapter:
             else:
                 raise RuntimeError("预览内容不是支持的图片")
             target = preview.with_suffix(suffix)
-            if target != preview:
-                preview.replace(target)
+            if source != target:
+                if source.resolve().parent == target.resolve().parent:
+                    source.replace(target)
+                else:
+                    shutil.copyfile(source, target)
             saved = True
             return str(target)
         finally:
             # Failed or timed-out thumbnail writes must never become image_paths.
-            if preview.exists() and not saved:
+            if not saved:
                 try:
-                    preview.unlink()
+                    for path in preview.parent.glob(f"{preview.stem}.*"):
+                        if path.is_file():
+                            path.unlink()
                 except OSError:
                     logging.warning("缩略图临时文件清理失败: %s", preview)
 
@@ -299,8 +574,7 @@ class TelethonTelegramAdapter:
                             message.id, type(exc).__name__, exc)
             return []
 
-    @staticmethod
-    def _preceding_photo_group(history, archive_id: int) -> list:
+    def _preceding_photo_group(self, history, archive_id: int) -> list:
         from telethon.tl.types import MessageMediaPhoto
 
         photos = []
@@ -309,7 +583,7 @@ class TelethonTelegramAdapter:
         for item in history:
             # Unfiltered history preserves intervening text/files as hard boundaries.
             # message.photo alone also includes webpage and service-message photos.
-            if (not item or not isinstance(getattr(item, "media", None), MessageMediaPhoto)
+            if (not self._is_channel_post(item) or not isinstance(getattr(item, "media", None), MessageMediaPhoto)
                     or not getattr(item, "photo", None) or not 0 < item.id < previous_id):
                 break
             current_group = getattr(item, "grouped_id", None)
@@ -323,6 +597,11 @@ class TelethonTelegramAdapter:
         return list(reversed(photos))
 
     def _download_preceding_photos(self, client, message, chat: str) -> dict:
+        coroutine = self._download_preceding_photos_async(client, message, chat)
+        loop = getattr(client, "loop", None)
+        return loop.run_until_complete(coroutine) if loop is not None else asyncio.run(coroutine)
+
+    async def _download_preceding_photos_async(self, client, message, chat: str) -> dict:
         if self.on_event is None:
             return {}
         paths, message_ids = [], []
@@ -332,7 +611,7 @@ class TelethonTelegramAdapter:
             nonlocal group_id
 
             async def lookup():
-                result = client.get_messages(chat, limit=6, offset_id=message.id)
+                result = client.get_messages(self.normalize_channel(chat), limit=6, offset_id=message.id)
                 return await result if inspect.isawaitable(result) else result
 
             history = await asyncio.wait_for(lookup(), timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS)
@@ -355,7 +634,10 @@ class TelethonTelegramAdapter:
                 message_ids.append(photo.id)
 
         async def guarded():
-            task = asyncio.create_task(asyncio.wait_for(retrieve(), timeout=_ALBUM_TIMEOUT_SECONDS))
+            async def bounded():
+                return await asyncio.wait_for(retrieve(), timeout=_ALBUM_TIMEOUT_SECONDS)
+
+            task = asyncio.create_task(bounded())
             try:
                 while True:
                     if self.stop_event and self.stop_event.is_set():
@@ -369,11 +651,7 @@ class TelethonTelegramAdapter:
                 await asyncio.gather(task, return_exceptions=True)
 
         try:
-            loop = getattr(client, "loop", None)
-            if loop is None:
-                asyncio.run(guarded())
-            else:
-                loop.run_until_complete(guarded())
+            await guarded()
         except DownloadCancelled:
             for path in paths:
                 try:
@@ -382,18 +660,15 @@ class TelethonTelegramAdapter:
                     logging.warning("已取消任务的配图清理失败: %s", path)
             raise
         except (Exception, asyncio.CancelledError) as exc:
+            if isinstance(exc, asyncio.CancelledError) and asyncio.current_task().cancelling():
+                raise
             logging.warning("消息 %s 的前置配图获取未完成，保留 %d 张，附件继续传输: %s: %s",
                             message.id, len(paths), type(exc).__name__, exc)
         return {"image_paths": paths, "image_source": "preceding_album" if group_id else "preceding_photo",
                 "image_message_ids": message_ids, "image_group_id": group_id} if paths else {}
 
     def _download_archive(self, client, message, name: str, transfer: _TransferEvents | None = None) -> Path:
-        staging = self.download_dir / ".telegram-api-downloads" / uuid4().hex
-        source = staging / name
         try:
-            staging.mkdir(parents=True, exist_ok=True)
-            if self.stop_event and self.stop_event.is_set():
-                raise DownloadCancelled("已请求停止 Telegram API 下载")
             if transfer is not None:
                 previews = self._download_preceding_photos(client, message, transfer.data["chat"])
                 if self.stop_event and self.stop_event.is_set():
@@ -405,36 +680,174 @@ class TelethonTelegramAdapter:
                                         image_message_ids=[message.id], image_group_id="")
                 if previews:
                     transfer.emit("queued", **previews)
-            # Preview latency must not count towards the attachment's watchdog or speed.
+        except (Exception, asyncio.CancelledError) as exc:
+            if transfer is not None:
+                transfer.fail(exc)
+            raise
+        coroutine = self._download_archive_async(client, message, name, transfer)
+        loop = getattr(client, "loop", None)
+        return loop.run_until_complete(coroutine) if loop is not None else asyncio.run(coroutine)
+
+    async def _download_archive_async(self, client, message, name: str,
+                                      transfer: _TransferEvents | None = None,
+                                      scheduler: DownloadScheduler | None = None) -> Path:
+        scheduler = scheduler or DownloadScheduler(self.download_file_concurrency)
+        staging = self.download_dir / ".telegram-api-downloads" / uuid4().hex
+        source = staging / name
+        received = 0
+        parallel = False
+        trace = DownloadTrace(message=message, filename=name, client=client,
+                              workers=self.download_workers,
+                              file_concurrency=self.download_file_concurrency,
+                              crypto_backend=telegram_crypto_backend(), proxy=self.proxy)
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            if self.stop_event and self.stop_event.is_set():
+                raise DownloadCancelled("已请求停止 Telegram API 下载")
             started = last_progress = last_report = time.monotonic()
+            first_byte_at = None
             received = 0
 
             def on_progress(current: int, total: int | None) -> None:
-                nonlocal last_progress, last_report, received
+                nonlocal last_progress, last_report, received, first_byte_at
                 now = time.monotonic()
+                if current > 0 and first_byte_at is None:
+                    first_byte_at = now
+                    logging.info("Telegram API 首字节: 消息=%d, 等待=%.2f 秒", message.id, now - started)
                 received = current
                 last_progress = now
+                trace.progress(current)
                 if transfer is not None:
+                    callback_at = time.monotonic()
                     transfer.progress(current, total)
+                    trace.callback_s += time.monotonic() - callback_at
                 if current and (current == total or now - last_report >= 15):
                     logging.info("Telegram API 下载进度: 消息=%d, 已接收=%d/%s 字节",
                                  message.id, current, total if total is not None else "?")
                     last_report = now
 
+            size = getattr(message.file, "size", None)
+            parallel = (self.download_workers > 1 and type(size) is int
+                        and size >= _ARCHIVE_PARALLEL_MIN_BYTES
+                        and source.suffix.lower() in {".zip", ".rar"}
+                        and callable(getattr(client, "iter_download", None)))
+
+            async def parallel_download():
+                request_size = _ARCHIVE_REQUEST_BYTES
+                chunks = (size + request_size - 1) // request_size
+                worker_count = min(self.download_workers, chunks)
+                logging.info("Telegram API 单文件分块并发: 消息=%d, 工人=%d, 请求块=%d 字节",
+                             message.id, worker_count, request_size)
+                # 同一事件循环内 seek/write 之间没有 await，无需线程或多个会话。
+                # 不预分配文件；进度按成功写入的字节求和，不能使用最高 offset。
+                with source.open("wb", buffering=0) as output:
+                    async def worker(index):
+                        first = index * chunks // worker_count
+                        last = (index + 1) * chunks // worker_count
+                        position = first * request_size
+                        end = min(size, last * request_size)
+                        iterator = client.iter_download(
+                            message, offset=position, limit=last - first, request_size=request_size)
+                        failed = False
+                        try:
+                            stream = iterator.__aiter__()
+                            while position < end:
+                                queued_at = time.monotonic()
+                                trace.request_state(index, position, "queue")
+                                async with scheduler.requests:
+                                    request_at = time.monotonic()
+                                    trace.request_state(index, position, "fetch")
+                                    try:
+                                        chunk = await anext(stream)
+                                    except StopAsyncIteration:
+                                        break
+                                    fetched_at = time.monotonic()
+                                if self.stop_event and self.stop_event.is_set():
+                                    raise DownloadCancelled("已请求停止 Telegram API 下载")
+                                expected = min(request_size, end - position)
+                                if (not isinstance(chunk, (bytes, bytearray, memoryview))
+                                        or len(chunk) != expected):
+                                    raise RuntimeError(f"Telegram API 分块长度不一致: offset={position}, "
+                                                       f"预期={expected} 字节")
+                                trace.request_state(index, position, "write")
+                                write_at = time.monotonic()
+                                output.seek(position)
+                                written = output.write(chunk)
+                                if written != expected:
+                                    raise RuntimeError("Telegram API 分块文件写入不完整")
+                                trace.chunk(worker=index, offset=position, size=written,
+                                            queue_s=request_at - queued_at,
+                                            fetch_s=fetched_at - request_at,
+                                            write_s=time.monotonic() - write_at,
+                                            sender=getattr(stream, "_sender", None))
+                                position += written
+                                on_progress(received + written, size)
+                                if position == end:
+                                    break
+                            if position != end:
+                                raise RuntimeError(f"Telegram API 分块提前结束: offset={position}, "
+                                                   f"区间终点={end}")
+                        except BaseException as exc:
+                            failed = True
+                            trace.request_failed(index, exc)
+                            raise
+                        finally:
+                            close = getattr(iterator, "close", None) or getattr(iterator, "aclose", None)
+                            if close is not None:
+                                try:
+                                    result = close()
+                                    if inspect.isawaitable(result):
+                                        closing = asyncio.ensure_future(result)
+                                        try:
+                                            await asyncio.shield(closing)
+                                        except asyncio.CancelledError:
+                                            await closing
+                                            raise
+                                except Exception as exc:
+                                    if not failed:
+                                        raise
+                                    logging.warning("Telegram API 下载迭代器收尾失败: %s", type(exc).__name__)
+
+                    workers = [asyncio.create_task(worker(index)) for index in range(worker_count)]
+                    group = asyncio.gather(*workers)
+                    try:
+                        # 由 finally 统一取消，避免父任务取消时重复打断 worker 的 close。
+                        await asyncio.shield(group)
+                    finally:
+                        for job in workers:
+                            if not job.done():
+                                job.cancel()
+                        cleanup = asyncio.gather(group, *workers, return_exceptions=True)
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            await cleanup
+                            raise
+                if received != size:
+                    raise RuntimeError("Telegram API 分块总长度与消息元数据不一致")
+                return str(source)
+
             async def guarded_download():
                 nonlocal last_report
 
                 async def transfer():
-                    result = client.download_media(message, file=str(source), progress_callback=on_progress)
-                    return await result if inspect.isawaitable(result) else result
+                    if parallel:
+                        return await parallel_download()
+                    async with scheduler.requests:
+                        result = client.download_media(message, file=str(source), progress_callback=on_progress)
+                        return await result if inspect.isawaitable(result) else result
 
                 task = asyncio.create_task(transfer())
                 try:
                     while True:
+                        wait_at = time.monotonic()
                         done, _ = await asyncio.wait((task,), timeout=1)
+                        trace.max_loop_lag_s = max(trace.max_loop_lag_s,
+                                                  time.monotonic() - wait_at - 1)
                         if task in done:
                             return await task
                         now = time.monotonic()
+                        trace.heartbeat()
                         if self.stop_event and self.stop_event.is_set():
                             raise DownloadCancelled("已请求停止 Telegram API 下载")
                         if now - last_progress >= self.download_start_timeout_seconds:
@@ -450,17 +863,23 @@ class TelethonTelegramAdapter:
                 finally:
                     if not task.done():
                         task.cancel()
-                        await asyncio.gather(task, return_exceptions=True)
+                    cleanup = asyncio.gather(task, return_exceptions=True)
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                        raise
 
             if self.stop_event and self.stop_event.is_set():
                 raise DownloadCancelled("已请求停止 Telegram API 下载")
             if transfer is not None:
                 transfer.start()
+            trace.begin(parallel, _ARCHIVE_REQUEST_BYTES)
             logging.info("Telegram API 开始下载: 消息=%d, 文件=%s, 预期=%s 字节",
                          message.id, name, getattr(message.file, "size", "?"))
-            loop = getattr(client, "loop", None)
-            returned = (loop.run_until_complete(guarded_download()) if loop is not None
-                        else asyncio.run(guarded_download()))
+            returned = await guarded_download()
+            transferred_at = time.monotonic()
+            trace.transferred()
             if not returned or Path(returned).resolve() != source.resolve() or not source.is_file():
                 raise RuntimeError("Telegram API 下载未生成预期的压缩包文件")
             if self.stop_event and self.stop_event.is_set():
@@ -470,26 +889,46 @@ class TelethonTelegramAdapter:
             size = getattr(message.file, "size", None)
             if not source.stat().st_size or (size is not None and source.stat().st_size != size):
                 raise RuntimeError("Telegram API 下载文件大小与消息元数据不一致")
-            if source.suffix.lower() == ".zip":
-                with zipfile.ZipFile(source) as archive:
-                    bad = archive.testzip()
-                    if bad:
-                        raise RuntimeError(f"ZIP 内容校验失败: {bad}")
-            else:
-                validate_rar(source, self.archive_test_executable_path, self.archive_test_timeout_seconds)
+            def validate():
+                if source.suffix.lower() == ".zip":
+                    with zipfile.ZipFile(source) as archive:
+                        bad = archive.testzip()
+                        if bad:
+                            raise RuntimeError(f"ZIP 内容校验失败: {bad}")
+                else:
+                    validate_rar(source, self.archive_test_executable_path, self.archive_test_timeout_seconds)
+
+            # CRC/RAR tests must not block concurrent message and preview requests.
+            trace.validating()
+            validation = asyncio.create_task(asyncio.to_thread(validate))
+            try:
+                await asyncio.shield(validation)
+            except asyncio.CancelledError:
+                await validation
+                raise
+            if self.stop_event and self.stop_event.is_set():
+                raise DownloadCancelled("已请求停止 Telegram API 下载")
             target = self.download_dir / name
             index = 2
             while target.exists():
                 target = self.download_dir / f"{Path(name).stem}-{index}{Path(name).suffix}"
                 index += 1
+            trace.saving()
             source.replace(target)
             logging.info("Telegram API 附件已校验保存: 消息=%d, 文件=%s, 字节=%d",
                          message.id, target, target.stat().st_size)
+            elapsed = max(0.001, transferred_at - started)
+            logging.info("Telegram API 下载统计: 消息=%d, 传输耗时=%.2f 秒, 平均=%.2f MiB/s, 分块=%s",
+                         message.id, elapsed, target.stat().st_size / elapsed / 1024 / 1024,
+                         self.download_workers if parallel else 1)
             if transfer is not None:
                 transfer.emit("completed", local_path=str(target.resolve()), received=target.stat().st_size,
                               size=target.stat().st_size)
+            trace.finish("completed")
             return target
         except (Exception, asyncio.CancelledError, KeyboardInterrupt) as exc:
+            trace.finish("cancelled" if isinstance(exc, (DownloadCancelled, asyncio.CancelledError, KeyboardInterrupt))
+                         else "failed", exc)
             recovery = None
             detail = f"消息 {message.id} 的 {name} 下载失败: {exc}"
             if source.is_file():
@@ -509,10 +948,11 @@ class TelethonTelegramAdapter:
                     except OSError:
                         recovery = source
                         logging.exception("API 下载隔离失败，保留原暂存文件: %s", source)
-                    detail = (f"消息 {message.id} 的 {name} 未通过下载/校验，已接收 {size} 字节，"
+                    actual_received = received if parallel else size
+                    detail = (f"消息 {message.id} 的 {name} 未通过下载/校验，已接收 {actual_received} 字节，"
                               f"文件保留待检查: {recovery}; 原因: {exc}")
                 if transfer is not None:
-                    transfer.data["received"] = size
+                    transfer.data["received"] = received if parallel else size
             if transfer is not None:
                 transfer.fail(exc, recovery)
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
@@ -543,25 +983,75 @@ class TelethonTelegramAdapter:
                         else (client.get_messages(target, ids=mid) for mid in message_ids))
             chosen = []
             scanned = 0
+            excluded = 0
             for message in iterator:
                 scanned += 1
+                if message and not self._is_channel_post(message):
+                    excluded += 1
+                    continue
                 if message and (name := self._archive_name(message)):
                     chosen.append((message, name))
                     if mode == "recent" and len(chosen) >= limit:
                         break
-            logging.info("Telegram API 消息扫描: 检查=%d, ZIP/RAR 消息=%d, 目标=%d",
-                         scanned, len(chosen), limit)
+            logging.info("Telegram API 频道主帖扫描: 检查=%d, 排除=%d, ZIP/RAR 消息=%d, 目标=%d",
+                         scanned, excluded, len(chosen), limit)
+            if mode == "message_ids" and excluded and not chosen:
+                raise ValueError("所选消息不是频道主帖，或已被转发帖过滤排除")
             messages = []
-            jobs = [(message, name, _TransferEvents(self.on_event, message.id, target, name,
+            jobs = [(message, name, _TransferEvents(self.on_event, message.id, str(target), name,
                                                    message.message or "", getattr(message.file, "size", 0)))
                     for message, name in (reversed(chosen) if mode == "recent" else chosen)]
             for _, _, transfer in jobs:
                 transfer.emit("queued")
+            async def download_all():
+                scheduler = DownloadScheduler(self.download_file_concurrency)
+                batch_failed = False
+
+                async def download(message, name, transfer):
+                    nonlocal batch_failed
+                    async with scheduler.file():
+                        try:
+                            if batch_failed or self.stop_event and self.stop_event.is_set():
+                                raise DownloadCancelled("本批次已中止，未继续下载")
+                            if self.on_event is not None:
+                                async with scheduler.background():
+                                    previews = await self._download_preceding_photos_async(client, message, str(target))
+                                    if not previews and getattr(getattr(message, "document", None), "thumbs", None):
+                                        try:
+                                            path = await self._download_preview(
+                                                client, message.document, message.id, _PREVIEW_TIMEOUT_SECONDS)
+                                            previews = {"image_paths": [path], "image_source": "document_thumbnail",
+                                                        "image_message_ids": [message.id], "image_group_id": ""}
+                                        except DownloadCancelled:
+                                            raise
+                                        except asyncio.CancelledError:
+                                            if asyncio.current_task().cancelling():
+                                                raise
+                                            logging.warning("附件缩略图请求被取消，继续下载文件")
+                                        except Exception:
+                                            logging.warning("附件缩略图不可用，继续下载文件", exc_info=True)
+                                    if previews:
+                                        transfer.emit("queued", **previews)
+                            path = await self._download_archive_async(client, message, name, transfer, scheduler)
+                            return SourceMessage(message_id=message.id, chat=str(target),
+                                                 text=message.message or "", attachment_paths=[path])
+                        except BaseException:
+                            batch_failed = True
+                            raise
+
+                tasks = [asyncio.create_task(download(*job)) for job in jobs]
+                try:
+                    return await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
             try:
-                for message, name, transfer in jobs:
-                    path = self._download_archive(client, message, name, transfer)
-                    messages.append(SourceMessage(message_id=message.id, chat=target,
-                                                  text=message.message or "", attachment_paths=[path]))
+                coroutine = download_all()
+                loop = getattr(client, "loop", None)
+                messages = loop.run_until_complete(coroutine) if loop is not None else asyncio.run(coroutine)
             except (Exception, asyncio.CancelledError, KeyboardInterrupt) as exc:
                 for _, _, transfer in jobs:
                     if not transfer.terminal:
@@ -570,6 +1060,343 @@ class TelethonTelegramAdapter:
             return messages
         finally:
             client.disconnect()
+
+    @staticmethod
+    def _catalog_photo_size(media, *, full: bool = False):
+        from telethon.tl.types import PhotoCachedSize, PhotoSize, PhotoSizeProgressive
+
+        sizes = [size for size in (getattr(media, "sizes", None) or getattr(media, "thumbs", None) or [])
+                 if isinstance(size, (PhotoSize, PhotoCachedSize, PhotoSizeProgressive)) and size.w > 0 and size.h > 0]
+        sizes.sort(key=lambda size: (max(size.w, size.h), size.w * size.h))
+        if not sizes:
+            return -1
+        if full:
+            return sizes[-1]
+        return next((size for size in sizes if max(size.w, size.h) >= 320), sizes[-1])
+
+    async def _catalog_cover(self, client, target: str, message, preview_dir: Path,
+                             history: list | None, *, full: bool = False, original: bool = True,
+                             cover_message_id: int = 0) -> dict:
+        if history is None and cover_message_id and cover_message_id != message.id:
+            try:
+                value = client.get_messages(target, ids=cover_message_id)
+                photo = await asyncio.wait_for(value, timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS) if inspect.isawaitable(value) else value
+                from telethon.tl.types import MessageMediaPhoto
+                if self._is_channel_post(photo) and isinstance(getattr(photo, "media", None), MessageMediaPhoto) and getattr(photo, "photo", None):
+                    history = [photo]
+            except (Exception,):
+                logging.info("缓存图片关联失效，回退相邻消息查询: %s", cover_message_id)
+        if history is None:
+            async def lookup():
+                result = client.get_messages(target, limit=6, offset_id=message.id)
+                return await result if inspect.isawaitable(result) else result
+
+            history = await asyncio.wait_for(lookup(), timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS)
+        photos = self._preceding_photo_group(history, message.id)
+        photo = photos[0] if photos else None
+        media = (photo.photo if photo else
+                 message.document if getattr(getattr(message, "document", None), "thumbs", None) else None)
+        if media is None:
+            if full:
+                raise ValueError("该消息没有可用的图片")
+            return {"cover_status": "none"}
+        message_id = photo.id if photo else message.id
+        quality = "full" if full and photo else "preview" if photo else "document_thumbnail"
+        try:
+            size = self._catalog_photo_size(media, full=full)
+            if full and photo and not original:
+                candidates = [s for s in getattr(media, "sizes", []) if getattr(s, "w", 0) > 0 and getattr(s, "h", 0) > 0]
+                candidates.sort(key=lambda s: max(s.w, s.h))
+                size = next((s for s in candidates if max(s.w, s.h) >= 960), candidates[-1] if candidates else size)
+                quality = "large"
+            path = await self._download_preview(
+                client, media, message_id,
+                _CATALOG_FULL_TIMEOUT_SECONDS if full else _CATALOG_PREVIEW_TIMEOUT_SECONDS,
+                preview_dir, thumb=size)
+        except Exception as exc:
+            logging.warning("频道图片获取失败: 附件消息=%s, 图片消息=%s, 质量=%s, 原因=%s: %s",
+                            message.id, message_id, quality, type(exc).__name__, exc)
+            raise
+        if full:
+            return {"full_cover_path": path, "full_cover_message_id": message_id,
+                    "full_status": "ready", "full_error": "", "full_quality": quality}
+        return {"cover_path": path, "cover_message_id": message_id,
+                "cover_quality": quality, "cover_status": "ready"}
+
+    def list_archives(self, channel: str, *, before_id: int = 0, limit: int = 12,
+                      preview_dir: Path, known_covers: dict[int, dict] | None = None,
+                      on_page: Callable[[dict], None] | None = None,
+                      on_progress: Callable[[dict], None] | None = None,
+                      take_request: Callable[[], dict | None] | None = None,
+                      close_requests: Callable[[], bool] | None = None,
+                      on_request_done: Callable[[dict, dict, str], None] | None = None,
+                      media_only: bool = False) -> dict:
+        target = self.normalize_channel(channel)
+        if (type(before_id) is not int or before_id < 0
+                or type(limit) is not int or not 1 <= limit <= 100
+                or type(self.scan_limit) is not int or not 1 <= self.scan_limit <= 1000):
+            raise ValueError("频道消息扫描参数无效")
+        # Large catalog pages need extra room for photos, captions, and other posts.
+        scan_limit = max(self.scan_limit, limit * 10)
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
+        client = self._client()
+        rows, chosen, history, pending_rows = [], [], [], []
+        scanned, oldest = 0, 0
+        has_more = True
+        last_publish = time.monotonic()
+        progress = {"stage": "connecting", "target": limit, "scanned": 0, "found": 0,
+                    "processed": 0, "total": 0, "ready": 0, "failed": 0, "no_cover": 0,
+                    "cached": 0, "scan_limit": scan_limit}
+
+        def report(**fields):
+            progress.update(fields)
+            if on_progress is not None:
+                on_progress(dict(progress))
+
+        def publish(force=False):
+            nonlocal last_publish
+            if not pending_rows:
+                return
+            if not force and len(pending_rows) < 10 and time.monotonic() - last_publish < 0.5:
+                return
+            if on_page is not None:
+                on_page({"messages": [dict(row) for row in pending_rows],
+                         "oldest_scanned_id": oldest, "has_more": has_more})
+            pending_rows.clear()
+            last_publish = time.monotonic()
+
+        try:
+            report()
+            try:
+                client.connect()
+            except (ConnectionError, OSError) as exc:
+                if self.proxy and self.proxy["addr"] in {"127.0.0.1", "localhost", "::1"}:
+                    try:
+                        with socket.create_connection((self.proxy["addr"], self.proxy["port"]), timeout=1):
+                            pass
+                    except OSError:
+                        raise RuntimeError(
+                            f"本机 API 代理 {self.proxy['addr']}:{self.proxy['port']} 未监听；"
+                            "请启动桌面代理后重试读取频道") from exc
+                raise RuntimeError("Telegram API 无法连接，请检查网络或配置的代理") from exc
+            if not client.is_user_authorized():
+                raise RuntimeError("Telegram API 尚未登录，请先在设置中完成账号授权")
+            async def load_catalog():
+                scheduler = DownloadScheduler(self.download_file_concurrency)
+                full_semaphore = asyncio.Semaphore(1)
+                album_semaphore = asyncio.Semaphore(2)
+                tasks = set()
+
+                async def load(message, row, preceding):
+                    async with scheduler.background():
+                        if self.stop_event and self.stop_event.is_set():
+                            raise DownloadCancelled("已请求停止频道消息扫描")
+                        try:
+                            row.update(await self._catalog_cover(client, target, message, preview_dir, preceding))
+                        except DownloadCancelled:
+                            raise
+                        except Exception as exc:
+                            row["cover_status"] = "failed"
+                            logging.warning("频道消息 %s 的封面获取失败，保留消息元数据: %s: %s",
+                                            message.id, type(exc).__name__, exc)
+                        pending_rows.append(row)
+                        publish()
+                        report(processed=progress["processed"] + 1,
+                               ready=progress["ready"] + (row["cover_status"] == "ready"),
+                               failed=progress["failed"] + (row["cover_status"] == "failed"),
+                               no_cover=progress["no_cover"] + (row["cover_status"] == "none"))
+
+                def schedule_covers(final=False):
+                    for item in chosen:
+                        if item["scheduled"]:
+                            continue
+                        preceding = history[item["offset"]:item["offset"] + 6]
+                        if len(preceding) < 6 and not final:
+                            continue
+                        publish(force=True)
+                        item["scheduled"] = True
+                        tasks.add(asyncio.create_task(load(item["message"], item["row"],
+                                                           preceding if len(preceding) == 6 else None)))
+
+                async def scan():
+                    nonlocal scanned, oldest, has_more
+                    options = {"limit": scan_limit}
+                    if before_id:
+                        options["offset_id"] = before_id
+                    report(stage="scanning")
+                    iterator = client.iter_messages(target, **options)
+
+                    async def messages():
+                        if hasattr(iterator, "__aiter__"):
+                            async for message in iterator:
+                                yield message
+                        else:
+                            for message in iterator:
+                                yield message
+
+                    async for message in messages():
+                        if self.stop_event and self.stop_event.is_set():
+                            raise DownloadCancelled("已请求停止频道消息扫描")
+                        scanned += 1
+                        oldest = message.id
+                        history.append(message)
+                        if self._is_channel_post(message) and (name := self._archive_name(message)):
+                            cover = (known_covers or {}).get(message.id, {})
+                            source_url = (f"https://t.me/c/{-target - 1000000000000}/{message.id}"
+                                          if isinstance(target, int) else f"https://t.me/{target}/{message.id}")
+                            row = {"message_id": message.id, "chat": str(target), "filename": name,
+                                   "size": getattr(message.file, "size", None), "text": message.message or "",
+                                   "date": message.date.isoformat() if getattr(message, "date", None) else "",
+                                   "source_url": source_url,
+                                   **{key: value for key, value in cover.items() if key.startswith("cover_")},
+                                   "cover_status": "ready" if cover else "pending",
+                                   "forwarded": bool(getattr(message, "fwd_from", None))}
+                            rows.append(row)
+                            self._annotate_series(rows)
+                            pending_rows.append(row)
+                            if cover:
+                                report(processed=progress["processed"] + 1, ready=progress["ready"] + 1,
+                                       cached=progress["cached"] + 1)
+                            else:
+                                chosen.append({"message": message, "row": row, "offset": len(history),
+                                               "scheduled": False})
+                            publish()
+                            report(scanned=scanned, found=len(rows), total=len(rows))
+                        schedule_covers()
+                        if scanned % 25 == 0:
+                            publish()
+                            report(scanned=scanned)
+                        await asyncio.sleep(0)
+                        if len(rows) >= limit:
+                            break
+                    has_more = scanned >= scan_limit or len(rows) >= limit
+                    publish(force=True)
+                    schedule_covers(final=True)
+                    if len(rows) < limit:
+                        reason = "已达到原始消息扫描上限" if scanned >= scan_limit else "已读完可访问的频道历史"
+                        logging.warning("本轮仅找到 %d/%d 条压缩包消息：%s", len(rows), limit, reason)
+                    report(stage="covers", scanned=scanned, found=len(rows), total=len(rows))
+
+                async def request_job(request):
+                    result, error = {}, ""
+                    transfer = None
+                    try:
+                        slot = scheduler.file() if request["kind"] == "download" else full_semaphore
+                        async with slot:
+                            if self.stop_event and self.stop_event.is_set():
+                                raise DownloadCancelled("已请求停止 Telegram 下载")
+                            message = next((item["message"] for item in chosen
+                                            if item["row"]["message_id"] == request["message_id"]), None)
+                            if message is None:
+                                value = client.get_messages(target, ids=request["message_id"])
+                                message = await value if inspect.isawaitable(value) else value
+                            if (not self._is_channel_post(message)
+                                    or self._archive_name(message) != request["filename"]):
+                                raise ValueError("频道附件已改变或不符合频道主帖筛选条件，请重新读取")
+                            if request["kind"] == "cover":
+                                async with scheduler.requests:
+                                    result = await self._catalog_cover(client, target, message, preview_dir, None, full=True,
+                                                                       original=request.get("original", False),
+                                                                       cover_message_id=request.get("cover_message_id", 0))
+                            else:
+                                transfer = _TransferEvents(self.on_event, message.id, str(target), request["filename"],
+                                                           message.message or "", getattr(message.file, "size", 0))
+                                transfer.emit("queued")
+
+                                async def pictures():
+                                    async with album_semaphore, scheduler.background():
+                                        try:
+                                            previews = await self._download_preceding_photos_async(client, message, str(target))
+                                            if not previews and getattr(getattr(message, "document", None), "thumbs", None):
+                                                path = await self._download_preview(
+                                                    client, message.document, message.id,
+                                                    _CATALOG_PREVIEW_TIMEOUT_SECONDS,
+                                                    thumb=self._catalog_photo_size(message.document))
+                                                previews = {"image_paths": [path], "image_source": "document_thumbnail",
+                                                            "image_message_ids": [message.id], "image_group_id": ""}
+                                            if previews and self.on_event and transfer.data["download_status"] in {
+                                                    "queued", "downloading", "validating", "completed"}:
+                                                transfer.data.update(previews)
+                                                self.on_event({**transfer.data,
+                                                               "image_paths": list(transfer.data["image_paths"]),
+                                                               "image_message_ids": list(transfer.data["image_message_ids"])})
+                                        except DownloadCancelled:
+                                            raise
+                                        except Exception:
+                                            logging.warning("频道附件配图未完成，保留下载结果", exc_info=True)
+
+                                picture_task = asyncio.create_task(pictures())
+                                tasks.add(picture_task)
+                                try:
+                                    await self._download_archive_async(client, message, request["filename"], transfer, scheduler)
+                                except BaseException:
+                                    picture_task.cancel()
+                                    tasks.discard(picture_task)
+                                    await asyncio.gather(picture_task, return_exceptions=True)
+                                    raise
+                    except DownloadCancelled:
+                        error = "已停止"
+                        raise
+                    except asyncio.CancelledError:
+                        error = "已停止"
+                        raise
+                    except Exception as exc:
+                        error = f"{type(exc).__name__}: {exc}"
+                        logging.warning("频道媒体任务失败: 消息=%s, 类型=%s, %s",
+                                        request["message_id"], request["kind"], error)
+                        if transfer is not None and not transfer.terminal:
+                            transfer.fail(exc)
+                    finally:
+                        if on_request_done is not None:
+                            on_request_done(request, result, error)
+
+                if not media_only:
+                    tasks.add(asyncio.create_task(scan()))
+                try:
+                    while True:
+                        if self.stop_event and self.stop_event.is_set():
+                            raise DownloadCancelled("已请求停止频道消息扫描")
+                        if take_request is not None:
+                            while (request := take_request()) is not None:
+                                tasks.add(asyncio.create_task(request_job(request)))
+                        if not tasks:
+                            if close_requests is None or close_requests():
+                                break
+                            await asyncio.sleep(0)
+                            continue
+                        done, _ = await asyncio.wait(tuple(tasks), timeout=0.2,
+                                                     return_when=asyncio.FIRST_COMPLETED)
+                        tasks.difference_update(done)
+                        results = await asyncio.gather(*done, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, BaseException):
+                                raise result
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    publish(force=True)
+
+            loop = getattr(client, "loop", None)
+            coroutine = load_catalog()
+            if loop is not None:
+                loop.run_until_complete(coroutine)
+            else:
+                asyncio.run(coroutine)
+            if self.stop_event and self.stop_event.is_set():
+                raise DownloadCancelled("已请求停止频道消息扫描")
+            report(stage="completed")
+            logging.info("频道消息扫描: 检查=%d, ZIP/RAR=%d, 更早游标=%d",
+                         scanned, len(rows), oldest)
+            return {"messages": rows, "oldest_scanned_id": oldest,
+                    "has_more": has_more}
+        finally:
+            try:
+                publish(force=True)
+            finally:
+                client.disconnect()
 
 
 def download_resource_status(destination: Path) -> dict[str, int | str]:

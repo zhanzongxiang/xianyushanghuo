@@ -3,6 +3,7 @@
 __pycache__/
 *.py[cod]
 .workbuddy/
+.cache/
 
 build*/
 dist*/
@@ -14,6 +15,7 @@ sample_data/
 tests/artifacts/
 config/*.local.json
 test.local.json
+telegram-settings.json
 
 *.session
 *.session-journal
@@ -28,3 +30,6 @@ test.local.json
 **/.browser-downloads/
 **/.telegram-api-downloads/
 **/.unverified/
+**/channels.json
+**/channel-catalog.json
+**/.channel-catalog/

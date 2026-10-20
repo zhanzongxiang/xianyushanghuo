@@ -124,8 +124,8 @@ def make_fixtures(root: Path, browser: Path):
     settings = {
         "source_channel_url": "", "source_chat": "", "fetch_mode": "recent", "message_ids": [],
         "telegram_access_mode": "api", "telegram_api_id": API_ID, "telegram_api_hash": API_HASH,
-        "telegram_api_proxy_url": "", "telegram_api_dc2_server": "", "telegram_run_mode": "once",
-        "recent_message_limit": 20, "telegram_scan_limit": 77,
+        "telegram_api_proxy_url": "socks5://127.0.0.1:7890", "telegram_api_dc2_server": "", "telegram_run_mode": "once",
+        "recent_message_limit": 20, "channel_message_limit": 100, "telegram_scan_limit": 77,
         "upload_provider": "local", "cloud_folder": "", "quark_folder_url": "", "quark_cookie": COOKIE,
         "browser_executable_path": str(browser), "telegram_browser_headless": True,
         "quark_headless": True, "telegram_browser_timeout_seconds": 180,
@@ -242,7 +242,8 @@ def verify_saved_config(path: Path, original: dict, expected_hash: str, expected
     require(current["telegram_api_hash"] == expected_hash and current["telegram_api_id"] == API_ID,
             "Saving cleared or changed retained fake API credentials")
     require(current["recent_message_limit"] == expected_limit, "Edited setting was not saved")
-    for key in ("quark_cookie", "telegram_session", "telegram_browser_profile", "quark_browser_profile",
+    for key in ("channel_message_limit", "telegram_api_proxy_url", "telegram_api_dc2_server",
+                "quark_cookie", "telegram_session", "telegram_browser_profile", "quark_browser_profile",
                 "inbox_dir", "work_dir", "output_dir", "quark_upload_input_selector", "quark_file_row_selector",
                 "quark_share_button_selector", "quark_share_link_selector", "telegram_scan_limit"):
         require(current[key] == original[key], f"Save lost hidden configuration: {key}")
@@ -252,21 +253,24 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
     from playwright.sync_api import sync_playwright
 
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    errors, external, posts = [], [], []
+    errors, external, posts, config_posts = [], [], [], []
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, executable_path=str(args.browser))
         try:
-            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            page = browser.new_page(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
             page.set_default_timeout(budget.ms(6))
             page.on("pageerror", lambda error: errors.append(str(error)))
 
             def route_request(route):
                 url = route.request.url
-                if not url.startswith(api.origin + "/") and not url.startswith("data:"):
+                if (not url.startswith(api.origin + "/") and not url.startswith("data:")
+                        and not url.startswith("blob:" + api.origin + "/")):
                     external.append(url)
                     return route.abort()
                 if route.request.method == "POST":
                     posts.append(url.removeprefix(api.origin))
+                    if url == api.origin + "/api/config":
+                        config_posts.append(route.request.post_data_json)
                 route.continue_()
 
             page.route("**/*", route_request)
@@ -333,8 +337,19 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
 
             open_view("settings")
             page.wait_for_function("!document.querySelector('#config-fields').disabled")
-            require(page.locator("#telegram_api_hash").input_value() == "", "Secret hash echoed in UI")
-            require(page.locator("#telegram_api_id").input_value() == "", "API ID echoed in UI")
+            require(page.locator("#telegram_api_hash").input_value() == "********", "Saved Hash mask missing")
+            require(page.locator("#telegram_api_id").input_value() == str(API_ID), "Saved API ID missing")
+            require(page.locator("#telegram_api_proxy_url").input_value() == original["telegram_api_proxy_url"],
+                    "Saved proxy missing")
+            require(page.locator("#channel_message_limit").input_value() == "100",
+                    "Channel page size missing")
+            require(page.locator("#download_workers").input_value() == "4", "下载工人默认值未加载")
+            require(page.locator("#download_file_concurrency").input_value() == "2",
+                    "双文件下载默认值未加载")
+            require(page.locator("#download-crypto-info").inner_text() == "cryptg · 已启用",
+                    "原生下载加速组件未启用")
+            page.locator("#download_workers").fill("1")
+            page.locator("#download_file_concurrency").fill("1")
             page.locator("#recent_message_limit").fill("17")
             page.locator("#refresh").click()
             page.wait_for_timeout(1200)
@@ -343,12 +358,34 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
                 page.locator("#save-config").click()
             page.wait_for_function("!document.querySelector('#save-config').disabled")
             verify_saved_config(config_path, original, API_HASH, 17)
+            require(api.json("/api/config")["download_workers"] == 1, "下载工人回退值未保存")
+            require(config_posts[-1]["download_workers"] == 1, "下载工人回退值未通过表单提交")
+            require(api.json("/api/config")["download_file_concurrency"] == 1,
+                    "单文件串行回退值未保存")
+            require(config_posts[-1]["download_file_concurrency"] == 1,
+                    "同时下载文件数未通过表单提交")
+            require("telegram_api_hash" not in config_posts[-1], "Hash mask was submitted as a credential")
             page.locator("#telegram_api_hash").fill(NEW_API_HASH)
             with page.expect_response(lambda response: response.url.endswith("/api/config") and response.request.method == "POST"):
                 page.locator("#save-config").click()
-            page.wait_for_function("document.querySelector('#telegram_api_hash').value === ''")
+            page.wait_for_function("document.querySelector('#telegram_api_hash').value === '********'")
             verify_saved_config(config_path, original, NEW_API_HASH, 17)
             require(NEW_API_HASH not in json.dumps(api.json("/api/config")), "Secret hash returned by API")
+            open_view("settings")
+            page.wait_for_function("!document.querySelector('#config-fields').disabled")
+            require(page.locator("#telegram_api_id").input_value() == str(API_ID), "Reload lost saved API ID")
+            require(page.locator("#download_workers").input_value() == "1", "重新读取丢失下载工人回退值")
+            require(page.locator("#download_file_concurrency").input_value() == "1",
+                    "重新读取丢失同时下载文件数")
+            require(page.locator("#telegram_api_hash").input_value() == "********", "Reload lost saved Hash state")
+            require(page.locator("#telegram_api_proxy_url").input_value() == original["telegram_api_proxy_url"],
+                    "Reload lost saved proxy")
+            page.locator("#telegram_api_hash").fill("")
+            with page.expect_response(lambda response: response.url.endswith("/api/config") and response.request.method == "POST"):
+                page.locator("#save-config").click()
+            page.wait_for_function("document.querySelector('#telegram_api_hash').value === '********'")
+            verify_saved_config(config_path, original, NEW_API_HASH, 17)
+            require("telegram_api_hash" not in config_posts[-1], "Empty input replaced saved credential")
 
             new_dir = root / "custom-downloads"
             new_dir.mkdir()
@@ -374,6 +411,17 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
                     page.evaluate("Array.from(document.images).forEach(img => { img.loading = 'eager'; })")
                     page.wait_for_function("Array.from(document.images).filter(img => img.getClientRects().length).every(img => img.complete && img.naturalWidth > 0)")
                     page.screenshot(path=str(ARTIFACTS / f"workbench-{view}-{name}.png"), full_page=True)
+            open_view("history")
+            with page.expect_download() as exported:
+                page.get_by_role("button", name="导出下载诊断").click()
+            diagnostics_zip = root / exported.value.suggested_filename
+            exported.value.save_as(diagnostics_zip)
+            with zipfile.ZipFile(diagnostics_zip) as archive:
+                require(archive.testzip() is None and "analysis.txt" in archive.namelist(),
+                        "Download diagnostic export is incomplete")
+                require(not any(API_HASH.encode() in archive.read(name)
+                                or NEW_API_HASH.encode() in archive.read(name)
+                                for name in archive.namelist()), "Diagnostic export contains credentials")
             open_view("download")
             row("arch").locator(".task-title").click()
             require(page.locator("#inspector").is_visible(), "Mobile details did not open")
@@ -383,10 +431,80 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
             page.screenshot(path=str(ARTIFACTS / "workbench-mobile-details.png"), full_page=True)
             page.locator("#close-inspector").click()
             require(not page.locator("#inspector").is_visible(), "Mobile details did not close")
+            open_view("settings")
+            page.locator("#upload_provider").select_option("quark_api")
+            require(page.locator("#quark-api-fields").is_visible(), "Quark API settings did not appear")
+            require(not page.locator("#quark-cli-fields").is_visible(), "Unselected CLI settings remained visible")
+            require(not page.locator("#browser-path-field").is_visible(), "API mode requires a browser")
+            require(page.locator("#quark-api-check").is_visible(), "Quark API check action missing")
+            page.locator("#quark_cookie").fill("__uid=offline-fixture; __pus=offline-fake-cookie")
+            page.locator("#quark_api_parent_fid").fill("fixture-folder")
+            page.locator("#quark_api_file_concurrency").fill("3")
+            with page.expect_response(lambda response: response.url.endswith("/api/config") and response.request.method == "POST"):
+                page.locator("#save-config").click()
+            page.wait_for_function("document.querySelector('#quark_cookie').value === '********'")
+            quark_settings = api.json("/api/config")
+            require(quark_settings["quark_cookie_configured"] is True, "Cookie saved-state missing")
+            require(quark_settings["quark_api_file_concurrency"] == 3, "API upload concurrency not saved")
+            require("quark_cookie" not in quark_settings, "Cookie leaked through settings API")
+            page.locator("#quark_cookie").fill("")
+            with page.expect_response(lambda response: response.url.endswith("/api/config") and response.request.method == "POST"):
+                page.locator("#save-config").click()
+            page.wait_for_function("document.querySelector('#quark_cookie').value === '********'")
+            require("quark_cookie" not in config_posts[-1], "Empty cookie or saved mask was submitted")
+            require(json.loads(config_path.read_text(encoding="utf-8"))["quark_cookie"] ==
+                    "__uid=offline-fixture; __pus=offline-fake-cookie", "Blank save erased Cookie")
+            for name, width, height in (("desktop", 1440, 1000), ("mobile", 390, 844)):
+                page.set_viewport_size({"width": width, "height": height})
+                require(page.evaluate("document.documentElement.scrollWidth <= innerWidth"),
+                        f"Quark API settings overflow: {name}")
+                page.screenshot(path=str(ARTIFACTS / f"quark-api-settings-{name}.png"), full_page=True)
+            page.set_viewport_size({"width": 1440, "height": 1000})
+            page.locator("#rename_translation_provider").select_option("local")
+            with page.expect_response(lambda response: response.url.endswith("/api/config") and response.request.method == "POST"):
+                page.locator("#save-config").click()
+            page.wait_for_function("document.querySelector('#config-dirty').textContent === ''")
+            open_view("upload")
+            if page.locator("#clear-selection").is_visible():
+                page.locator("#clear-selection").click()
+            row("arch").locator(".task-checkbox").check()
+            page.locator("#open-naming").click()
+            require(page.locator(".naming-row").count() == 1, "Naming ignored selected tasks")
+            require(page.locator(".naming-picture img").count() == 1, "Naming preview missing")
+            page.locator("#naming-generate").click()
+            api.wait_state(lambda state: not state["running"] and any(
+                task["id"] == tasks["arch"]["id"] and task.get("naming_status") == "review"
+                for task in state["tasks"]), "Chinese name generation")
+            page.wait_for_function("!document.querySelector('#naming-apply').disabled")
+            page.wait_for_function("document.querySelector('.naming-proposal small.warning')?.textContent.includes('未识别')")
+            require("含未识别名称" in page.locator(".naming-original small").inner_text(),
+                    "Partial translation looks like a complete result")
+            for name, width, height in (("desktop", 1440, 1000), ("mobile", 390, 844)):
+                page.set_viewport_size({"width": width, "height": height})
+                require(page.evaluate("document.querySelector('#naming-dialog').scrollWidth <= document.querySelector('#naming-dialog').clientWidth"),
+                        f"Naming dialog overflow: {name}")
+                page.screenshot(path=str(ARTIFACTS / f"chinese-naming-{name}.png"), full_page=True)
+            chinese = "建筑形体模型.zip"
+            page.locator(".naming-proposal input").fill(chinese)
+            page.wait_for_timeout(2100)
+            require(page.locator(".naming-proposal input").input_value() == chinese, "Polling replaced edited name")
+            require(page.locator(".naming-proposal small").inner_text() == "已编辑，待保存",
+                    "Unsaved edit still shows an obsolete translation warning")
+            with page.expect_response(lambda response: response.url.endswith("/api/names/apply")) as applied:
+                page.locator("#naming-apply").click()
+            require(applied.value.status == 200, f"Naming apply failed: {applied.value.text()}")
+            renamed = api.wait_state(lambda state: not state["running"] and any(
+                task["id"] == tasks["arch"]["id"] and task.get("naming_status") == "approved"
+                for task in state["tasks"]), "Chinese name approval without cloud upload")
+            record = next(task for task in renamed["tasks"] if task["id"] == tasks["arch"]["id"])
+            require(record["rename_target"] == chinese, "Approved name was not saved")
+            require(record["filename"] == FILES["arch"], "Naming changed original identity")
+            require((root / "inbox" / FILES["arch"]).exists(), "Naming changed original local file")
+            page.locator("#naming-close").click()
             require(not errors, f"Browser errors: {errors}")
             require(not external, f"External requests attempted: {external}")
-            require(set(posts) <= {"/api/upload", "/api/config"}, f"Unexpected browser mutations: {posts}")
-            print("PASS: real local upload, validation failure, previews, settings, polling and desktop/mobile layouts", flush=True)
+            require(set(posts) <= {"/api/upload", "/api/config", "/api/names/generate", "/api/names/save", "/api/names/apply"}, f"Unexpected browser mutations: {posts}")
+            print("PASS: local upload, validation, previews, Quark API settings, Chinese naming and desktop/mobile layouts", flush=True)
         finally:
             browser.close()
 

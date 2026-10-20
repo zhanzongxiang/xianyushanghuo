@@ -68,6 +68,7 @@ class TransferStore:
                 backup = self.path.with_name(f"workbench-tasks-unreadable-{time.time_ns()}.json")
                 shutil.copy2(self.path, backup)
         for task in self.tasks.values():
+            self._naming_defaults(task)
             # Older records bound uploads implicitly to the then-current local file.
             if "upload_filename" not in task and task.get("upload_status") in {"uploading", "link_pending", "completed", "local"}:
                 local_path = task.get("local_path", "")
@@ -76,6 +77,12 @@ class TransferStore:
             task.setdefault("upload_filename", "")
             task.setdefault("upload_local_path", "")
             task.setdefault("upload_target", "")
+            task.setdefault("upload_received", 0)
+            task.setdefault("upload_size", 0)
+            task.setdefault("upload_speed", 0)
+            task.setdefault("upload_eta", None)
+            for field in ("upload_remote_fid", "upload_task_id", "upload_md5", "upload_sha1", "upload_phase"):
+                task.setdefault(field, "")
             task.setdefault("image_source", "")
             task.setdefault("image_message_ids", [])
             task.setdefault("image_group_id", "")
@@ -84,6 +91,8 @@ class TransferStore:
                 task.update(download_status="interrupted", error="上次运行中断，可重新下载", speed=0, eta=None)
             if task.get("upload_status") == "uploading":
                 task.update(upload_status="link_pending", error="上次上传中断，请先核对网盘文件或重新获取链接")
+            if task["naming_status"] in {"generating", "applying"}:
+                task.update(naming_status="failed", naming_error="上次命名操作中断，可重试")
         self.import_existing()
         self.flush()
 
@@ -103,6 +112,14 @@ class TransferStore:
                 self.import_existing()
                 self.flush()
 
+    @staticmethod
+    def _naming_defaults(task):
+        for field in ("chinese_filename", "naming_source", "naming_note", "naming_error",
+                      "naming_quality", "remote_filename", "rename_target", "rename_pending_name"):
+            task.setdefault(field, "")
+        task.setdefault("naming_status", "idle")
+        task.setdefault("naming_untranslated", [])
+
     def event(self, event: dict) -> str:
         with self.lock:
             filename = str(event.get("filename", ""))
@@ -119,11 +136,17 @@ class TransferStore:
                     "image_source": "", "image_message_ids": [], "image_group_id": "",
                     "storage_root": str(self.config.inbox_dir.resolve()),
                     "upload_provider": "", "upload_filename": "", "upload_local_path": "", "upload_target": "",
+                    "upload_received": 0, "upload_size": 0, "upload_speed": 0, "upload_eta": None,
+                    "upload_remote_fid": "", "upload_task_id": "", "upload_md5": "", "upload_sha1": "", "upload_phase": "",
                     "created_at": utc_now(), "validation": "pending",
                 }
             task = self.tasks[identity]
+            self._naming_defaults(task)
             previous_status = task["download_status"]
-            allowed = set(task) - {"id", "created_at", "share_url", "storage_root"} - {
+            allowed = set(task) - {"id", "created_at", "share_url", "storage_root", "chinese_filename",
+                                  "naming_source", "naming_note", "naming_error", "naming_status",
+                                  "naming_quality", "naming_untranslated",
+                                  "remote_filename", "rename_target", "rename_pending_name"} - {
                 key for key in task if key.startswith("upload_")}
             task.update({key: value for key, value in event.items() if key in allowed})
             if event.get("download_status") == "queued" or event.get("local_path"):
@@ -145,6 +168,13 @@ class TransferStore:
             if identity not in self.tasks:
                 raise ValueError("任务不存在，请刷新列表")
             return copy.deepcopy(self.tasks[identity])
+
+    def has_completed_message(self, chat: str, message_id: int) -> bool:
+        with self.lock:
+            return any(channel_key(row.get("chat", "")) == channel_key(chat)
+                       and row.get("message_id") == message_id
+                       and row.get("download_status") == "completed"
+                       for row in self.tasks.values())
 
     def update(self, identity: str, **values) -> None:
         with self.lock:
@@ -288,6 +318,14 @@ class TransferStore:
                 if elapsed > 5:
                     row.update(speed=0, eta=None)
         disk = shutil.disk_usage(self.config.inbox_dir)
+        if self.config.upload_provider == "quark_browser":
+            upload_target = self.config.quark_folder_url
+        elif self.config.upload_provider == "quark_cli":
+            upload_target = f"夸克 CLI 目录 FID: {self.config.quark_cli_parent_fid}" if self.config.quark_cli_parent_fid else "夸克 CLI 默认目录"
+        elif self.config.upload_provider == "quark_api":
+            upload_target = f"夸克 API 目录 FID: {self.config.quark_api_parent_fid}"
+        else:
+            upload_target = "本地模拟"
         return {"tasks": rows, "disk": {"free": disk.free, "total": disk.total},
                 "download_dir": str(self.config.inbox_dir.resolve()),
-                "upload_target": self.config.quark_folder_url if self.config.upload_provider == "quark_browser" else "本地模拟"}
+                "upload_target": upload_target}

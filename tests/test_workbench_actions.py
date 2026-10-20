@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from xianyu_pipeline import web_ui
+from xianyu_pipeline.channel_sources import ChannelDirectory
 from xianyu_pipeline.config import PipelineConfig
 from xianyu_pipeline.quark_browser import QuarkBrowserStorageAdapter
 from xianyu_pipeline.workbench import TransferStore
@@ -34,9 +35,11 @@ def app(tmp_path, monkeypatch):
         "upload_provider": "quark_browser", "quark_folder_url": TARGET,
         "quark_upload_input_selector": "input", "quark_file_row_selector": "row",
         "quark_share_button_selector": "button", "quark_share_link_selector": "link",
+        "quark_share_create_button_selector": "create",
     }), encoding="utf-8")
     result = SimpleNamespace(config_path=config_path, workers=[], calls=[], upload_error=False, share_error=False)
     result.store = TransferStore(PipelineConfig.from_json(config_path))
+    result.channels = ChannelDirectory(result.store.config.output_dir)
 
     class Server:
         def __init__(self, address, handler):
@@ -79,6 +82,7 @@ def app(tmp_path, monkeypatch):
 
     monkeypatch.setattr(web_ui, "configure_logging", configure_logging)
     monkeypatch.setattr(web_ui, "TransferStore", lambda config: result.store)
+    monkeypatch.setattr(web_ui, "ChannelDirectory", lambda directory: result.channels)
     monkeypatch.setattr(web_ui, "ThreadingHTTPServer", Server)
     monkeypatch.setattr(web_ui, "threading", SimpleNamespace(Lock=threading.Lock, Thread=WorkerThread))
     monkeypatch.setattr(web_ui, "QuarkBrowserStorageAdapter", RecordingQuark)
@@ -102,6 +106,17 @@ def app(tmp_path, monkeypatch):
         worker.target(*worker.args)
         assert not result.state.running
 
+    def get(path):
+        handler = result.handler.__new__(result.handler)
+        handler.path = path
+        handler.headers = {"Host": "127.0.0.1:18765"}
+        responses = []
+        handler.json_response = lambda payload, status=200: responses.append((status, payload))
+        handler.send_error = lambda status: responses.append((status, {}))
+        handler.do_GET()
+        assert len(responses) == 1
+        return responses[0]
+
     def task(name="asset.zip", **values):
         source = result.store.config.inbox_dir / name
         if source.suffix == ".zip":
@@ -121,8 +136,57 @@ def app(tmp_path, monkeypatch):
         result.store.update(identity, upload_status=status, upload_provider="quark_browser",
                             upload_filename=source.name, upload_local_path=str(source), upload_target=TARGET)
 
-    result.post, result.run, result.task, result.bind = post, run, task, bind
+    def acquire(avatar_url=""):
+        result.channels.merge_joined([
+            {"id": 123, "title": "Fixture", "username": "fixture_channel",
+             "key": "fixture_channel", "target": "https://t.me/fixture_channel",
+             "avatar_url": avatar_url},
+        ])
+        assert post("/api/channels/select", {"key": "fixture_channel"})[0] == 200
+
+    result.post, result.get, result.run, result.task, result.bind = post, get, run, task, bind
+    result.acquire = acquire
     return result
+
+
+@pytest.mark.parametrize("enabled,name,status,fail,expected", [
+    (True, "new.zip", "waiting", False, 1),
+    (False, "new.zip", "waiting", False, 0),
+    (True, "new.part1.zip", "waiting", False, 0),
+    (True, "new.zip", "completed", False, 0),
+    (True, "new.zip", "link_pending", False, 0),
+    (True, "new.zip", "waiting", True, 1),
+])
+def test_auto_upload_only_new_completed_downloads(app, monkeypatch, enabled, name, status, fail, expected):
+    values = json.loads(app.config_path.read_text(encoding="utf-8"))
+    values["auto_upload_after_download"] = enabled
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+    historical = app.task("historical.zip")
+    identity = app.task(name, upload_status=status)
+    app.upload_error = fail
+    values["download_workers"] = 2
+    values["download_file_concurrency"] = 1
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def fetch_messages(self, *args):
+            assert self.download_workers == 2
+            assert self.download_file_concurrency == 1
+            self.on_event({"chat": "fixture_channel", "message_id": 123, "filename": name,
+                           "local_path": app.store.get(identity)["local_path"], "download_status": "completed"})
+            return []
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    app.acquire()
+    assert app.post("/api/download")[0] == 200
+    app.run()
+    assert len(app.calls) == expected
+    assert app.store.get(historical)["upload_status"] == "waiting"
+    assert app.store.get(identity)["download_status"] == "completed"
+    if fail:
+        assert app.store.get(identity)["upload_status"] == "link_pending"
+    elif expected:
+        assert app.store.get(identity)["share_url"] == SHARE
 
 
 def test_upload_binding_is_durable_before_cloud_side_effect(app):
@@ -290,15 +354,13 @@ def test_ambiguous_upload_failure_recovers_without_reupload(app):
     assert app.store.get(identity)["upload_status"] == "completed"
 
 
-@pytest.mark.parametrize("status", ["failed", "cancelled", "interrupted"])
-def test_browser_retry_returns_explicit_400_without_starting_worker(app, status):
-    identity = app.task(download_status=status)
-    assert app.post("/api/config", {"telegram_access_mode": "browser"})[0] == 200
-    response, body = app.post("/api/retry", {"id": identity})
+def test_browser_mode_cannot_be_reenabled(app):
+    identity = app.task(download_status="failed")
+    response, body = app.post("/api/config", {"telegram_access_mode": "browser"})
     assert response == 400
     assert "Telegram API" in body["message"]
     assert not app.workers and not app.state.running
-    assert app.store.get(identity)["download_status"] == status
+    assert app.store.get(identity)["download_status"] == "failed"
 
 
 def test_api_retry_keeps_single_message_arguments(app, monkeypatch):
@@ -359,3 +421,527 @@ def test_legacy_run_still_processes_local_material_and_writes_manifest(app):
     manifest = json.loads((app.store.config.output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest) == 1
     assert manifest[0]["share_url"].startswith("file:")
+
+
+def api_settings(app, **changes):
+    return app.post("/api/config", {
+        "upload_provider": "quark_api", "quark_cookie": "__uid=fixture; __pus=fixture-secret",
+        "quark_api_parent_fid": "folder-1", "browser_executable_path": "", **changes,
+    })
+
+
+def test_naming_candidates_can_be_generated_without_cloud_or_telegram(app):
+    identity = app.task("Dragon Warrior Bust v2.zip")
+    assert app.post("/api/config", {"rename_translation_provider": "local"})[0] == 200
+    assert app.post("/api/names/generate", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["chinese_filename"] == "龙战士 胸像_v2.zip"
+    assert task["naming_status"] == "review"
+    assert task["naming_quality"] == "matched"
+    assert not task["rename_target"] and not app.calls
+
+
+def test_work_and_character_names_are_corrected_without_remote_translation(app, monkeypatch):
+    identity = app.task("Kuru Figure - Steins Gate - Kurisu Makise.rar")
+    monkeypatch.setattr(web_ui.NameTranslator, "_online", lambda *_: pytest.fail("Unknown maker should be kept"))
+    assert app.post("/api/names/generate", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["chinese_filename"] == "Kuru 手办 - 命运石之门 - 牧濑红莉栖.rar"
+    assert task["naming_untranslated"] == ["Kuru"]
+    assert task["naming_quality"] == "partial"
+    assert not app.calls
+    assert app.post("/api/names/save", {"entries": [{"id": identity, "name": "命运石之门 牧濑红莉栖 手办.rar"}]})[0] == 200
+    saved = app.store.get(identity)
+    assert saved["naming_quality"] == "manual"
+    assert saved["naming_untranslated"] == []
+    assert saved["naming_note"] == "手动编辑，待确认"
+
+
+def test_naming_save_validates_entire_batch_before_changes(app):
+    first, second = app.task("one.zip"), app.task("two.rar")
+    assert app.post("/api/names/save", {"entries": [
+        {"id": first, "name": "第一个.zip"}, {"id": second, "name": "../第二个.rar"},
+    ]})[0] == 400
+    assert not app.store.get(first)["chinese_filename"]
+
+
+@pytest.mark.parametrize("provider", ["unknown", [], {}, 123, None])
+def test_invalid_naming_provider_is_rejected_without_changing_settings(app, provider):
+    before = app.config_path.read_bytes()
+    assert app.post("/api/config", {"rename_translation_provider": provider})[0] == 400
+    assert app.config_path.read_bytes() == before
+
+
+def test_approved_name_is_persisted_for_future_upload_and_remembered(app):
+    assert api_settings(app)[0] == 200
+    identity = app.task("Dragon Bust.zip")
+    assert app.post("/api/names/save", {"entries": [{"id": identity, "name": "巨龙胸像.zip"}]})[0] == 200
+    assert app.post("/api/names/apply", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["rename_target"] == "巨龙胸像.zip" and task["naming_status"] == "approved"
+    assert task["naming_quality"] == "confirmed"
+    assert task["upload_status"] == "waiting" and Path(task["local_path"]).exists()
+    assert not app.calls
+    assert json.loads((app.store.config.output_dir / "name-memory.json").read_text(encoding="utf-8"))["dragon bust.zip"] == "巨龙胸像.zip"
+
+
+def test_completed_upload_can_be_renamed_in_its_original_folder_without_reupload(app, monkeypatch):
+    assert api_settings(app, quark_api_parent_fid="new-default")[0] == 200
+    identity = app.task("uploaded.zip")
+    app.store.update(identity, upload_status="completed", upload_provider="quark_api",
+                     upload_filename="uploaded.zip", upload_target="original-folder", upload_remote_fid="original-fid",
+                     upload_size=123, chinese_filename="模型.zip")
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, *args, **kwargs):
+            raise AssertionError("rename must not upload")
+
+        def share_existing(self, source, target, **values):
+            calls.append((source.name, target, values))
+            self._remote(remote_filename=values["rename_to"], naming_status="completed")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/names/apply", {"ids": [identity]})[0] == 200
+    app.run()
+    assert calls[0][0:2] == ("uploaded.zip", "original-folder")
+    assert calls[0][2]["remote_fid"] == "original-fid"
+    assert calls[0][2]["rename_to"] == "模型.zip"
+    assert app.store.get(identity)["filename"] == "uploaded.zip"
+    assert app.store.get(identity)["remote_filename"] == "模型.zip"
+    assert app.store.get(identity)["share_url"] == SHARE
+
+
+def test_rename_failure_is_separate_from_successful_upload(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = app.task("uploaded.zip")
+    app.store.update(identity, upload_status="completed", upload_provider="quark_api",
+                     upload_filename="uploaded.zip", upload_target="folder-1", upload_remote_fid="original-fid",
+                     upload_size=123, chinese_filename="模型.zip", share_url=SHARE)
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def share_existing(self, *args, **values):
+            raise RuntimeError("fixture conflict")
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/names/apply", {"ids": [identity]})[0] == 200
+    app.run()
+    assert app.store.get(identity)["naming_status"] == "failed"
+    assert app.store.get(identity)["upload_status"] == "completed"
+    assert app.store.get(identity)["share_url"] == SHARE
+
+
+def test_duplicate_chinese_names_are_rejected_before_cloud_actions(app):
+    assert api_settings(app)[0] == 200
+    ids = [app.task("one.zip"), app.task("two.zip")]
+    for identity in ids:
+        app.store.update(identity, chinese_filename="同名.zip")
+    assert app.post("/api/names/apply", {"ids": ids})[0] == 400
+    assert not app.workers
+
+
+def test_upload_batch_checks_previously_approved_chinese_name_collisions(app):
+    assert api_settings(app)[0] == 200
+    ids = [app.task("one.zip"), app.task("two.zip")]
+    for identity in ids:
+        app.store.update(identity, rename_target="同名.zip")
+    assert app.post("/api/upload", {"ids": ids})[0] == 400
+    assert not app.workers
+
+
+def test_upload_passes_approved_chinese_name_and_keeps_english_binding(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = app.task("english.zip", rename_target="中文模型.zip", naming_status="approved")
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            assert source.name == "english.zip"
+            assert values == {"new_name": "中文模型.zip"}
+            assert app.store.get(identity)["upload_filename"] == "english.zip"
+            assert app.store.get(identity)["rename_target"] == "中文模型.zip"
+            self._remote(remote_filename="中文模型.zip", naming_status="completed")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert app.store.get(identity)["filename"] == "english.zip"
+    assert app.store.get(identity)["remote_filename"] == "中文模型.zip"
+    assert app.store.get(identity)["upload_status"] == "completed"
+
+
+def test_download_updates_do_not_change_approved_names(app):
+    identity = app.task("Dragon.zip")
+    app.store.update(identity, chinese_filename="龙.zip", rename_target="龙.zip", naming_status="approved",
+                     naming_quality="confirmed", naming_untranslated=[])
+    app.store.event({"chat": "fixture_channel", "message_id": 123, "filename": "Dragon.zip",
+                     "rename_target": "unexpected.zip", "chinese_filename": "unexpected.zip",
+                     "naming_quality": "partial", "naming_untranslated": ["unexpected"]})
+    assert app.store.get(identity)["rename_target"] == "龙.zip"
+    restored = TransferStore(PipelineConfig.from_json(app.config_path))
+    assert restored.get(identity)["chinese_filename"] == "龙.zip"
+    assert restored.get(identity)["naming_quality"] == "confirmed"
+    assert restored.get(identity)["naming_untranslated"] == []
+
+
+def test_quark_api_settings_save_without_browser_and_blank_cookie_preserves_secret(app):
+    assert api_settings(app)[0] == 200
+    status, config = app.get("/api/config")
+    assert status == 200 and config["quark_cookie_configured"] is True
+    assert "quark_cookie" not in config
+    assert "fixture-secret" not in json.dumps(config)
+    assert app.post("/api/config", {"quark_cookie": "", "quark_api_file_concurrency": 3})[0] == 200
+    saved = PipelineConfig.from_json(app.config_path)
+    assert saved.quark_cookie == "__uid=fixture; __pus=fixture-secret"
+    assert saved.quark_api_file_concurrency == 3
+    assert "夸克 API" in app.get("/api/workbench")[1]["upload_target"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"quark_api_parent_fid": ""}, {"quark_api_parent_fid": "https://pan.quark.cn/"},
+    {"quark_api_timeout_seconds": 9}, {"quark_api_timeout_seconds": True},
+    {"quark_api_file_concurrency": 4}, {"quark_api_file_concurrency": "2"},
+    {"quark_cookie": "__uid=fixture\nbad=x"}, {"quark_cookie": ["invalid"]},
+])
+def test_invalid_quark_api_settings_do_not_change_config(app, changes):
+    before = app.config_path.read_bytes()
+    assert api_settings(app, **changes)[0] == 400
+    assert app.config_path.read_bytes() == before
+    assert not app.workers
+
+
+def test_api_batch_upload_concurrency_partial_failure_and_durable_remote_binding(app, monkeypatch):
+    assert api_settings(app, quark_api_file_concurrency=2)[0] == 200
+    identities = [app.task(f"batch-{index}.zip") for index in range(3)]
+    lock = threading.Lock()
+    first_pair = threading.Barrier(2)
+    result = {"active": 0, "peak": 0, "calls": []}
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target):
+            assert target == "folder-1"
+            assert self.stop_event is app.state.stop_event
+            with lock:
+                result["active"] += 1
+                result["peak"] = max(result["peak"], result["active"])
+                ordinal = len(result["calls"])
+                result["calls"].append(source.name)
+            try:
+                if ordinal < 2:
+                    first_pair.wait(timeout=3)
+                self.on_progress(20, source.stat().st_size, 10, 2)
+                self.on_remote({"upload_remote_fid": source.stem, "upload_md5": "a" * 32})
+                self.on_stage("link_pending")
+                rows = json.loads(app.store.path.read_text(encoding="utf-8"))
+                bound = next(row for row in rows if row["upload_filename"] == source.name)
+                assert bound["upload_remote_fid"] == source.stem
+                assert bound["upload_provider"] == "quark_api"
+                assert bound["upload_target"] == target
+                if source.name == "batch-1.zip":
+                    raise RuntimeError("fixture share unavailable")
+                return SHARE
+            finally:
+                with lock:
+                    result["active"] -= 1
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": identities})[0] == 200
+    app.run()
+    assert result["peak"] == 2 and len(result["calls"]) == 3
+    assert [app.store.get(identity)["upload_status"] for identity in identities] == [
+        "completed", "link_pending", "completed"]
+    assert app.state.error
+    assert all(app.store.get(identity)["upload_speed"] == 0 for identity in identities)
+
+
+def test_api_recovery_uses_persisted_fid_hash_and_size_without_local_file(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = app.task("recover.zip")
+    source = Path(app.store.get(identity)["local_path"])
+    expected_size = source.stat().st_size
+    source.unlink()
+    app.store.update(identity, upload_status="link_pending", upload_provider="quark_api",
+                     upload_filename=source.name, upload_target="folder-1", upload_remote_fid="original-fid",
+                     upload_task_id="original-upload-task",
+                     upload_md5="a" * 32, upload_sha1="b" * 40, upload_size=expected_size)
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, *args):
+            raise AssertionError("recovery must not upload")
+
+        def share_existing(self, source, target, **values):
+            calls.append((source.name, target, values))
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert calls == [("recover.zip", "folder-1", {
+        "remote_fid": "original-fid", "size": expected_size, "md5": "a" * 32, "sha1": "b" * 40,
+        "upload_task_id": "original-upload-task",
+    })]
+    assert app.store.get(identity)["upload_status"] == "completed"
+    assert app.store.get(identity)["upload_received"] == expected_size
+
+
+def test_api_upload_stop_leaves_unstarted_files_waiting(app, monkeypatch):
+    from xianyu_pipeline.browser_download import DownloadCancelled
+    assert api_settings(app, quark_api_file_concurrency=1)[0] == 200
+    identities = [app.task(f"stop-{index}.zip") for index in range(3)]
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target):
+            calls.append(source.name)
+            self.stop_event.set()
+            raise DownloadCancelled("fixture cancelled")
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": identities})[0] == 200
+    app.run()
+    assert calls == ["stop-0.zip"]
+    assert [app.store.get(identity)["upload_status"] for identity in identities] == ["failed", "waiting", "waiting"]
+    assert not app.state.error
+
+
+def test_api_batch_rejects_same_local_names_before_starting(app):
+    assert api_settings(app)[0] == 200
+    identities = [app.task(f"original-{index}.zip") for index in range(2)]
+    for index, identity in enumerate(identities):
+        original = Path(app.store.get(identity)["local_path"])
+        folder = original.parent / f"channel-{index}"
+        folder.mkdir()
+        source = folder / "material.zip"
+        source.write_bytes(original.read_bytes())
+        app.store.update(identity, local_path=str(source))
+    status, response = app.post("/api/upload", {"ids": identities})
+    assert status == 400 and "同名" in response["message"]
+    assert not app.workers
+    assert all(app.store.get(identity)["upload_status"] == "waiting" for identity in identities)
+
+
+def test_quark_api_check_does_not_upload_or_require_telegram(app, monkeypatch):
+    assert app.post("/api/quark-api-check")[0] == 400
+    assert api_settings(app)[0] == 200
+    values = json.loads(app.config_path.read_text(encoding="utf-8"))
+    values.update(telegram_api_id=0, telegram_api_hash="")
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def check(self):
+            calls.append((self.parent_fid, self.stop_event))
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/quark-api-check")[0] == 200
+    app.run()
+    assert calls == [("folder-1", app.state.stop_event)]
+    assert not app.state.error
+
+
+def catalog_page(ids, cursor, has_more=True):
+    return {"messages": [{"message_id": mid, "chat": "fixture_channel",
+                          "filename": f"asset-{mid}.zip", "cover_status": "pending"}
+                         for mid in ids],
+            "oldest_scanned_id": cursor, "has_more": has_more}
+
+
+def test_catalog_worker_streams_metadata_before_cover_completion(app, monkeypatch):
+    app.acquire()
+    covers_started, release = threading.Event(), threading.Event()
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            assert options["limit"] == 100
+            options["on_progress"]({"stage": "scanning", "found": 2, "scanned": 6})
+            page = catalog_page([100, 95], 90)
+            options["on_page"](page)
+            options["on_progress"]({"stage": "covers", "found": 2, "total": 2, "processed": 0})
+            covers_started.set()
+            assert release.wait(5)
+            options["on_progress"]({"stage": "completed", "processed": 2, "ready": 1, "failed": 1})
+            return page
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    status, body = app.get("/api/workbench")
+    assert status == 200 and body["running"]
+    assert body["channel_scan"]["stage"] == "connecting"
+    worker = threading.Thread(target=app.run)
+    worker.start()
+    try:
+        assert covers_started.wait(5)
+        body = app.get("/api/workbench")[1]
+        assert body["running"] and body["channel_scan"]["stage"] == "covers"
+        assert [row["message_id"] for row in app.get("/api/channel-messages")[1]["messages"]] == [100, 95]
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    body = app.get("/api/workbench")[1]
+    assert not body["running"] and not body["error"]
+    assert body["channel_scan"]["stage"] == "completed"
+    assert body["channel_scan"]["found"] == body["channel_scan"]["processed"] == 2
+    assert body["channel_scan"]["failed"] == 1
+
+
+def test_streamed_catalog_cursor_tracks_first_and_older_scans_but_not_refresh(app, monkeypatch):
+    app.acquire()
+    rounds = [
+        (0, [catalog_page([100, 95], 90), catalog_page([89, 85], 80)]),
+        (0, [catalog_page([110], 109), catalog_page([108], 107)]),
+        (80, [catalog_page([79], 75), catalog_page([70], 60, False)]),
+    ]
+    observed = []
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            before, pages = rounds.pop(0)
+            assert options["before_id"] == before
+            for page in pages:
+                options["on_page"](page)
+                observed.append(app.get("/api/channel-messages")[1]["oldest_scanned_id"])
+            return {**pages[-1], "messages": [row for page in pages for row in page["messages"]]}
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    for older in (False, False, True):
+        assert app.post("/api/channel-scan", {"older": older})[0] == 200
+        app.run()
+        assert not app.state.error
+    assert observed == [90, 80, 80, 80, 75, 60]
+    listing = app.get("/api/channel-messages")[1]
+    assert listing["oldest_scanned_id"] == 60 and not listing["has_more"]
+    assert len(listing["messages"]) == 8
+
+
+def test_catalog_stop_retains_streamed_messages_without_fatal_error(app, monkeypatch):
+    app.acquire()
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            options["on_page"](catalog_page([100], 95))
+            options["on_progress"]({"stage": "covers", "found": 1, "total": 1})
+            assert app.post("/api/stop")[0] == 200
+            assert self.stop_event.is_set()
+            assert app.get("/api/workbench")[1]["channel_scan"]["stop_requested"]
+            raise web_ui.DownloadCancelled("fixture stop")
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    body = app.get("/api/workbench")[1]
+    assert body["channel_scan"]["stage"] == "cancelled"
+    assert not body["running"] and not body["error"]
+    assert len(app.get("/api/channel-messages")[1]["messages"]) == 1
+
+
+def test_catalog_failure_retains_metadata_and_next_scan_resets_progress(app, monkeypatch):
+    app.acquire()
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            options["on_page"](catalog_page([100], 95))
+            options["on_progress"]({"stage": "covers", "found": 1, "total": 1})
+            raise RuntimeError("fixture connection lost")
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    body = app.get("/api/workbench")[1]
+    assert body["channel_scan"]["stage"] == "failed"
+    assert body["error"] == "fixture connection lost" and not body["running"]
+    assert len(app.get("/api/channel-messages")[1]["messages"]) == 1
+    assert app.post("/api/channel-scan")[0] == 200
+    body = app.get("/api/workbench")[1]
+    assert body["channel_scan"]["stage"] == "connecting"
+    assert body["channel_scan"]["found"] == 0 and not body["error"]
+    assert "elapsed_seconds" not in app.state.channel_scan
+    app.run()
+
+
+def test_catalog_scan_accepts_file_and_full_image_jobs_without_a_second_worker(app, monkeypatch):
+    app.acquire()
+    observed = []
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            page = catalog_page([100, 99], 95)
+            options["on_page"](page)
+            assert app.get("/api/workbench")[1]["channel_requests_open"]
+            assert app.post("/api/channel-download", {"ids": [100]})[0] == 200
+            assert app.post("/api/channel-cover", {"id": 99})[0] == 200
+            assert not app.workers, "Do not open a competing Telegram session"
+            assert app.post("/api/channel-download", {"ids": [100]})[0] == 409
+            assert app.post("/api/config", {"recent_message_limit": 2})[0] == 409
+            assert not options["close_requests"]()
+            while (job := options["take_request"]()) is not None:
+                observed.append(job["kind"])
+                if job["kind"] == "download":
+                    self.on_event({"chat": "fixture_channel", "message_id": 100,
+                                   "filename": "asset-100.zip", "download_status": "failed",
+                                   "error": "fixture download failure"})
+                    options["on_request_done"](job, {}, "fixture download failure")
+                else:
+                    full = options["preview_dir"] / "full.jpg"
+                    full.parent.mkdir(parents=True, exist_ok=True)
+                    full.write_bytes(b"\xff\xd8\xfffixture")
+                    options["on_request_done"](job, {"full_cover_path": str(full),
+                                                     "full_status": "ready", "full_quality": "full"}, "")
+            assert options["close_requests"]()
+            assert app.post("/api/channel-cover", {"id": 100})[0] == 409
+            return page
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    assert not app.state.error
+    # v49 前台图片请求进入队首，不再按提交顺序排在文件任务后面。
+    assert observed == ["cover", "download"]
+    tasks = app.get("/api/workbench")[1]["tasks"]
+    assert len(tasks) == 1 and tasks[0]["download_status"] == "failed"
+    rows = app.get("/api/channel-messages")[1]["messages"]
+    assert rows[1]["full_cover_url"] and rows[1]["full_status"] == "ready"
+    assert app.post("/api/channel-cover", {"id": 99})[0] == 200
+    assert not app.workers, "Cached full images do not start a new API job"
+
+
+def test_stop_rejects_new_jobs_and_cancels_queued_file_and_full_image(app, monkeypatch):
+    app.acquire()
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            options["on_page"](catalog_page([100], 95))
+            assert app.post("/api/channel-download", {"ids": [100]})[0] == 200
+            assert app.post("/api/channel-cover", {"id": 100})[0] == 200
+            assert app.post("/api/stop")[0] == 200
+            assert app.post("/api/channel-cover", {"id": 100})[0] == 409
+            raise web_ui.DownloadCancelled("fixture stop")
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    assert not app.state.error and not app.state.channel_requests_open
+    assert app.get("/api/workbench")[1]["tasks"][0]["download_status"] == "cancelled"
+    assert app.get("/api/channel-messages")[1]["messages"][0]["full_status"] == "cancelled"
+
+
+def test_queue_storage_failure_returns_error_without_starting_or_losing_a_job(app, monkeypatch):
+    app.acquire()
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            return catalog_page([100], 95)
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+
+    def failing_write(event):
+        raise OSError("fixture disk unavailable")
+
+    monkeypatch.setattr(app.store, "event", failing_write)
+    status, result = app.post("/api/channel-download", {"ids": [100]})
+    assert status == 400 and "fixture disk unavailable" in result["message"]
+    assert not app.workers and not app.state.running
+    assert not app.state.channel_requests and not app.state.channel_request_keys

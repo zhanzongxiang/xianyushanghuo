@@ -143,6 +143,7 @@ def test_api_failed_events_include_error_and_retained_path(tmp_path, monkeypatch
     item = message(content=payload)
     item.file.size = expected_size
     adapter, client, events = api_fixture(tmp_path, monkeypatch, [message(8), item], payload)
+    adapter.download_file_concurrency = 1
     with pytest.raises(RuntimeError):
         adapter.fetch_messages("", [], CHANNEL, "recent", 2)
     failure = next(event for event in events if event["download_status"] == "failed")

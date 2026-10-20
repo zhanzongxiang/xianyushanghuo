@@ -25,7 +25,10 @@ class QuarkBrowserStorageAdapter:
                  upload_input_selector: str, file_row_selector: str,
                  share_button_selector: str, share_link_selector: str,
                  timeout_seconds: int = 180, browser_executable_path: str = "",
-                 on_stage: Callable[[str], None] | None = None):
+                 share_create_button_selector: str = "", folder_ready_selector: str = "",
+                 share_expire_days: int | None = None,
+                 on_stage: Callable[[str], None] | None = None,
+                 on_progress: Callable[[int, int, float, float | None], None] | None = None):
         parsed = urlparse(folder_url)
         if (parsed.scheme != "https" or parsed.netloc.lower() not in {"pan.quark.cn", "drive.quark.cn"}
                 or re.search(r"[\s\\]", folder_url)):
@@ -33,6 +36,11 @@ class QuarkBrowserStorageAdapter:
         required = (upload_input_selector, file_row_selector, share_button_selector, share_link_selector)
         if not all(required):
             raise ValueError("网页上传需要配置经实际页面确认的上传控件、文件行、分享按钮及链接选择器")
+        if share_expire_days is not None and (type(share_expire_days) is not int or share_expire_days not in {0, 1, 7, 30}):
+            raise ValueError("分享有效期仅支持1、7、30天或0（永久）")
+        if share_expire_days is not None and not share_create_button_selector:
+            raise ValueError("指定有效期必须配置创建分享按钮，不能依赖默认分享")
+        self.share_expire_days = share_expire_days
         self.folder_url = folder_url
         self.profile_dir = Path(profile_dir)
         self.headless = headless
@@ -40,9 +48,12 @@ class QuarkBrowserStorageAdapter:
         self.file_row_selector = file_row_selector
         self.share_button_selector = share_button_selector
         self.share_link_selector = share_link_selector
+        self.share_create_button_selector = share_create_button_selector
+        self.folder_ready_selector = folder_ready_selector
         self.timeout_ms = timeout_seconds * 1000
         self.browser_executable_path = browser_executable_path
         self.on_stage = on_stage
+        self.on_progress = on_progress
 
     def _report_stage(self, stage: str) -> None:
         if callable(self.on_stage):
@@ -78,6 +89,8 @@ class QuarkBrowserStorageAdapter:
                 page.goto(self.folder_url, wait_until="domcontentloaded")
                 if urlparse(page.url) != urlparse(self.folder_url):
                     raise QuarkBrowserError("未进入目标文件夹；请先运行可见窗口登录并复制实际文件夹地址")
+                if self.folder_ready_selector:
+                    page.locator(self.folder_ready_selector).wait_for(state="visible", timeout=self.timeout_ms)
                 if upload:
                     upload_input = page.locator(self.upload_input_selector)
                     if upload_input.count() != 1:
@@ -114,7 +127,24 @@ class QuarkBrowserStorageAdapter:
         share_button = row.locator(self.share_button_selector)
         if share_button.count() != 1:
             raise QuarkBrowserError("文件行中找不到唯一的分享按钮，请人工检查上传状态")
+        if self.share_create_button_selector:
+            row.hover()
         share_button.click()
+        if self.share_create_button_selector:
+            create_button = page.locator(self.share_create_button_selector)
+            create_button.wait_for(state="visible", timeout=self.timeout_ms)
+            if create_button.count() != 1:
+                raise QuarkBrowserError("创建分享按钮不存在或不唯一，未继续创建分享")
+            if self.share_expire_days is not None:
+                label = "永久有效" if self.share_expire_days == 0 else f"{self.share_expire_days}天"
+                option = page.locator(".ant-modal:visible label.ant-radio-button-wrapper").filter(
+                    has_text=re.compile(rf"^{re.escape(label)}$"))
+                if option.count() != 1:
+                    raise QuarkBrowserError("有效期选项不存在或不唯一，未创建分享")
+                option.click()
+                if not option.locator("input[type=radio]").is_checked():
+                    raise QuarkBrowserError("有效期选择未生效，未创建分享")
+            create_button.click()
         link = page.locator(self.share_link_selector)
         if link.count() > 1:
             raise QuarkBrowserError("分享链接控件不唯一")
@@ -122,7 +152,12 @@ class QuarkBrowserStorageAdapter:
         if link.count() != 1:
             raise QuarkBrowserError("分享链接控件不存在或不唯一")
         result = link.input_value() if link.evaluate("el => 'value' in el") else link.inner_text()
-        return self._share_url(result)
+        url = self._share_url(result)
+        if self.share_expire_days is not None:
+            expected = "永久有效" if self.share_expire_days == 0 else f"{self.share_expire_days}天后失效"
+            if expected not in result:
+                raise QuarkBrowserError("分享已创建但有效期未确认，保持链接待核对；不要重新上传文件")
+        return url
 
     @staticmethod
     def _share_url(value: str) -> str:

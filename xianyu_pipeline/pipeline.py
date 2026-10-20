@@ -116,7 +116,7 @@ def process_messages(config: PipelineConfig, messages: list[SourceMessage], clou
             upload_source = payload[0]
             candidate.delivery_path = upload_source
             try:
-                candidate.share_url = cloud.upload(upload_source, config.cloud_folder)
+                candidate.share_url = cloud.upload(upload_source, config.cloud_upload_target())
             except Exception as exc:
                 candidate.status = "needs_review"
                 candidate.warnings.append(f"上传未完成：{exc}")

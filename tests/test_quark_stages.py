@@ -38,6 +38,8 @@ class FakeLocator:
             return self.page.input_count
         if self.kind in {"rows", "row"}:
             return len(self.matches())
+        if self.kind in {"create", "ready"}:
+            return 1
         if self.kind == "share":
             return self.page.share_count
         assert self.kind == "link"
@@ -82,9 +84,13 @@ class FakeLocator:
         self.page.step("link_read")
         return self.page.link_text
 
+    def hover(self):
+        assert self.kind in {"row", "rows"}
+        self.page.step("row_hover")
+
     def click(self):
-        assert self.kind == "share"
-        self.page.step("share_click")
+        assert self.kind in {"share", "create"}
+        self.page.step(f"{self.kind}_click")
 
     def set_input_files(self, filename):
         assert self.kind == "upload"
@@ -123,6 +129,8 @@ class FakePage:
         self.url = self.redirect or url
 
     def locator(self, selector):
+        if selector in {"fixture-create", "fixture-ready"}:
+            return FakeLocator(self, selector.removeprefix("fixture-"))
         kind = next(kind for kind, value in SELECTORS.items() if value == selector)
         assert kind != "share", "share must be scoped to the file row"
         if kind == "upload":
@@ -438,6 +446,59 @@ def test_unsafe_configured_folder_url_is_rejected(browser, folder_url):
     options = dict(browser.options, folder_url=folder_url)
     with pytest.raises(ValueError):
         QuarkBrowserStorageAdapter(**options)
+
+
+def test_two_stage_share_hovers_creates_and_reads_modal_text(browser):
+    browser.adapter.share_create_button_selector = "fixture-create"
+    browser.adapter.folder_ready_selector = "fixture-ready"
+    browser.page.link_is_input = False
+    browser.page.link_text = f"分享成功\n链接：{SHARE_URL}\n永久有效"
+    browser.page.files = [browser.local_path.name]
+    browser.page.forbid_upload = True
+    assert browser.adapter.share_existing(browser.local_path, "") == SHARE_URL
+    events = browser.page.events
+    assert events.index("ready_wait") < events.index("row_wait")
+    assert events.index("row_hover") < events.index("share_click")
+    assert events.index("share_click") < events.index("create_click") < events.index("link_read")
+    assert browser.page.uploads == []
+
+
+@pytest.mark.parametrize("checked,text,success", [
+    (True, f"7天后失效\n{SHARE_URL}", True),
+    (False, f"7天后失效\n{SHARE_URL}", False),
+    (True, f"永久有效\n{SHARE_URL}", False),
+    (True, f"{SHARE_URL}", False),
+])
+def test_expiry_requires_checked_option_and_confirmed_result(browser, monkeypatch, checked, text, success):
+    browser.adapter.share_create_button_selector = "fixture-create"
+    browser.adapter.share_expire_days = 7
+    browser.page.link_is_input = False
+    browser.page.link_text = text
+    original = browser.page.locator
+    radio = SimpleNamespace(is_checked=lambda: checked)
+    option = SimpleNamespace(count=lambda: 1, click=lambda: browser.page.step("expiry_click"),
+                             locator=lambda selector: radio)
+    group = SimpleNamespace(filter=lambda **kwargs: option)
+    monkeypatch.setattr(browser.page, "locator", lambda selector: group if selector ==
+                        ".ant-modal:visible label.ant-radio-button-wrapper" else original(selector))
+    if success:
+        assert browser.adapter.upload(browser.local_path, "") == SHARE_URL
+        assert browser.page.events.index("expiry_click") < browser.page.events.index("create_click")
+    else:
+        with pytest.raises(QuarkBrowserError):
+            browser.adapter.upload(browser.local_path, "")
+        assert browser.stages == ["uploading", "link_pending"]
+        if not checked:
+            assert "create_click" not in browser.page.events
+
+
+def test_create_failure_never_completes_or_resubmits(browser):
+    browser.adapter.share_create_button_selector = "fixture-create"
+    browser.page.failure = "create_click"
+    with pytest.raises(RuntimeError, match="create_click"):
+        browser.adapter.upload(browser.local_path, "")
+    assert len(browser.page.uploads) == 1
+    assert browser.stages == ["uploading", "link_pending"]
 
 
 def test_browser_without_initial_page_uses_new_page(browser):

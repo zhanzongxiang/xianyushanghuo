@@ -90,6 +90,70 @@ def test_database_idempotency_conflicts_workspaces_and_restart(tmp_path):
                                                 "cursor": 1, "operations": []})["changes"][0]["value"]["name"] == "Other"
 
 
+def test_cloud_deletion_metadata_syncs_to_another_device_and_survives_restart(tmp_path, service):
+    first, second = desktop(tmp_path / "first", service), desktop(tmp_path / "second", service)
+    identity = first.transfers.event({"chat": "models", "message_id": 88, "filename": "model.rar",
+                                      "download_status": "completed"})
+    first.transfers.update(identity, upload_status="completed", upload_provider="quark_api",
+                           upload_remote_fid="bound-file", upload_target="original-folder",
+                           cloud_delete_status="pending", cloud_delete_task_id="delete-receipt",
+                           cloud_delete_error="等待云端确认")
+    settled(first)
+    settled(second)
+    task = second.transfers.snapshot()["tasks"][0]
+    assert task["remote_device"] and task["cloud_delete_status"] == "pending"
+    assert task["cloud_delete_task_id"] == "delete-receipt" and task["cloud_delete_error"] == "等待云端确认"
+    first.transfers.update(identity, upload_status="deleted", cloud_delete_status="completed",
+                           cloud_delete_error="", cloud_deleted_at="2026-10-22T04:00:00+00:00", share_url="")
+    settled(first)
+    settled(second)
+    restarted = desktop(tmp_path / "second", service)
+    settled(restarted)
+    task = restarted.transfers.snapshot()["tasks"][0]
+    assert task["upload_status"] == "deleted" and task["cloud_delete_status"] == "completed"
+    assert task["cloud_deleted_at"] == "2026-10-22T04:00:00+00:00" and task["share_url"] == ""
+    assert identity not in restarted.transfers.tasks
+
+
+def test_removed_library_record_stays_hidden_across_sync_restart_and_local_import(tmp_path, service, monkeypatch):
+    first, second = desktop(tmp_path / "first", service), desktop(tmp_path / "second", service)
+    source = first.config.inbox_dir / "model.rar"
+    source.write_bytes(b"archive fixture")
+    image = first.config.inbox_dir / "cover.jpg"
+    image.write_bytes(JPEG)
+    identity = first.transfers.event({"chat": "models", "message_id": 90, "filename": source.name,
+                                      "download_status": "completed", "local_path": str(source),
+                                      "image_paths": [str(image)]})
+    first.transfers.update(identity, upload_status="completed", upload_provider="quark_api",
+                           upload_remote_fid="bound-file", share_url="https://pan.quark.cn/s/Fixture")
+    settled(first)
+    settled(second)
+    assert len(second.transfers.snapshot()["tasks"]) == 1
+    first.transfers.remove_record(identity)
+    settled(first)
+    settled(second)
+    assert second.transfers.snapshot()["tasks"] == [] and not second.transfers.remote_tasks
+    assert source.read_bytes() == b"archive fixture" and image.read_bytes() == JPEG
+    restarted = desktop(tmp_path / "first", service)
+    settled(restarted)
+    assert restarted.transfers.snapshot()["tasks"] == [] and len(restarted.transfers.tasks) == 1
+    assert restarted.transfers.tasks[identity]["record_removed_at"]
+    third = desktop(tmp_path / "third", service)
+
+    def unexpected_asset(*args):
+        raise AssertionError("Removed records must not download images")
+
+    monkeypatch.setattr(third.sync, "_download_image", unexpected_asset)
+    settled(third)
+    assert third.transfers.snapshot()["tasks"] == []
+    first.transfers.event({"chat": "models", "message_id": 90, "filename": source.name, "download_status": "queued"})
+    first.transfers.event({"chat": "models", "message_id": 90, "filename": source.name, "download_status": "completed"})
+    settled(first)
+    settled(second)
+    assert len(second.transfers.snapshot()["tasks"]) == 1
+    assert second.transfers.snapshot()["tasks"][0]["record_removed_at"] == ""
+
+
 def test_database_batch_validation_and_operation_reuse_are_atomic(tmp_path):
     database = DataDatabase(tmp_path / "business.sqlite3")
     with pytest.raises(ValueError):

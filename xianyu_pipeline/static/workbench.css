@@ -20,6 +20,7 @@ button.primary:hover:enabled { background: #196d55; }
 .danger-button { color: var(--red); }
 .icon-button { width: 34px; height: 34px; min-height: 34px; padding: 7px; flex-shrink: 0; }
 .text-button { border: 0; background: transparent; color: var(--green); padding: 4px 6px; min-height: 30px; }
+.text-button.danger-button { color: var(--red); }
 a { color: var(--green); overflow-wrap: anywhere; }
 button, a, input, select, [tabindex] { -webkit-tap-highlight-color: transparent; }
 :focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
@@ -97,6 +98,18 @@ main { min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
 .channel-messages-section { padding: 0 30px 30px; min-width: 0; max-width: 1200px; width: 100%; }
 .channel-switcher { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .channel-switcher-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+.channel-topic-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.channel-topic-bar label, .channel-topic-status, #channel-topic-status { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+#channel-topic-select { flex: 1 1 180px; min-width: 0; max-width: 420px; }
+.topic-children { margin: 0 0 12px 16px; padding-left: 14px; border-left: 2px solid var(--line); min-width: 0; }
+.topic-toolbar { display: flex; align-items: center; gap: 10px; padding: 10px 0; flex-wrap: wrap; }
+.topic-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.topic-row.active { color: var(--green); }
+.topic-copy { display: flex; flex: 1; min-width: 0; align-items: center; flex-wrap: wrap; gap: 6px; }
+.topic-copy strong { font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+.topic-copy small { font-size: 11px; color: var(--muted); }
+.topic-row button { flex-shrink: 0; }
+.topic-expand { width: 30px; height: 30px; padding: 5px; flex-shrink: 0; }
 .channel-switcher-label { color: var(--muted); font-size: 11px; white-space: nowrap; }
 .channel-picker { position: relative; width: min(460px, 100%); min-width: 0; }
 #channel-select { width: 100%; min-width: 0; height: 56px; padding: 8px 12px; justify-content: flex-start; gap: 10px; text-align: left; }
@@ -126,6 +139,7 @@ main { min-width: 0; display: flex; flex-direction: column; min-height: 100vh; }
 #scan-channel { min-width: 130px; }
 .channel-toolbar { display: flex; align-items: center; gap: 20px; padding: 10px 0 14px; border-bottom: 1px solid var(--line); }
 .channel-toolbar .search-field { max-width: 560px; }
+.channel-transfer-filter { display: flex; align-items: center; gap: 7px; flex: 0 0 160px; }
 #channel-scan-status { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
 .channel-loading { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 8px 12px; padding: 14px 0; border-bottom: 1px solid var(--line); min-height: 85px; }
 .channel-loading-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
@@ -163,7 +177,10 @@ button.channel-message-cover:hover { outline: 2px solid var(--green); outline-of
 .channel-preview-canvas img { display: block; width: auto; max-width: 100%; max-height: calc(94vh - 104px); height: auto; object-fit: contain; }
 .channel-message-body { min-width: 0; }
 .channel-message-head { display: flex; align-items: flex-start; gap: 10px; justify-content: space-between; }
-.channel-message-head h2 { margin: 0; font-size: 14px; line-height: 1.4; font-weight: 600; min-width: 0; }
+.channel-message-head h2 { margin: 0; font-size: 14px; line-height: 1.4; font-weight: 600; min-width: 0; flex: 1; }
+.channel-message-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; max-width: 48%; }
+.channel-message-badges .badge { gap: 4px; }
+.channel-message-badges .lucide { width: 12px; height: 12px; }
 .channel-message-meta { display: flex; flex-wrap: wrap; gap: 3px 15px; margin: 7px 0; font-size: 11px; color: var(--muted); }
 .channel-caption { margin: 8px 0 12px; color: #526159; font-size: 12px; line-height: 1.55; white-space: pre-line; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
 .channel-message-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; margin-top: 11px; }
@@ -367,6 +384,7 @@ fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
   #channel-active-hint { max-width: 100%; }
   .joined-channel-status { max-width: 100%; }
   .channel-toolbar { align-items: stretch; flex-direction: column; gap: 5px; }
+  .channel-transfer-filter { flex-basis: auto; width: 100%; }
   #channel-scan-status { white-space: normal; }
   .channel-message { grid-template-columns: 15px 66px minmax(0, 1fr); gap: 8px; }
   .channel-message-cover { width: 66px; height: 80px; }
@@ -376,6 +394,7 @@ fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
   .channel-preview-canvas img { max-height: calc(100dvh - 100px); }
   .channel-message-head { flex-wrap: wrap; gap: 5px; }
   .channel-message-head h2 { font-size: 12px; flex-basis: 100%; }
+  .channel-message-badges { max-width: 100%; justify-content: flex-start; }
   .channel-message-meta, .channel-caption { font-size: 10px; }
   .channel-message-actions { gap: 5px; }
   .channel-message-actions button, .channel-message-actions .button { font-size: 10px; }

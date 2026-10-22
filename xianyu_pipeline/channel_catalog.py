@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .models import utc_now
 from .workbench import channel_key, image_type
+from .telegram_sources import split_scope, source_scope
 
 
 class ChannelCatalog:
@@ -22,14 +23,15 @@ class ChannelCatalog:
 
     @staticmethod
     def _empty(channel: str) -> dict:
-        return {"channel": channel, "messages": [], "oldest_scanned_id": 0,
+        peer, topic_id = split_scope(channel) if channel else ("", 0)
+        return {"channel": channel, "chat": peer, "topic_id": topic_id, "messages": [], "oldest_scanned_id": 0,
                 "has_more": False, "scanned_at": ""}
 
     def _current(self, channel: str) -> dict:
         key = channel_key(channel)
         path = self._path(key)
         stored = self._read(path)
-        if stored is not None:
+        if stored is not None and stored["channel"] == key:
             return stored
         # v42 and earlier stored the active channel in one shared file. Read it
         # as a migration source, but never let another channel reuse its rows.
@@ -40,6 +42,7 @@ class ChannelCatalog:
         return self._empty(key)
 
     def _path(self, key: str) -> Path:
+        split_scope(key)
         return self.catalog_root / f"{key}.json"
 
     @staticmethod
@@ -91,8 +94,8 @@ class ChannelCatalog:
             for row in rows:
                 cover = self._cover(row)
                 full = self._cover(row, full=True)
-                row["cover_url"] = (f"/api/channel-preview/{row['message_id']}?v={cover.name}" if cover else "")
-                row["full_cover_url"] = (f"/api/channel-full-preview/{row['message_id']}?v={full.name}" if full else "")
+                row["cover_url"] = (f"/api/channel-preview/{row['message_id']}?v={cover.name}&source={current['channel']}" if cover else "")
+                row["full_cover_url"] = (f"/api/channel-full-preview/{row['message_id']}?v={full.name}&source={current['channel']}" if full else "")
                 row.pop("cover_path", None)
                 row.pop("full_cover_path", None)
             return {**{key: value for key, value in current.items() if key != "messages"},
@@ -134,11 +137,16 @@ class ChannelCatalog:
     def merge(self, channel: str, page: dict, *, older: bool = False) -> None:
         with self.lock:
             key = channel_key(channel)
+            peer, topic_id = split_scope(key)
             current = self._current(key)
             existing = {row["message_id"]: row for row in current["messages"]
                         if isinstance(row, dict) and isinstance(row.get("message_id"), int)}
             for item in page["messages"]:
                 row = dict(item)
+                if topic_id:
+                    if source_scope(row.get("chat", peer), row.get("topic_id", topic_id)) != key:
+                        raise ValueError("消息不属于当前话题")
+                    row.update(chat=peer, topic_id=topic_id, source_kind="forum")
                 previous = existing.get(row["message_id"], {})
                 for field, value in previous.items():
                     if field.startswith("full_") and field not in row:
@@ -152,7 +160,7 @@ class ChannelCatalog:
                 existing[row["message_id"]] = row
             cursor = (page["oldest_scanned_id"] if older or not current["oldest_scanned_id"]
                       else current["oldest_scanned_id"])
-            self.data = {"channel": key,
+            self.data = {"channel": key, "chat": peer, "topic_id": topic_id,
                          "messages": sorted(existing.values(), key=lambda row: row["message_id"], reverse=True)[:300],
                          "oldest_scanned_id": cursor,
                          "has_more": page["has_more"] if older or not current["oldest_scanned_id"] else current["has_more"],

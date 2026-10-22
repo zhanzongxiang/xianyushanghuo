@@ -17,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+from uuid import uuid4
 
 from .adapters import (LocalCloudStorageAdapter, LocalTelegramAdapter,
                        TelethonTelegramAdapter, parse_telegram_api_proxy, parse_telegram_dc2_server)
@@ -25,16 +26,19 @@ from .config import PipelineConfig
 from .pipeline import run_pipeline
 from .quark_browser import QuarkBrowserStorageAdapter
 from .quark_cli import QuarkCLIStorageAdapter, validate_quark_cli_settings
-from .quark_api import QuarkAPIStorageAdapter, validate_cookie, validate_quark_api_settings
+from .quark_api import (FID, QuarkAPIStorageAdapter, QuarkDeletePending,
+                        validate_cookie, validate_quark_api_settings)
+from .models import utc_now
 from .runtime import configure_logging, validate_browser_path, telegram_crypto_backend
 from .archive_validation import find_archive_tester, validate_rar
 from .browser_profiles import check_browser, resolve_browser_profile, version_text
 from .browser_download import DownloadCancelled
 from .channel_catalog import ChannelCatalog
 from .channel_sources import ChannelDirectory, normalize_public_channel
+from .telegram_sources import source_scope, split_scope
 from .server_sync import ServerSync
 from .local_settings import remember_telegram_settings, restore_telegram_settings
-from .workbench import TransferStore, channel_key, image_type
+from .workbench import TransferStore, channel_key, image_type, is_library_item
 from .admin_auth import AuthHandlerMixin, AdminAuth, LOGOUT_HTML
 from .download_diagnostics import export_diagnostics
 from .naming import NameTranslator, validate_name, validate_naming_settings
@@ -55,6 +59,7 @@ class WebState:
         self.logs: list[str] = []
         self.running = False
         self.action = ""
+        self.task_id = ""
         self.error = ""
         self.stop_event = Event()
         self.channel_scan: dict = {}
@@ -64,6 +69,7 @@ class WebState:
         self.channel_requests_open = False
         self.telegram_channels = {"stage": "idle", "scanned_at": "", "error": "",
                                   "found": 0, "added": 0, "updated": 0}
+        self.telegram_topics = {"stage": "idle", "channel": "", "found": 0, "error": ""}
         self.lock = threading.Lock()
         # Serialize configuration saves and validated starts without holding the log lock.
         self.control_lock = threading.Lock()
@@ -80,9 +86,10 @@ class WebState:
                 scan["elapsed_seconds"] = round(time.monotonic() - self.channel_scan_started, 1)
             telegram_channels = dict(self.telegram_channels)
             return {"running": self.running, "logs": list(self.logs), "action": self.action,
+                    "task_id": self.task_id, "stop_requested": self.running and self.stop_event.is_set(),
                     "error": self.error, "channel_scan": scan,
                     "channel_requests_open": self.channel_requests_open,
-                    "telegram_channels": telegram_channels}
+                    "telegram_channels": telegram_channels, "telegram_topics": dict(self.telegram_topics)}
 
     def take_channel_request(self) -> dict | None:
         with self.lock:
@@ -114,6 +121,14 @@ def config_payload(config: PipelineConfig) -> dict:
     return {
         "source_chat": "",
         "data_server_enabled": config.data_server_enabled,
+        "data_server_backend": config.data_server_backend,
+        "data_server_db_host": config.data_server_db_host,
+        "data_server_db_port": config.data_server_db_port,
+        "data_server_db_name": config.data_server_db_name,
+        "data_server_db_user": config.data_server_db_user,
+        "data_server_db_password_configured": bool(config.data_server_db_password),
+        "data_server_db_tls": config.data_server_db_tls,
+        "data_server_db_ca": config.data_server_db_ca,
         "data_server_url": config.data_server_url,
         "data_server_workspace": config.data_server_workspace,
         "data_server_interval_seconds": config.data_server_interval_seconds,
@@ -134,6 +149,7 @@ def config_payload(config: PipelineConfig) -> dict:
         "unverified_dir": str((config.inbox_dir / ".unverified").resolve()),
         "log_path": str((config.output_dir / "logs" / "pipeline.log").resolve()),
         "source_channel_url": config.source_channel_url,
+        "source_topic_id": config.source_topic_id,
         "fetch_mode": "recent",
         "recent_message_limit": config.recent_message_limit,
         "channel_message_limit": config.channel_message_limit,
@@ -180,7 +196,7 @@ def browser_payload(config: PipelineConfig) -> dict:
 def write_config(path: Path, payload: dict) -> None:
     existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     updates = dict(payload)
-    for secret in ("telegram_api_hash", "quark_cookie", "data_server_token"):
+    for secret in ("telegram_api_hash", "quark_cookie", "data_server_token", "data_server_db_password"):
         if not updates.get(secret):
             updates.pop(secret, None)
     existing.update(updates)
@@ -347,7 +363,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             raise ValueError("上传方式必须为本地模拟、夸克网页上传或夸克 CLI / WSL")
         return LocalCloudStorageAdapter(config.output_dir / "cloud_fixture")
 
-    def api_adapter(config: PipelineConfig) -> TelethonTelegramAdapter:
+    def api_adapter(config: PipelineConfig, *, source_kind: str | None = None,
+                    topic_id: int | None = None) -> TelethonTelegramAdapter:
+        row = selected_channel(config)
         return TelethonTelegramAdapter(
             config.telegram_api_id, config.telegram_api_hash, config.telegram_session, config.inbox_dir,
             scan_limit=config.telegram_scan_limit, archive_test_executable_path=config.archive_test_executable_path,
@@ -358,7 +376,12 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             download_workers=config.download_workers,
             download_file_concurrency=config.download_file_concurrency,
             exclude_forwarded_posts=config.exclude_forwarded_posts,
+            source_kind=source_kind or (row or {}).get("kind", "channel"),
+            topic_id=config.source_topic_id if topic_id is None else topic_id,
             stop_event=state.stop_event, on_event=transfer_event)
+
+    def catalog_source(config: PipelineConfig) -> str:
+        return source_scope(config.source_channel_url, config.source_topic_id)
 
     def selected_channel(config: PipelineConfig) -> dict | None:
         if not config.source_channel_url:
@@ -369,17 +392,32 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             return None
 
     def require_selected_channel(config: PipelineConfig) -> None:
-        if selected_channel(config) is None:
+        row = selected_channel(config)
+        if row is None:
             raise ValueError("请先在来源频道中保存并选择频道，再获取频道消息")
+        if row.get("forum") or config.source_topic_id:
+            validate_topic_selection(row, config.source_topic_id, required=True)
+
+    def validate_topic_selection(row: dict, topic_id: int, *, required: bool = False) -> None:
+        if type(topic_id) is not int or not 0 <= topic_id <= 2147483647:
+            raise ValueError("来源话题 ID 无效")
+        if topic_id:
+            if not row.get("forum"):
+                raise ValueError("普通频道或群组不能选择话题")
+            channels.get_topic(row["key"], topic_id)
+        elif required and row.get("forum"):
+            raise ValueError("请先在来源频道中获取话题列表，再选择要读取的话题")
 
     def media_job_result(config: PipelineConfig, request: dict, result: dict, error: str) -> None:
         try:
             if request["kind"] == "cover":
-                catalog.update_cover(config.source_channel_url, request["message_id"], **(
+                catalog.update_cover(catalog_source(config), request["message_id"], **(
                     {"full_status": "cancelled" if state.stop_event.is_set() else "failed",
                      "full_error": error} if error else result))
             elif error:
                 transfers.event({"chat": str(TelethonTelegramAdapter.normalize_channel(config.source_channel_url)),
+                                 "topic_id": config.source_topic_id,
+                                 "source_kind": (selected_channel(config) or {}).get("kind", "channel"),
                                  "message_id": request["message_id"], "filename": request["filename"],
                                  "download_status": "cancelled" if state.stop_event.is_set() else "failed",
                                  "error": error})
@@ -434,17 +472,18 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 self.wfile.write(body)
             elif path == "/api/workbench":
                 self.json_response({**transfers.snapshot(), **{key: value for key, value in state.snapshot().items() if key != "logs"},
-                                    "data_sync": server_sync.snapshot()})
+                                    "data_sync": server_sync.snapshot(), "cloud_delete_supported": True,
+                                    "record_remove_supported": True})
             elif path == "/api/data-sync":
                 self.json_response(server_sync.snapshot())
             elif path == "/api/channels":
                 config = PipelineConfig.from_json(config_path)
-                self.json_response(channels.list(config.source_channel_url))
+                self.json_response(channels.list(config.source_channel_url, config.source_topic_id))
             elif path == "/api/telegram-channels":
                 self.json_response(state.snapshot()["telegram_channels"])
             elif path == "/api/channel-messages":
-                if active_channel:
-                    self.json_response(catalog.snapshot(config.source_channel_url,
+                if active_channel and (not active_channel.get("forum") or config.source_topic_id):
+                    self.json_response(catalog.snapshot(catalog_source(config),
                                                         exclude_forwarded_posts=config.exclude_forwarded_posts))
                 else:
                     self.json_response({"channel": "", "messages": [], "oldest_scanned_id": 0,
@@ -462,10 +501,18 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     self.send_error(404)
             elif re.fullmatch(r"/api/channel-(?:full-)?preview/[0-9]+", path):
                 try:
-                    require_selected_channel(config)
+                    query = parse_qs(urlparse(self.path).query)
+                    scope = query.get("source", [""])[0]
+                    if scope:
+                        peer, topic_id = split_scope(scope)
+                        row = channels.get(peer)
+                        validate_topic_selection(row, topic_id, required=True)
+                    else:
+                        require_selected_channel(config)
+                        scope = catalog_source(config)
                     message_id = int(path.rsplit("/", 1)[1])
                     config = PipelineConfig.from_json(config_path)
-                    asset, content_type = catalog.preview(config.source_channel_url, message_id,
+                    asset, content_type = catalog.preview(scope, message_id,
                                                           exclude_forwarded_posts=config.exclude_forwarded_posts,
                                                           full=path.startswith("/api/channel-full-preview/"))
                     self.file_response(asset, content_type)
@@ -550,16 +597,27 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         allowed = set(config_payload(existing)) - {
                             "download_dir", "log_path", "unverified_dir", "telegram_api_configured",
                             "telegram_crypto_backend", "quark_cookie_configured",
-                            "data_server_token_configured",
+                            "data_server_token_configured", "data_server_db_password_configured",
                         }
-                        allowed.update({"telegram_scan_limit", "cloud_folder", "telegram_api_hash", "quark_cookie", "data_server_token"})
+                        allowed.update({"telegram_scan_limit", "cloud_folder", "telegram_api_hash", "quark_cookie",
+                                        "data_server_token", "data_server_db_password"})
                         payload = {key: value for key, value in arguments.items() if key in allowed}
+                        next_source = payload.get("source_channel_url", existing.source_channel_url)
+                        if channel_key(next_source) != channel_key(existing.source_channel_url) and "source_topic_id" not in payload:
+                            payload["source_topic_id"] = 0
+                        next_topic = payload.get("source_topic_id", existing.source_topic_id)
+                        if type(next_topic) is not int or not 0 <= next_topic <= 2147483647:
+                            raise ValueError("来源话题 ID 无效")
+                        if next_topic:
+                            validate_topic_selection(channels.get(next_source), next_topic)
+                        if arguments.get("data_server_url") and "data_server_backend" not in arguments:
+                            payload["data_server_backend"] = "http"
                         if arguments.get("telegram_access_mode", "api") != "api" or arguments.get("telegram_run_mode", "once") != "once":
                             raise ValueError("仅支持 Telegram API 抓取一次")
                         validate_source_settings({**config_payload(existing), **payload}, existing)
                         replace(existing, **{key: value for key, value in payload.items()
                                              if key.startswith("data_server_") and
-                                             (key != "data_server_token" or value)})
+                                             (key not in {"data_server_token", "data_server_db_password"} or value)})
                         if "inbox_dir" in payload:
                             payload["inbox_dir"] = str(prepare_download_directory(payload["inbox_dir"]))
                         payload.update({"fetch_mode": "recent", "source_chat": "", "message_ids": [],
@@ -574,7 +632,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                     "stage": "idle", "scanned_at": "", "error": "",
                                     "found": 0, "added": 0, "updated": 0,
                                 }
-                            elif saved_config.source_channel_url != existing.source_channel_url:
+                            elif (saved_config.source_channel_url != existing.source_channel_url
+                                  or saved_config.source_topic_id != existing.source_topic_id):
                                 state.channel_scan = {}
                         if saved_config.source_channel_url and (not saved_config.data_server_enabled
                                 or saved_config.source_channel_url != existing.source_channel_url or not channels.path.exists()):
@@ -586,6 +645,27 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 if saved_config.data_server_enabled:
                     server_sync.start()
                 self.json_response({"message": "配置已保存"})
+            elif path == "/api/data-check":
+                config = PipelineConfig.from_json(config_path)
+                if arguments or config.data_server_backend == "http":
+                    self.json_response({"message": "请先保存 PostgreSQL 或 MySQL 数据库配置"}, 400)
+                    return
+                if not config.data_server_db_password:
+                    self.json_response({"message": "请先保存数据库密码"}, 400)
+                    return
+                try:
+                    replace(config, data_server_enabled=True)
+                    from .database_storage import database_engine
+                    engine = database_engine(config)
+                    try:
+                        with engine.connect() as connection:
+                            connection.exec_driver_sql("SELECT 1").scalar_one()
+                    finally:
+                        engine.dispose()
+                except Exception:
+                    self.json_response({"message": "数据库连接失败，请检查地址、端口、账号权限与 TLS 配置"}, 400)
+                    return
+                self.json_response({"message": "数据库连接成功"})
             elif path == "/api/data-sync":
                 if set(arguments) - {"resolve"}:
                     self.json_response({"message": "同步参数无效"}, 400)
@@ -601,6 +681,23 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     return
                 server_sync.wake.set()
                 self.json_response({"message": "已请求同步"})
+            elif path == "/api/library/remove":
+                with state.control_lock:
+                    if state.running:
+                        self.json_response({"message": "任务运行中，不能移除素材记录"}, 409)
+                        return
+                    try:
+                        if arguments.get("confirm") is not True or not isinstance(arguments.get("id"), str):
+                            raise ValueError("请先确认要移除的素材记录")
+                        identity = arguments["id"]
+                        task = transfers.get(identity)
+                        transfers.remove_record(identity)
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        self.json_response({"message": str(exc)}, 400)
+                        return
+                server_sync.wake.set()
+                logging.info("已从素材库移除记录：%s；本地文件和云端文件保留", task["filename"])
+                self.json_response({"message": "素材记录已移除，本地文件和云端文件保留"})
             elif path == "/api/names/save":
                 with state.control_lock:
                     if state.running:
@@ -620,9 +717,13 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                           "/api/channels/rename", "/api/channels/remove"}:
                 with state.control_lock:
                     with state.lock:
-                        if state.running:
-                            self.json_response({"message": "任务运行中，不能切换或修改频道列表"}, 409)
-                            return
+                        selecting = path in {"/api/channels/select", "/api/telegram-channels/select"}
+                        blocked = state.running and (selecting or state.action in {"telegram-channels-scan", "channel-topics-scan"})
+                    if blocked:
+                        message = ("任务运行中，不能切换当前频道" if selecting
+                                   else "正在获取账号频道或群组话题，请等待扫描结束后修改频道列表")
+                        self.json_response({"message": message}, 409)
+                        return
                     try:
                         config = PipelineConfig.from_json(config_path)
                         if path == "/api/channels":
@@ -641,7 +742,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             raise ValueError("频道标识无效")
                         if path in {"/api/channels/select", "/api/telegram-channels/select"}:
                             row = channels.get(key)
-                            write_config(config_path, {"source_channel_url": row["url"]})
+                            topic_id = arguments.get("topic_id", 0)
+                            validate_topic_selection(row, topic_id)
+                            write_config(config_path, {"source_channel_url": row["url"], "source_topic_id": topic_id})
                             saved_config = PipelineConfig.from_json(config_path)
                             transfers.use_config(saved_config)
                             with state.lock:
@@ -669,18 +772,31 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 except (ValueError, OSError, AttributeError) as exc:
                     self.json_response({"message": f"打开目录失败: {exc}"}, 400)
             elif path == "/api/stop":
-                if not state.running:
-                    self.json_response({"message": "当前没有运行中的任务"}, 409); return
-                state.stop_event.set()
-                with state.lock:
-                    state.channel_requests_open = False
-                    if state.action == "channel-scan":
-                        state.channel_scan["stop_requested"] = True
-                logging.info("已请求停止；Telegram API 任务将中断")
-                self.json_response({"message": "已请求停止"})
+                if (not isinstance(arguments.get("task_id"), str) or not arguments["task_id"]
+                        or not isinstance(arguments.get("action"), str) or not arguments["action"]
+                        or set(arguments) != {"task_id", "action"}):
+                    self.json_response({"message": "请刷新任务状态后，停止指定的任务"}, 400)
+                    return
+                with state.control_lock:
+                    with state.lock:
+                        if not state.running:
+                            message = "当前没有运行中的任务"
+                        elif arguments["task_id"] != state.task_id or arguments["action"] != state.action:
+                            message = "运行任务已变化，请刷新后重新操作"
+                        else:
+                            message = ""
+                            state.stop_event.set()
+                            state.channel_requests_open = False
+                            if state.action == "channel-scan":
+                                state.channel_scan["stop_requested"] = True
+                if message:
+                    self.json_response({"message": message}, 409)
+                    return
+                logging.info("已请求停止指定任务：%s", arguments["action"])
+                self.json_response({"message": "已请求停止指定任务"})
             elif path in {"/api/run", "/api/download", "/api/retry", "/api/upload", "/api/channel-scan",
-                          "/api/names/generate", "/api/names/apply",
-                          "/api/telegram-channels-scan",
+                          "/api/names/generate", "/api/names/apply", "/api/cloud-delete",
+                          "/api/telegram-channels-scan", "/api/channel-topics-scan",
                           "/api/channel-download", "/api/channel-cover", "/api/quark-login", "/api/quark-cli-login",
                           "/api/quark-cli-check", "/api/quark-api-check",
                           "/api/telegram-api-login", "/api/browser-check"}:
@@ -692,9 +808,35 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     if busy and not can_enqueue:
                         self.json_response({"message": "已有任务运行中"}, 409)
                         return
+                    if (path == "/api/channel-cover" and arguments.get("prefetch") is True
+                            and not (busy and can_enqueue)):
+                        self.json_response({"message": "图片预加载只能复用正在运行的频道会话"}, 409)
+                        return
                     try:
                         config = PipelineConfig.from_json(config_path)
-                        if path in {"/api/names/generate", "/api/names/apply"}:
+                        if path == "/api/cloud-delete":
+                            if arguments.get("confirm") is not True or not isinstance(arguments.get("id"), str):
+                                raise ValueError("请先确认要删除的云端文件")
+                            task = transfers.get(arguments["id"])
+                            if not is_library_item(task):
+                                raise ValueError("仅可操作素材库中下载成功或上传成功的文件")
+                            if task.get("remote_device"):
+                                raise ValueError("其他设备的任务仅可查看")
+                            if config.upload_provider != "quark_api" or task.get("upload_provider") != "quark_api":
+                                raise ValueError("删除云端文件仅支持夸克 API 上传记录，请切回夸克 API")
+                            if task["upload_status"] != "completed":
+                                raise ValueError("仅可删除已确认上传完成的文件")
+                            fid, target = task.get("upload_remote_fid", ""), task.get("upload_target", "")
+                            if (not isinstance(fid, str) or not FID.fullmatch(fid) or fid == "0"
+                                    or arguments.get("remote_fid") != fid):
+                                raise ValueError("原上传文件 ID 缺失或已变化，请刷新后再确认删除")
+                            if not isinstance(target, str) or not FID.fullmatch(target) or target == fid:
+                                raise ValueError("原上传目录缺失或无效，无法删除")
+                            if type(task.get("upload_size")) is not int or task["upload_size"] <= 0:
+                                raise ValueError("原上传文件大小缺失，无法删除")
+                            transfers.upload_name(task["id"])
+                            validate_quark_api_settings({}, config)
+                        elif path in {"/api/names/generate", "/api/names/apply"}:
                             identities = arguments.get("ids")
                             if (not isinstance(identities, list) or not 1 <= len(identities) <= 100
                                     or any(not isinstance(identity, str) for identity in identities)
@@ -705,6 +847,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 if task["download_status"] != "completed":
                                     raise ValueError("请先下载素材，再生成或应用中文名")
                                 if path == "/api/names/apply":
+                                    if task.get("cloud_delete_status") in {"deleting", "pending"}:
+                                        raise ValueError("请先确认云端删除结果，再应用名称")
                                     validate_name(task.get("chinese_filename", ""), task["filename"])
                                     if task["upload_status"] in {"completed", "link_pending"}:
                                         if task.get("upload_provider") != "quark_api":
@@ -729,6 +873,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 validate_upload_batch_names([transfers.get(identity) for identity in identities])
                             for identity in identities:
                                 task = transfers.get(identity)
+                                if task.get("cloud_delete_status") in {"deleting", "pending"}:
+                                    raise ValueError("请先确认云端删除结果，再重新上传")
                                 if (task["upload_status"] in {"completed", "uploading"}
                                         or task["upload_status"] == "local"
                                         and config.upload_provider not in {"quark_browser", "quark_cli", "quark_api"}):
@@ -763,7 +909,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         else:
                             if config.telegram_access_mode != "api":
                                 raise ValueError("旧配置使用 Telegram Web，请在设置中保存 API 配置后重试")
-                            if path in {"/api/telegram-channels-scan", "/api/telegram-api-login"}:
+                            if path in {"/api/telegram-channels-scan", "/api/channel-topics-scan",
+                                        "/api/telegram-api-login", "/api/retry"}:
                                 validate_telegram_settings(config_payload(config), config)
                             else:
                                 validate_source_settings(config_payload(config), config)
@@ -776,12 +923,16 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 if type(arguments.get("older", False)) is not bool:
                                     raise ValueError("扫描范围无效")
                                 if arguments.get("older"):
-                                    listing = catalog.snapshot(config.source_channel_url,
+                                    listing = catalog.snapshot(catalog_source(config),
                                                                exclude_forwarded_posts=config.exclude_forwarded_posts)
                                     if not listing["has_more"] or not listing["oldest_scanned_id"]:
                                         raise ValueError("没有可继续读取的更早消息")
                             if path == "/api/telegram-channels-scan" and arguments:
                                 raise ValueError("已加入频道扫描不接受请求参数")
+                            if path == "/api/channel-topics-scan":
+                                if set(arguments) != {"key"} or not isinstance(arguments["key"], str):
+                                    raise ValueError("请选择已保存的来源以获取话题")
+                                channels.get(arguments["key"])
                             if path in {"/api/channel-download", "/api/channel-cover"}:
                                 ids = arguments.get("ids") if path == "/api/channel-download" else [arguments.get("id")]
                                 if (not isinstance(ids, list) or not 1 <= len(ids) <= 20
@@ -789,7 +940,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                         or len(set(ids)) != len(ids)):
                                     raise ValueError("请选择 1 到 20 条不重复的频道消息")
                                 messages = {row["message_id"]: row for row in
-                                            catalog.snapshot(config.source_channel_url,
+                                            catalog.snapshot(catalog_source(config),
                                                              exclude_forwarded_posts=config.exclude_forwarded_posts)["messages"]}
                                 for mid in ids:
                                     if mid not in messages:
@@ -826,11 +977,13 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                                      "cover_message_id": row.get("cover_message_id", 0)})
                                     if kind == "download":
                                         transfers.event({"chat": row["chat"], "message_id": mid,
+                                                         "topic_id": config.source_topic_id,
+                                                         "source_kind": (selected_channel(config) or {}).get("kind", "channel"),
                                                          "filename": row["filename"], "title": row.get("text") or row["filename"],
                                                          "source_url": row.get("source_url", ""), "size": row.get("size") or 0,
                                                          "download_status": "queued"})
                                     else:
-                                        catalog.update_cover(config.source_channel_url, mid, full_status="loading", full_error="")
+                                        catalog.update_cover(catalog_source(config), mid, full_status="loading", full_error="")
                                 state.channel_request_keys.update(keys)
                                 if kind == "cover" and not arguments.get("prefetch", False):
                                     state.channel_requests.extendleft(reversed(prepared))
@@ -842,6 +995,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             state.stop_event.clear()
                             state.running = True
                             state.action = path.removeprefix("/api/")
+                            state.task_id = uuid4().hex
                             state.error = ""
                             state.channel_requests_open = path in {
                                 "/api/channel-scan", "/api/channel-cover", "/api/channel-download"}
@@ -853,6 +1007,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         if path == "/api/telegram-channels-scan":
                             state.telegram_channels = {"stage": "connecting", "scanned_at": "",
                                                        "error": "", "found": 0, "added": 0, "updated": 0}
+                        if path == "/api/channel-topics-scan":
+                            state.telegram_topics = {"stage": "loading", "channel": channel_key(arguments["key"]),
+                                                     "found": 0, "error": ""}
                 if registration_error:
                     for request in prepared:
                         try:
@@ -928,7 +1085,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                      upload_provider=config.upload_provider, upload_filename=source.name,
                                      upload_local_path=str(source.resolve()), upload_target=config.cloud_upload_target(),
                                      upload_received=0, upload_size=source.stat().st_size, upload_speed=0, upload_eta=None,
-                                     upload_phase="", upload_remote_fid="", upload_task_id="", upload_md5="", upload_sha1="")
+                                     upload_phase="", upload_remote_fid="", upload_task_id="", upload_md5="", upload_sha1="",
+                                     remote_filename="", rename_pending_name="", cloud_delete_status="",
+                                     cloud_delete_error="", cloud_delete_task_id="", cloud_deleted_at="")
                     new_name = task.get("rename_target", "") if config.upload_provider == "quark_api" else ""
                     result = cloud.upload(source, config.cloud_upload_target(), **({"new_name": new_name} if new_name else {}))
                 final_status = "local" if config.upload_provider == "local" else "completed"
@@ -958,6 +1117,41 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         else:
             with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="QuarkUpload") as pool:
                 list(pool.map(upload_one, identities))
+
+    def delete_cloud_file(arguments, config):
+        identity = arguments["id"]
+        task = transfers.get(identity)
+        pending = task.get("cloud_delete_status") == "pending"
+        transfers.update(identity, cloud_delete_status="deleting", cloud_delete_error="")
+        try:
+            cloud = cloud_adapter(config, on_remote=lambda values: transfers.update(identity, **values))
+            cloud.delete_existing(
+                task.get("remote_filename") or transfers.upload_name(identity), task["upload_target"],
+                remote_fid=task["upload_remote_fid"], size=task["upload_size"],
+                md5=task.get("upload_md5", ""), sha1=task.get("upload_sha1", ""),
+                delete_task_id=task.get("cloud_delete_task_id", ""), pending=pending,
+            )
+            deleted_at = utc_now()
+            # Multiple local records may reuse the same remote object after deduplication.
+            with transfers.lock:
+                for other_id, other in list(transfers.tasks.items()):
+                    if (other.get("upload_provider") == "quark_api"
+                            and other.get("upload_remote_fid") == task["upload_remote_fid"]
+                            and other.get("upload_target") == task["upload_target"]):
+                        transfers.update(other_id, upload_status="deleted", cloud_delete_status="completed",
+                                         cloud_deleted_at=deleted_at, cloud_delete_error="", share_url="",
+                                         upload_speed=0, upload_eta=None)
+            logging.info("云端文件已删除：%s，FID=%s；本地文件保留", task["filename"], task["upload_remote_fid"])
+        except Exception as exc:
+            current = transfers.get(identity)
+            uncertain = (isinstance(exc, QuarkDeletePending)
+                         or current.get("cloud_delete_status") == "pending"
+                         or pending and current.get("cloud_delete_status") != "failed")
+            transfers.update(identity, cloud_delete_status="pending" if uncertain else "failed",
+                             cloud_delete_error=str(exc))
+            with state.lock:
+                state.error = "云端删除结果待确认，请在任务详情重新确认" if uncertain else "云端删除失败，请查看任务详情"
+            logging.warning("云端删除未完成：%s，%s", task["filename"], exc)
 
     def validated_name_entries(arguments):
         rows = arguments.get("entries")
@@ -1013,6 +1207,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         auto_upload_candidates.clear()
         try:
             logging.info("开始任务，上传方式=%s", config.upload_provider)
+            if action == "/api/cloud-delete":
+                delete_cloud_file(arguments, config)
+                return
             if action in {"/api/names/generate", "/api/names/apply"}:
                 naming_tasks(action, arguments, config)
                 return
@@ -1086,20 +1283,30 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 logging.info("账号频道已保存：获取=%d，新增=%d，更新=%d，列表总数=%d",
                              len(rows), merged["added"], merged["updated"], merged["total"])
                 return
+            if action == "/api/channel-topics-scan":
+                row = channels.get(arguments["key"])
+                topics = api_adapter(config, topic_id=0).list_forum_topics(row["url"])
+                if state.stop_event.is_set():
+                    raise DownloadCancelled("已请求停止话题扫描")
+                channels.merge_topics(row["key"], topics)
+                with state.lock:
+                    state.telegram_topics.update(stage="completed", found=len(topics), error="")
+                logging.info("已保存超级群组话题：%s，共 %d 个", row["name"], len(topics))
+                return
             if action in {"/api/channel-scan", "/api/channel-cover", "/api/channel-download"}:
-                listing = catalog.snapshot(config.source_channel_url,
+                listing = catalog.snapshot(catalog_source(config),
                                            exclude_forwarded_posts=config.exclude_forwarded_posts)
                 older = arguments.get("older", False)
                 advance_cursor = older or not listing["oldest_scanned_id"]
                 preview_dir = catalog.preview_root / listing["channel"]
                 def publish(page: dict) -> None:
-                    catalog.merge(config.source_channel_url, page, older=advance_cursor)
+                    catalog.merge(catalog_source(config), page, older=advance_cursor)
 
                 page = api_adapter(config).list_archives(
                     config.source_channel_url,
                     before_id=listing["oldest_scanned_id"] if older else 0,
                     limit=config.channel_message_limit,
-                    preview_dir=preview_dir, known_covers=catalog.covers(config.source_channel_url),
+                    preview_dir=preview_dir, known_covers=catalog.covers(catalog_source(config)),
                     on_page=publish if action == "/api/channel-scan" else None,
                     on_progress=state.scan_progress if action == "/api/channel-scan" else None,
                     take_request=state.take_channel_request, close_requests=state.close_channel_requests,
@@ -1121,6 +1328,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             if action in {"/api/download", "/api/retry", "/api/channel-download"}:
                 if action == "/api/retry":
                     task = transfers.get(arguments["id"])
+                    telegram = api_adapter(config, source_kind=task.get("source_kind", "channel"),
+                                           topic_id=task.get("topic_id", 0))
                     messages = telegram.fetch_messages(task["chat"], [task["message_id"]], task["chat"], "message_ids", 1)
                 elif action == "/api/channel-download":
                     ids = arguments["ids"]
@@ -1149,6 +1358,10 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 with state.lock:
                     state.telegram_channels["stage"] = "cancelled"
                 logging.info("已加入频道扫描已停止")
+            elif action == "/api/channel-topics-scan":
+                with state.lock:
+                    state.telegram_topics["stage"] = "cancelled"
+                logging.info("话题扫描已停止，原列表保留")
             else:
                 logging.info("任务已停止")
         except Exception as exc:
@@ -1157,6 +1370,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             elif action == "/api/telegram-channels-scan":
                 with state.lock:
                     state.telegram_channels.update({"stage": "failed", "error": str(exc)})
+            elif action == "/api/channel-topics-scan":
+                with state.lock:
+                    state.telegram_topics.update(stage="failed", error=str(exc))
             with state.lock:
                 state.error = str(exc)
             logging.exception("任务失败")
@@ -1187,7 +1403,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     state.channel_requests_open = False
                 for request in abandoned:
                     if request["kind"] == "cover":
-                        catalog.update_cover(config.source_channel_url, request["message_id"],
+                        catalog.update_cover(catalog_source(config), request["message_id"],
                                              full_status="cancelled" if state.stop_event.is_set() else "failed",
                                              full_error=state.error or "任务未完成，可重新加载")
                 transfers.finish(state.error, stopped=state.stop_event.is_set())

@@ -37,6 +37,10 @@ class QuarkAPIError(RuntimeError):
     pass
 
 
+class QuarkDeletePending(QuarkAPIError):
+    """A delete may have reached Quark; keep its receipt for reconciliation."""
+
+
 def _hash_hex(value, kind):
     length = {"md5": 16, "sha1": 20}[kind]
     if isinstance(value, str):
@@ -567,3 +571,69 @@ class QuarkAPIStorageAdapter:
             fid = self._confirm(expected_name, folder, size, hashes, remote_fid)
             self._remote(upload_remote_fid=fid)
             return self._publish(fid, expected_name, folder, size, hashes, rename_to)
+
+    def delete_existing(self, name: str, remote_folder: str, *, remote_fid: str,
+                        size: int, md5: str = "", sha1: str = "",
+                        delete_task_id: str = "", pending: bool = False) -> None:
+        """Delete only the bound file; retry a known task by reading its receipt."""
+        if (not isinstance(remote_fid, str) or not FID.fullmatch(remote_fid)
+                or remote_fid == "0"):
+            raise ValueError("缺少有效的原上传文件 FID，无法删除")
+        if (not isinstance(remote_folder, str) or not FID.fullmatch(remote_folder)
+                or remote_folder == remote_fid):
+            raise ValueError("缺少有效的原上传目录，无法删除")
+        if not isinstance(name, str) or not name or type(size) is not int or size <= 0:
+            raise ValueError("原上传文件名称或大小缺失，无法删除")
+        if delete_task_id and (not isinstance(delete_task_id, str) or not FID.fullmatch(delete_task_id)):
+            raise ValueError("原删除任务 ID 无效，请人工核对")
+        with self._clients():
+            if not delete_task_id:
+                row = self._find(name, remote_folder, fid=remote_fid)
+                if row is None:
+                    message = "原上传文件不在原目录，请先在夸克核对是否已移动或删除"
+                    if pending:
+                        raise QuarkDeletePending(message)
+                    raise QuarkAPIError(message)
+                if str(row.get("pdir_fid", "")) != remote_folder or row.get("file_type") == 0:
+                    raise QuarkAPIError("原上传文件目录或类型不符，已停止删除")
+                self._verify(row, name, remote_folder, size, {"md5": md5, "sha1": sha1})
+                self._check_stop()
+                # Persist intent before the mutation, including when its response is lost.
+                self._remote(cloud_delete_status="pending", cloud_delete_error="")
+                try:
+                    result = self._data("POST", "file/delete", data={
+                        "action_type": 2, "filelist": [remote_fid], "exclude_fids": [],
+                    })
+                except QuarkAPIError as exc:
+                    raise QuarkDeletePending(str(exc)) from exc
+                delete_task_id = result.get("task_id")
+                if not isinstance(delete_task_id, str) or not FID.fullmatch(delete_task_id):
+                    raise QuarkDeletePending("夸克未返回有效删除任务 ID，请在网盘核对后重试")
+                self._remote(cloud_delete_task_id=delete_task_id)
+            task_failed = False
+            try:
+                for attempt in range(30):
+                    result = self._data("GET", "task", params={
+                        "task_id": delete_task_id, "retry_index": attempt,
+                    })
+                    if result.get("task_id", delete_task_id) != delete_task_id:
+                        raise QuarkDeletePending("夸克删除回执与原任务不符，请人工核对")
+                    if result.get("status") == 3:
+                        task_failed = True
+                        self._remote(cloud_delete_status="failed", cloud_delete_task_id="")
+                        raise QuarkAPIError("夸克删除任务失败，可核对文件后重试")
+                    if result.get("status") == 2:
+                        for check in range(5):
+                            if self._find(name, remote_folder, fid=remote_fid) is None:
+                                return
+                            if check < 4:
+                                self._wait(0.5)
+                        raise QuarkDeletePending("删除任务已完成，但原目录仍有该文件，请稍后重新确认")
+                    self._wait(0.5)
+                raise QuarkDeletePending("夸克删除任务尚未完成，请稍后重新确认")
+            except (QuarkAPIError, DownloadCancelled) as exc:
+                if isinstance(exc, QuarkDeletePending):
+                    raise
+                if task_failed:
+                    raise
+                raise QuarkDeletePending(str(exc)) from exc

@@ -15,11 +15,14 @@ def package(folder: Path, example: Path, archive: Path) -> None:
     sample = json.loads(example.read_text(encoding="utf-8"))
     if any(sample.get(key) for key in (
         "browser_executable_path", "telegram_api_id", "telegram_api_hash", "quark_cookie",
-        "data_server_token", "data_server_enabled",
+        "data_server_token", "data_server_enabled", "data_server_db_password",
     )):
         raise ValueError("Sample configuration contains local or account values")
     executable = folder / f"{folder.name}.exe"
     files = [executable, folder / "start_ui.cmd", folder / "README_TEST.md"]
+    tunnel_launcher = folder / "start_database_tunnel.ps1"
+    if tunnel_launcher.is_file():
+        files.append(tunnel_launcher)
     internal = folder / "_internal"
     if not internal.is_dir():
         raise FileNotFoundError(internal)

@@ -17,6 +17,8 @@ class SourceMessage:
     text: str = ""
     attachment_paths: list[Path] = field(default_factory=list)
     received_at: str = field(default_factory=utc_now)
+    topic_id: int = 0
+    source_kind: str = "channel"
 
 
 @dataclass(slots=True)

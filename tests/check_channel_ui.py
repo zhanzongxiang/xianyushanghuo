@@ -39,11 +39,14 @@ def check_loading(page, address: str, result_dir: Path, unique: str, label: str,
                         total=0, ready=0, failed=0, elapsed_seconds=0)
         progress.pop("stop_requested", None)
         workbench.update(running=True, action="channel-scan", error="", channel_scan=progress,
-                         channel_requests_open=True)
+                         channel_requests_open=True, task_id="fixture-message-scan", stop_requested=False)
         route.fulfill(json={"message": "fixture scan started"})
 
     def stop(route):
+        assert route.request.post_data_json == {
+            "task_id": workbench["task_id"], "action": workbench["action"]}
         progress["stop_requested"] = True
+        workbench["stop_requested"] = True
         route.fulfill(json={"message": "fixture stopping"})
 
     page.route("**/api/channel-scan", start)
@@ -197,6 +200,253 @@ def check_loading(page, address: str, result_dir: Path, unique: str, label: str,
     print(full_screenshot.resolve())
 
 
+def check_transfers(page, address: str, result_dir: Path, unique: str, label: str,
+                    original: dict) -> None:
+    base = address.split("/?")[0]
+    with urlopen(f"{base}/api/workbench", timeout=5) as response:
+        workbench = json.load(response)
+    workbench.update(running=False, action="", error="", channel_scan={}, tasks=[])
+    catalog = {**original, "messages": [
+        {**original["messages"][index % len(original["messages"])], "message_id": 400 + index,
+         "filename": f"model-{index}.rar", "series": False}
+        for index in range(9)
+    ]}
+
+    def task(index, **values):
+        return {"id": f"transfer-{index}", "message_id": 400 + index, "chat": "demo_channel",
+                "filename": f"model-{index}.rar", "title": f"Model {index}", "size": 100,
+                "received": 100, "download_status": "completed", "validation": "passed",
+                "upload_status": "waiting", "images": [], **values}
+
+    workbench["tasks"] = [
+        task(0),
+        task(1, remote_device=True, upload_status="completed", upload_provider="quark_api",
+             share_url="https://pan.quark.cn/s/fixture"),
+        task(2, upload_status="local", upload_provider="local"),
+        task(3, upload_status="link_pending", upload_provider="quark_api",
+             upload_remote_fid="unconfirmed", share_url="https://pan.quark.cn/s/unconfirmed"),
+        task(4, upload_status="failed", upload_provider="quark_cli"),
+        task(5, chat="unrelated_channel", upload_status="completed", upload_provider="quark_api"),
+        task(6, id="transfer-6-failed", download_status="failed", upload_status="failed"),
+        task(6, id="transfer-6-success", remote_device=True, upload_status="completed",
+             upload_provider="quark_browser", remote_filename="translated.rar"),
+        task(7, chat="-1000000001001", remote_device=True),
+        task(8, download_status="downloading", upload_status="waiting"),
+    ]
+    submitted = []
+    page.unroute("**/api/workbench")
+    page.unroute("**/api/channel-messages")
+    page.unroute("**/api/channel-download")
+    page.route("**/api/workbench", lambda route: route.fulfill(json=workbench))
+    page.route("**/api/channel-messages", lambda route: route.fulfill(json=catalog))
+
+    def download(route):
+        submitted.append(route.request.post_data_json["ids"])
+        route.fulfill(json={"message": "fixture accepted"})
+
+    page.route("**/api/channel-download", download)
+    page.reload()
+    page.wait_for_function("document.querySelectorAll('.channel-message').length === 9")
+    page.wait_for_function(
+        "document.querySelector('[data-message-id=\"401\"]').textContent.includes('已转存夸克')")
+
+    def row(index):
+        return page.locator(f"[data-message-id='{400 + index}']")
+
+    def badges(index):
+        return row(index).locator(".channel-message-badges").inner_text()
+
+    assert "已下载" in badges(0) and "已转存夸克" not in badges(0)
+    assert row(0).locator("[data-channel-action='download']").is_disabled()
+    assert "已下载" in badges(1) and "其他设备" in badges(1) and "已转存夸克" in badges(1)
+    assert row(1).locator(".channel-checkbox").is_disabled()
+    assert "下载到本机" in row(1).locator("[data-channel-action='download']").inner_text()
+    assert row(1).get_by_role("link", name="查看夸克").get_attribute("href") == "https://pan.quark.cn/s/fixture"
+    assert "已转存夸克" not in badges(2)
+    assert "转存待确认" in badges(3) and "已转存夸克" not in badges(3)
+    assert row(3).get_by_role("link", name="查看夸克").count() == 0
+    assert "转存失败" in badges(4) and "已转存夸克" not in badges(4)
+    assert badges(5) == "未下载", "A different channel's message ID or filename matched"
+    assert "已转存夸克" in badges(6) and "下载失败" in badges(6)
+    assert "其他设备" in badges(7), "Numeric channel ID did not match its saved username"
+    assert "下载中" in badges(8) and "已下载" not in badges(8), "Full byte count was treated as success"
+    assert "已下载 7" in page.locator("#channel-result-count").inner_text()
+    assert "已转存 2" in page.locator("#channel-result-count").inner_text()
+
+    status_filter = page.locator("#channel-transfer-filter")
+    for status, expected in (("transferred", 2), ("downloaded", 7), ("new", 2), ("all", 9)):
+        status_filter.select_option(status)
+        assert page.locator(".channel-message").count() == expected
+    status_filter.select_option("transferred")
+    assert page.locator("#channel-select-all").is_disabled()
+    assert not page.locator("#channel-select-all").is_checked()
+    page.locator("#channel-search").fill("model-1")
+    assert page.locator(".channel-message").count() == 1
+    page.locator("#channel-search").fill("")
+    status_filter.select_option("all")
+    page.locator("#channel-select-all").check()
+    assert page.locator(".channel-checkbox:checked").count() == 1
+    assert row(5).locator(".channel-checkbox").is_checked()
+    page.locator("#channel-download-selected").click()
+    page.wait_for_function("!document.getElementById('channel-download-selected').disabled")
+    assert submitted == [[405]], "Bulk selection repeated a processed file"
+    row(1).locator("[data-channel-action='download']").click()
+    page.wait_for_function("!document.querySelector('[data-message-id=\"401\"] [data-channel-action=\"download\"]').disabled")
+    assert submitted == [[405], [401]], "Explicit local download of a remote file was blocked"
+
+    workbench["tasks"][0].update(upload_status="completed", upload_provider="quark_api",
+                                  share_url="https://pan.quark.cn/s/new")
+    page.locator("#refresh").click()
+    page.wait_for_function(
+        "document.querySelector('[data-message-id=\"400\"]').textContent.includes('已转存夸克')")
+    assert "已转存 3" in page.locator("#channel-result-count").inner_text()
+    row(1).locator("[data-channel-action='task']").click()
+    page.wait_for_function("document.getElementById('page-title').textContent === '下载任务'")
+    assert page.locator("#detail-path").inner_text() == "文件位于其他设备"
+    page.keyboard.press("Escape")
+    page.locator(".nav-item[data-view='messages']").click()
+    page.wait_for_function("document.querySelectorAll('.channel-message').length === 9")
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    assert page.locator("#channel-transfer-filter").is_visible()
+    screenshot = result_dir / f"channel-transfers-{unique}-{label}.png"
+    page.screenshot(path=str(screenshot), full_page=True)
+    print(screenshot.resolve())
+
+
+def check_cloud_delete(page, address: str, result_dir: Path, unique: str, label: str,
+                       original: dict) -> None:
+    base = address.split("/?")[0]
+    with urlopen(f"{base}/api/workbench", timeout=5) as response:
+        workbench = json.load(response)
+    with urlopen(f"{base}/api/config", timeout=5) as response:
+        config = json.load(response)
+    config.update(upload_provider="quark_api", quark_cookie_configured=True)
+    task = {
+        "id": "delete-fixture", "message_id": 30218, "chat": "demo_channel",
+        "filename": "model.rar", "title": "Model", "remote_filename": "中文模型.rar",
+        "download_status": "completed", "upload_status": "completed", "validation": "passed",
+        "upload_provider": "quark_api", "upload_remote_fid": "original-fid",
+        "upload_target": "original-folder", "upload_filename": "model.rar", "upload_size": 100,
+        "size": 100, "received": 100, "local_path": "C:/fixture/model.rar", "images": [],
+        "share_url": "https://pan.quark.cn/s/fixture", "cloud_delete_status": "",
+    }
+    workbench.update(running=False, action="", error="", cloud_delete_supported=True, record_remove_supported=True,
+                     tasks=[task, {**task, "id": "other-device", "message_id": 10, "remote_device": True},
+                            {**task, "id": "cli-upload", "message_id": 11, "upload_provider": "quark_cli"},
+                            {**task, "id": "cloud-only", "message_id": 12, "upload_provider": "quark_cli",
+                             "download_status": "failed", "local_path": ""},
+                            {**task, "id": "failed-only", "message_id": 13,
+                             "download_status": "failed", "upload_status": "failed"}])
+    for route in ("**/api/workbench", "**/api/channel-messages"):
+        page.unroute(route)
+    page.route("**/api/config", lambda route: route.fulfill(json=config))
+    page.route("**/api/workbench", lambda route: route.fulfill(json=workbench))
+    page.route("**/api/channel-messages", lambda route: route.fulfill(json=original))
+    requests, confirmations = [], []
+    outcomes = iter(["failed", "pending", "completed"])
+
+    def delete(route):
+        payload = route.request.post_data_json
+        assert payload == {"id": "delete-fixture", "remote_fid": "original-fid", "confirm": True}
+        requests.append(payload)
+        outcome = next(outcomes)
+        task.update(cloud_delete_status=outcome,
+                    cloud_delete_error="fixture remote file changed" if outcome == "failed" else "")
+        if outcome == "completed":
+            task.update(upload_status="deleted", share_url="", cloud_deleted_at="2026-10-22T08:00:00Z")
+        route.fulfill(json={"message": "fixture accepted"})
+
+    def confirm(dialog, accept):
+        confirmations.append(dialog.message)
+        dialog.accept() if accept else dialog.dismiss()
+
+    page.route("**/api/cloud-delete", delete)
+    for view in ("download", "upload", "history"):
+        page.goto(base + f"/?view={view}")
+        page.wait_for_function("document.getElementById('nav-library').textContent === '4'")
+        assert page.locator(".row-delete-cloud:visible, .row-remove-record:visible").count() == 0
+        assert page.locator("#delete-cloud-task").is_hidden()
+        assert page.locator("#remove-record-task").is_hidden()
+    page.goto(base + "/?view=library")
+    page.wait_for_function("document.querySelector('.row-delete-cloud:not([hidden])') && !document.querySelector('.row-delete-cloud:not([hidden])').disabled")
+    assert page.locator(".row-delete-cloud:visible").count() == 1
+    assert page.locator("#task-list .task:visible").count() == 4
+    assert page.locator("[data-task-id='cloud-only']").is_visible()
+    assert page.locator("[data-task-id='cloud-only'] .badge").first.inner_text() == "已完成"
+    assert page.locator("[data-task-id='failed-only']").count() == 0
+    assert page.locator(".row-remove-record:visible").count() == 3
+    assert page.locator("[data-task-id='other-device'] .row-remove-record").is_hidden()
+    row = page.locator("[data-task-id='delete-fixture']")
+    page.once("dialog", lambda dialog: confirm(dialog, False))
+    row.locator(".row-delete-cloud").click()
+    assert not requests
+    assert "中文模型.rar" in confirmations[-1] and "本地文件和任务记录将保留" in confirmations[-1]
+    row.locator(".task-title").click()
+    assert page.locator("#delete-cloud-task").is_visible()
+    for status in ("failed", "pending", "completed"):
+        page.once("dialog", lambda dialog: confirm(dialog, True))
+        page.locator("#delete-cloud-task").click()
+        expected = {"failed": "云端删除失败", "pending": "云端删除待确认", "completed": "云端已删除"}[status]
+        page.wait_for_function("(text) => document.getElementById('detail-upload').textContent === text", arg=expected)
+        if status == "failed":
+            assert "fixture remote file changed" in page.locator("#detail-error").inner_text()
+            assert page.locator("#share-result").is_visible()
+        elif status == "pending":
+            assert page.locator("#share-result").is_hidden()
+            assert "重新确认" in page.locator("#delete-cloud-task").inner_text()
+            assert page.locator("#remove-record-task").is_disabled()
+    assert len(requests) == 3
+    assert page.locator("#delete-cloud-task").is_hidden()
+    assert page.locator("#share-result").is_hidden()
+    assert page.locator("#detail-download").inner_text() == "已下载"
+    assert page.locator("#open-task").is_visible()
+    assert page.locator("#remove-record-task").is_enabled()
+    screenshot = result_dir / f"library-cloud-deleted-{unique}-{label}.png"
+    page.screenshot(path=str(screenshot), full_page=True)
+    page.keyboard.press("Escape")
+    row.locator(".task-checkbox").check()
+    assert page.locator("#upload").is_enabled(), "A deleted cloud file should be eligible for a new upload"
+    page.locator(".nav-item[data-view='messages']").click()
+    page.wait_for_function(
+        "document.querySelector('[data-message-id=\"30218\"]')?.textContent.includes('云端已删除')")
+    badges = page.locator("[data-message-id='30218'] .channel-message-badges").inner_text()
+    assert "已下载" in badges and "已转存夸克" not in badges
+    assert page.locator("[data-message-id='30218']").get_by_role("link", name="查看夸克").count() == 0
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    page.locator(".nav-item[data-view='library']").click()
+    row.wait_for(state="visible")
+    removed = []
+
+    def remove(route):
+        assert route.request.post_data_json == {"id": task["id"], "confirm": True}
+        removed.append(task["id"])
+        workbench["tasks"] = [item for item in workbench["tasks"] if item["id"] != task["id"]]
+        route.fulfill(json={"message": "fixture record removed"})
+
+    page.route("**/api/library/remove", remove)
+    page.once("dialog", lambda dialog: confirm(dialog, False))
+    row.locator(".row-remove-record").click()
+    assert not removed and row.is_visible()
+    assert "本地文件、图片和夸克文件保留" in confirmations[-1]
+    row.locator(".task-title").click()
+    page.once("dialog", lambda dialog: confirm(dialog, True))
+    page.locator("#remove-record-task").click()
+    page.wait_for_function("!document.querySelector('[data-task-id=\"delete-fixture\"]')")
+    assert removed == [task["id"]]
+    assert page.locator("#nav-library").inner_text() == "3"
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    removed_screenshot = result_dir / f"library-record-removed-{unique}-{label}.png"
+    page.screenshot(path=str(removed_screenshot), full_page=True)
+    page.reload()
+    page.wait_for_function("document.getElementById('nav-library').textContent === '3'")
+    assert page.locator("[data-task-id='delete-fixture']").count() == 0
+    page.locator(".nav-item[data-view='messages']").click()
+    page.wait_for_function(
+        "document.querySelector('[data-message-id=\"30218\"] .channel-message-badges')?.textContent === '未下载'")
+    print(removed_screenshot.resolve())
+    print(screenshot.resolve())
+
+
 def check(executable: Path | None = None) -> None:
     from playwright.sync_api import sync_playwright
 
@@ -321,6 +571,8 @@ def check(executable: Path | None = None) -> None:
                         screenshot = result_dir / f"channel-catalog-{unique}-{label}.png"
                         page.screenshot(path=str(screenshot), full_page=True)
                         check_loading(page, address, result_dir, unique, label, original)
+                        check_transfers(page, address, result_dir, unique, label, original)
+                        check_cloud_delete(page, address, result_dir, unique, label, original)
                         assert not errors, errors
                         print(screenshot.resolve())
                         print(zoom_screenshot.resolve())

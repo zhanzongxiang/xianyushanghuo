@@ -11,10 +11,10 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .config import PipelineConfig
 from .models import utc_now
+from .telegram_sources import channel_key
 
 
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -22,11 +22,10 @@ IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 ACTIVE_DOWNLOADS = {"queued", "downloading", "validating"}
 
 
-def channel_key(chat: str) -> str:
-    value = str(chat).strip().rstrip("/")
-    if value.startswith(("https://t.me/", "http://t.me/")):
-        value = urlparse(value).path.strip("/").split("/")[0]
-    return value.removeprefix("@").lower()
+def is_library_item(task: dict) -> bool:
+    return (not task.get("record_removed_at")
+            and (task.get("download_status") == "completed"
+                 or task.get("upload_status") in {"completed", "deleted"}))
 
 
 def task_key(chat: str, message_id: int, filename: str) -> str:
@@ -69,7 +68,11 @@ class TransferStore:
                 backup = self.path.with_name(f"workbench-tasks-unreadable-{time.time_ns()}.json")
                 shutil.copy2(self.path, backup)
         for task in self.tasks.values():
+            task.setdefault("topic_id", 0)
+            task.setdefault("source_kind", "channel")
             self._naming_defaults(task)
+            self._deletion_defaults(task)
+            task.setdefault("record_removed_at", "")
             # Older records bound uploads implicitly to the then-current local file.
             if "upload_filename" not in task and task.get("upload_status") in {"uploading", "link_pending", "completed", "local"}:
                 local_path = task.get("local_path", "")
@@ -92,6 +95,8 @@ class TransferStore:
                 task.update(download_status="interrupted", error="上次运行中断，可重新下载", speed=0, eta=None)
             if task.get("upload_status") == "uploading":
                 task.update(upload_status="link_pending", error="上次上传中断，请先核对网盘文件或重新获取链接")
+            if task["cloud_delete_status"] == "deleting":
+                task.update(cloud_delete_status="pending", cloud_delete_error="上次删除操作中断，请重新确认云端结果")
             if task["naming_status"] in {"generating", "applying"}:
                 task.update(naming_status="failed", naming_error="上次命名操作中断，可重试")
         self.import_existing()
@@ -114,6 +119,11 @@ class TransferStore:
                 self.flush()
 
     @staticmethod
+    def _deletion_defaults(task):
+        for field in ("cloud_delete_status", "cloud_delete_error", "cloud_delete_task_id", "cloud_deleted_at"):
+            task.setdefault(field, "")
+
+    @staticmethod
     def _naming_defaults(task):
         for field in ("chinese_filename", "naming_source", "naming_note", "naming_error",
                       "naming_quality", "remote_filename", "rename_target", "rename_pending_name"):
@@ -131,6 +141,7 @@ class TransferStore:
             if is_new:
                 self.tasks[identity] = {
                     "id": identity, "message_id": mid, "chat": chat, "filename": filename,
+                    "topic_id": 0, "source_kind": "channel",
                     "title": Path(filename).stem, "source_url": "", "size": 0, "received": 0,
                     "speed": 0, "eta": None, "download_status": "queued", "upload_status": "waiting",
                     "local_path": "", "image_paths": [], "share_url": "", "error": "",
@@ -143,18 +154,20 @@ class TransferStore:
                 }
             task = self.tasks[identity]
             self._naming_defaults(task)
+            self._deletion_defaults(task)
+            task.setdefault("record_removed_at", "")
             previous_status = task["download_status"]
-            allowed = set(task) - {"id", "created_at", "share_url", "storage_root", "chinese_filename",
+            allowed = set(task) - {"id", "created_at", "share_url", "storage_root", "record_removed_at", "chinese_filename",
                                   "naming_source", "naming_note", "naming_error", "naming_status",
                                   "naming_quality", "naming_untranslated",
                                   "remote_filename", "rename_target", "rename_pending_name"} - {
-                key for key in task if key.startswith("upload_")}
+                key for key in task if key.startswith(("upload_", "cloud_delete"))}
             task.update({key: value for key, value in event.items() if key in allowed})
             if event.get("download_status") == "queued" or event.get("local_path"):
                 task["storage_root"] = str(self.config.inbox_dir.resolve())
             task["updated_at"] = utc_now()
             if event.get("download_status") == "queued":
-                task.update(error="", received=0, speed=0, eta=None)
+                task.update(error="", received=0, speed=0, eta=None, record_removed_at="")
             if event.get("download_status") == "completed":
                 task.update(validation="passed", speed=0, eta=None, error="")
             if event.get("download_status") in {"failed", "cancelled", "interrupted"}:
@@ -166,15 +179,30 @@ class TransferStore:
 
     def get(self, identity: str) -> dict:
         with self.lock:
-            if identity not in self.tasks:
+            if identity not in self.tasks or self.tasks[identity].get("record_removed_at"):
                 raise ValueError("任务不存在，请刷新列表")
             return copy.deepcopy(self.tasks[identity])
+
+    def remove_record(self, identity: str) -> None:
+        with self.lock:
+            task = self.get(identity)
+            if task.get("remote_device"):
+                raise ValueError("其他设备的任务仅可查看")
+            if not is_library_item(task):
+                raise ValueError("仅可移除素材库中下载成功或上传成功的记录")
+            if (task.get("download_status") in ACTIVE_DOWNLOADS
+                    or task.get("upload_status") in {"uploading", "link_pending"}
+                    or task.get("cloud_delete_status") in {"deleting", "pending"}):
+                raise ValueError("请先完成当前任务并确认云端操作结果，再移除记录")
+            # Keep a synced removal marker so local imports cannot recreate the record.
+            self.update(identity, record_removed_at=utc_now())
 
     def has_completed_message(self, chat: str, message_id: int) -> bool:
         with self.lock:
             return any(channel_key(row.get("chat", "")) == channel_key(chat)
                        and row.get("message_id") == message_id
                        and row.get("download_status") == "completed"
+                       and not row.get("record_removed_at")
                        for row in self.tasks.values())
 
     def update(self, identity: str, **values) -> None:
@@ -192,6 +220,8 @@ class TransferStore:
                                 error=error or "任务未完成，可重新下载", updated_at=utc_now())
                 if task["upload_status"] == "uploading":
                     task.update(upload_status="link_pending", error=error or "上传结果待确认")
+                if task.get("cloud_delete_status") == "deleting":
+                    task.update(cloud_delete_status="pending", cloud_delete_error=error or "删除结果待确认")
             self.flush()
 
     def local_file(self, identity: str, *, completed: bool = False) -> Path:
@@ -279,6 +309,8 @@ class TransferStore:
                 identity = existing
             else:
                 identity = self.event({"message_id": message.message_id, "chat": message.chat,
+                                       "topic_id": getattr(message, "topic_id", 0),
+                                       "source_kind": getattr(message, "source_kind", "channel"),
                                        "filename": path.name, "title": path.stem,
                                        "local_path": str(path.resolve()), "download_status": "completed",
                                        "received": path.stat().st_size, "size": path.stat().st_size})
@@ -307,7 +339,7 @@ class TransferStore:
 
     def snapshot(self) -> dict:
         with self.lock:
-            rows = copy.deepcopy(list(self.tasks.values()))
+            rows = copy.deepcopy([row for row in self.tasks.values() if not row.get("record_removed_at")])
         for row in rows:
             row.pop("storage_root", None)
             row["images"] = [{"url": f"/api/preview/{row['id']}/{index}", "name": Path(path).name}
@@ -319,7 +351,7 @@ class TransferStore:
                 if elapsed > 5:
                     row.update(speed=0, eta=None)
         with self.lock:
-            rows.extend(copy.deepcopy(self.remote_tasks))
+            rows.extend(copy.deepcopy([row for row in self.remote_tasks if not row.get("record_removed_at")]))
         disk = shutil.disk_usage(self.config.inbox_dir)
         if self.config.upload_provider == "quark_browser":
             upload_target = self.config.quark_folder_url

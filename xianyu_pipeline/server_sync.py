@@ -12,11 +12,48 @@ import threading
 from uuid import uuid4
 
 import httpx
+from sqlalchemy.exc import SQLAlchemyError
 
 from .data_protocol import DIGEST, FIELDS, MAX_ASSET, PROTOCOL_VERSION, encoded, validate_record
 from .data_server import image_mime
 from .models import utc_now
 from .workbench import channel_key, image_type
+from .telegram_sources import split_scope
+
+
+class HTTPDataClient:
+    """Compatibility transport for previously configured data services."""
+    def __init__(self, config):
+        self.client = httpx.Client(base_url=config.data_server_url, headers={
+            "Authorization": "Bearer " + config.data_server_token,
+        }, timeout=httpx.Timeout(10, connect=5), follow_redirects=False, trust_env=False)
+
+    def health(self):
+        response = self.client.get("/v1/health")
+        response.raise_for_status()
+        return response.json()
+
+    def exchange(self, payload):
+        response = self.client.post("/v1/sync", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def put_asset(self, digest, body):
+        self.client.put("/v1/assets/" + digest, content=body,
+                        headers={"Content-Type": "application/octet-stream"}).raise_for_status()
+
+    def get_asset(self, digest):
+        with self.client.stream("GET", "/v1/assets/" + digest) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body.extend(chunk)
+                if len(body) > MAX_ASSET:
+                    raise ValueError("服务端图片超过大小限制")
+        return bytes(body)
+
+    def close(self):
+        self.client.close()
 
 
 class SyncJournal:
@@ -65,7 +102,7 @@ class SyncJournal:
             # Only explicit removal of a previously observed channel creates a tombstone.
             values = dict(records)
             for identity, row in existing.items():
-                if identity[0] == "channels" and identity not in values and row["local_value"] != "null":
+                if identity[0] in {"channels", "topics"} and identity not in values and row["local_value"] != "null":
                     values[identity] = None
             for (kind, key), value in values.items():
                 text = encoded(value)
@@ -170,16 +207,29 @@ class ServerSync:
         self.journal = None
         self.digest_cache = {}
         self.assets = {}
+        self.database = None
         self.configure(config)
+
+    @staticmethod
+    def target(config):
+        if config.data_server_backend == "http":
+            return encoded(["http", config.data_server_url, config.data_server_workspace])
+        return encoded([config.data_server_backend, config.data_server_db_host, config.data_server_db_port,
+                        config.data_server_db_name, config.data_server_db_user, config.data_server_workspace])
 
     def configure(self, config):
         with self.lock:
-            previous = (self.config.data_server_url, self.config.data_server_workspace)
+            previous = self.target(self.config)
+            if self.database:
+                self.database.close()
+                self.database = None
             self.config = config
-            if previous != (config.data_server_url, config.data_server_workspace):
+            if previous != self.target(config):
                 self.transfers.remote_tasks = []
             if config.data_server_enabled:
-                target = encoded([config.data_server_url, config.data_server_workspace, config.data_server_token])
+                # Preserve existing HTTP journals; database password rotation keeps its cursor.
+                target = (encoded([config.data_server_url, config.data_server_workspace, config.data_server_token])
+                          if config.data_server_backend == "http" else self.target(config))
                 self.journal = SyncJournal(self.root, target)
                 self.status.update(stage="waiting", error="", last_sync="", conflict_rows=[], **self.journal.counts())
             else:
@@ -205,6 +255,30 @@ class ServerSync:
         self.wake.set()
         if self.thread:
             self.thread.join(timeout=20)
+        if not self.thread or not self.thread.is_alive():
+            with self.lock:
+                if self.database:
+                    self.database.close()
+                    self.database = None
+
+    @contextmanager
+    def client(self):
+        if self.config.data_server_backend == "http":
+            client = HTTPDataClient(self.config)
+            try:
+                yield client
+            finally:
+                client.close()
+        else:
+            if self.database is None:
+                from .database_storage import SQLDatabase, database_engine
+                engine = database_engine(self.config)
+                try:
+                    self.database = SQLDatabase(engine, self.config.data_server_workspace)
+                except Exception:
+                    engine.dispose()
+                    raise
+            yield self.database
 
     def _run(self):
         while not self.stop_event.is_set():
@@ -237,6 +311,8 @@ class ServerSync:
             if digest:
                 value["avatar_digest"] = digest
             records["channels", row["key"]] = value
+            for topic in row.get("topics", []):
+                records["topics", topic["key"]] = {field: topic[field] for field in FIELDS["topics"] if field in topic}
         with self.catalog.lock:
             paths = list(self.catalog.catalog_root.glob("*.json"))
             if self.catalog.path.exists():
@@ -251,7 +327,8 @@ class ServerSync:
                 records["cursors", key] = {field: current[field] for field in FIELDS["cursors"] if field in current}
                 for row in current["messages"]:
                     value = {field: row[field] for field in FIELDS["messages"] if field in row}
-                    value.update(chat=key)
+                    peer, topic_id = split_scope(key)
+                    value.update(chat=peer, topic_id=topic_id)
                     for field in ("cover", "full_cover"):
                         digest = self._image(row.get(field + "_path"), self.catalog.preview_root)
                         if digest:
@@ -280,15 +357,8 @@ class ServerSync:
         if target.is_file():
             body = target.read_bytes()
         else:
-            with client.stream("GET", "/v1/assets/" + digest) as response:
-                response.raise_for_status()
-                body = bytearray()
-                for chunk in response.iter_bytes():
-                    body.extend(chunk)
-                    if len(body) > MAX_ASSET:
-                        raise ValueError("服务端图片超过大小限制")
-            body = bytes(body)
-            if hashlib.sha256(body).hexdigest() != digest or not image_mime(body):
+            body = client.get_asset(digest)
+            if len(body) > MAX_ASSET or hashlib.sha256(body).hexdigest() != digest or not image_mime(body):
                 raise ValueError("服务端图片校验失败")
             temporary = target.with_suffix(".tmp")
             temporary.write_bytes(body)
@@ -327,8 +397,9 @@ class ServerSync:
                     value["full_status" if prefix == "full_cover" else "cover_status"] = "ready"
         elif kind == "tasks":
             digests = value.pop("image_digests", [])
-            value["images"] = [{"url": f"/api/synced-image/{image.name}", "name": image.name}
-                               for digest in digests if (image := self._download_image(client, digest))]
+            value["images"] = [] if value.get("record_removed_at") else [
+                {"url": f"/api/synced-image/{image.name}", "name": image.name}
+                for digest in digests if (image := self._download_image(client, digest))]
         return value
 
     def apply(self, staged):
@@ -340,6 +411,11 @@ class ServerSync:
                     if value:
                         records.append(value)
                     self.channels._flush({"channels": records})
+                elif kind == "topics":
+                    records = [item for item in self.channels.data.get("topics", []) if item["key"] != key]
+                    if value:
+                        records.append(value)
+                    self.channels._flush({**self.channels.data, "topics": records})
                 elif kind in {"messages", "cursors"}:
                     chat = key.rsplit(":", 1)[0] if kind == "messages" else key
                     current = self.catalog._current(chat)
@@ -360,7 +436,8 @@ class ServerSync:
                     if value["device_id"] != self.journal.device_id or value["id"] not in self.transfers.tasks:
                         identity = "remote-" + key.replace(":", "-")
                         existing = [item for item in self.transfers.remote_tasks if item["id"] != identity]
-                        existing.append({**value, "id": identity, "remote_device": True, "local_path": ""})
+                        if not value.get("record_removed_at"):
+                            existing.append({**value, "id": identity, "remote_device": True, "local_path": ""})
                         self.transfers.remote_tasks = existing
                     else:
                         self.transfers.tasks[value["id"]].update({field: item for field, item in value.items()
@@ -384,12 +461,8 @@ class ServerSync:
                 self.journal.capture(self.collect())
                 operations = self.journal.operations()
                 config = self.config
-                with httpx.Client(base_url=config.data_server_url, headers={
-                    "Authorization": "Bearer " + config.data_server_token,
-                }, timeout=httpx.Timeout(10, connect=5), follow_redirects=False, trust_env=False) as client:
-                    health = client.get("/v1/health")
-                    health.raise_for_status()
-                    health = health.json()
+                with self.client() as client:
+                    health = client.health()
                     if health.get("protocol") != PROTOCOL_VERSION or not isinstance(health.get("server_id"), str):
                         raise ValueError("数据服务协议版本不兼容")
                     previous_server = self.journal.meta("server_id")
@@ -402,15 +475,12 @@ class ServerSync:
                         digests.extend(value.get("image_digests", []))
                         for digest in filter(None, digests):
                             if not self.journal.asset_uploaded(digest):
-                                client.put("/v1/assets/" + digest, content=self.assets[digest].read_bytes(),
-                                           headers={"Content-Type": "application/octet-stream"}).raise_for_status()
+                                client.put_asset(digest, self.assets[digest].read_bytes())
                                 self.journal.asset_uploaded(digest, mark=True)
-                    response = client.post("/v1/sync", json={
+                    data = client.exchange({
                         "workspace": config.data_server_workspace, "device_id": self.journal.device_id,
                         "cursor": int(self.journal.meta("cursor") or 0), "operations": operations,
                     })
-                    response.raise_for_status()
-                    data = response.json()
                     if data.get("server_id") != health["server_id"] or type(data.get("cursor")) is not int:
                         raise ValueError("数据服务响应无效")
                     for row in data["changes"] + [result["record"] for result in data["results"]]:
@@ -438,8 +508,13 @@ class ServerSync:
                     message = f"数据服务返回 HTTP {exc.response.status_code}"
                 elif isinstance(exc, httpx.TransportError):
                     message = "无法连接数据服务，变更已保留，稍后自动重试"
+                elif isinstance(exc, SQLAlchemyError):
+                    message = "数据库连接或读写失败，请检查地址、账号权限与 TLS 配置；变更已保留，将自动重试"
                 elif isinstance(exc, ValueError):
-                    message = str(exc).replace(self.config.data_server_token, "[已隐藏]")
+                    message = str(exc)
+                    for secret in (self.config.data_server_token, self.config.data_server_db_password):
+                        if secret:
+                            message = message.replace(secret, "[已隐藏]")
                 else:
                     message = f"同步未完成（{type(exc).__name__}），本地数据已保留"
                 self.status.update(stage="offline", error=message, **self.journal.counts(),

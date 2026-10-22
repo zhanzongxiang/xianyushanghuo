@@ -27,6 +27,7 @@ from .browser_profiles import launch_browser_context
 from .download_scheduler import DownloadScheduler
 from .download_diagnostics import DownloadTrace
 from .runtime import telegram_crypto_backend
+from .telegram_sources import message_topic_id, source_scope
 
 
 class TelegramAdapter(Protocol):
@@ -85,12 +86,14 @@ def parse_telegram_dc2_server(value: str) -> tuple[str, int] | None:
 class _TransferEvents:
     """One attachment's snapshots; byte counts and rates never come from a timer."""
 
-    def __init__(self, callback, message_id: int, chat: str, name: str, title: str, size=0):
+    def __init__(self, callback, message_id: int, chat: str, name: str, title: str, size=0,
+                 *, topic_id: int = 0, source_kind: str = "channel"):
         self.callback = callback
         self.data = dict(message_id=message_id, chat=chat, filename=name,
                          title=re.sub(r"\s+", " ", title).strip()[:180] or name,
                          size=size or 0, received=0, speed=0, eta=None, image_paths=[],
                          image_source="", image_message_ids=[], image_group_id="")
+        self.data.update(topic_id=topic_id, source_kind=source_kind)
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", chat) and chat != "joinchat" and message_id > 0:
             self.data["source_url"] = f"https://t.me/{chat}/{message_id}"
         elif re.fullmatch(r"-[0-9]+", chat) and int(chat) < -1000000000000 and message_id > 0:
@@ -169,7 +172,7 @@ class TelethonTelegramAdapter:
                  download_transfer_timeout_seconds: int = 3600, stop_event: Event | None = None,
                  on_event: Callable[[dict], None] | None = None,
                  exclude_forwarded_posts: bool = False, download_workers: int = 4,
-                 download_file_concurrency: int = 2):
+                 download_file_concurrency: int = 2, source_kind: str = "channel", topic_id: int = 0):
         if not api_id or not api_hash:
             raise ValueError("Telegram 适配器需要 api_id 和 api_hash")
         if type(download_workers) is not int or not 1 <= download_workers <= 8:
@@ -192,6 +195,11 @@ class TelethonTelegramAdapter:
         self.stop_event = stop_event
         self.on_event = on_event
         self.exclude_forwarded_posts = exclude_forwarded_posts
+        source_scope("validation", topic_id)
+        if source_kind not in {"channel", "supergroup", "forum"}:
+            raise ValueError("Telegram 来源类型无效")
+        self.source_kind = "forum" if topic_id else source_kind
+        self.topic_id = topic_id
 
     def _client(self):
         from telethon.sync import TelegramClient
@@ -254,7 +262,7 @@ class TelethonTelegramAdapter:
 
     def list_joined_channels(self, *, limit: int | None = None,
                              avatar_dir: Path | None = None) -> list[dict]:
-        """Read all joined broadcast channels, including archived dialogs."""
+        """Read joined broadcast channels and supergroups, including archives."""
         if limit is not None and (type(limit) is not int or not 1 <= limit <= 5000):
             raise ValueError("已加入频道扫描数量必须为 1 到 5000 的整数")
         Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
@@ -291,8 +299,8 @@ class TelethonTelegramAdapter:
             async for dialog in dialogs():
                 check_stop()
                 entity = getattr(dialog, "entity", None)
-                if (entity is None or not getattr(entity, "broadcast", False)
-                        or getattr(entity, "megagroup", False)
+                if (entity is None or not (getattr(entity, "broadcast", False)
+                                          or getattr(entity, "megagroup", False))
                         or getattr(entity, "left", False)
                         or getattr(entity, "deactivated", False)
                         or type(entity).__name__ == "ChannelForbidden"):
@@ -313,6 +321,9 @@ class TelethonTelegramAdapter:
                     "verified": bool(getattr(entity, "verified", False)),
                     "scam": bool(getattr(entity, "scam", False)),
                     "fake": bool(getattr(entity, "fake", False)),
+                    "kind": ("forum" if getattr(entity, "forum", False) else
+                             "supergroup" if getattr(entity, "megagroup", False) else "channel"),
+                    "forum": bool(getattr(entity, "forum", False)),
                 }
                 rows.append(row)
                 if avatar_dir is not None and getattr(entity, "photo", None):
@@ -413,6 +424,121 @@ class TelethonTelegramAdapter:
         except asyncio.TimeoutError as exc:
             raise RuntimeError("获取账号频道超时，请检查网络或代理后重试") from exc
 
+    def list_forum_topics(self, channel: str) -> list[dict]:
+        from telethon.tl.functions.messages import GetForumTopicsRequest
+        from telethon.tl.types import ForumTopic
+
+        target = self.normalize_channel(channel)
+        Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
+        client = self._client()
+
+        async def resolve(value):
+            return await value if inspect.isawaitable(value) else value
+
+        def check_stop():
+            if self.stop_event and self.stop_event.is_set():
+                raise DownloadCancelled("已请求停止话题扫描")
+
+        async def scan():
+            await resolve(client.connect())
+            if not await resolve(client.is_user_authorized()):
+                raise RuntimeError("Telegram API 尚未登录，请先在设置中完成账号授权")
+            entity = await resolve(client.get_entity(target))
+            if not getattr(entity, "forum", False):
+                raise ValueError("该来源未开启论坛话题")
+            peer = await resolve(client.get_input_entity(entity))
+            offset_date, offset_id, offset_topic = 0, 0, 0
+            rows, seen_offsets = {}, set()
+            while True:
+                check_stop()
+                result = await resolve(client(GetForumTopicsRequest(
+                    peer, offset_date=offset_date, offset_id=offset_id,
+                    offset_topic=offset_topic, limit=100)))
+                topics = [topic for topic in result.topics if isinstance(topic, ForumTopic)]
+                for topic in topics:
+                    rows[topic.id] = {"topic_id": topic.id, "title": topic.title,
+                                      "closed": bool(topic.closed), "hidden": bool(topic.hidden),
+                                      "top_message_id": topic.top_message}
+                if not result.topics or len(rows) >= result.count:
+                    return list(rows.values())
+                if not topics:
+                    raise RuntimeError("话题列表分页不完整，原列表已保留")
+                last = topics[-1]
+                messages = {message.id: message for message in result.messages}
+                date = (last.date if getattr(result, "order_by_create_date", False)
+                        else getattr(messages.get(last.top_message), "date", None))
+                if date is None:
+                    raise RuntimeError("话题分页游标缺失，原列表已保留")
+                offset_date, offset_id, offset_topic = date, last.top_message, last.id
+                marker = (offset_date, offset_id, offset_topic)
+                if marker in seen_offsets:
+                    raise RuntimeError("话题列表分页未前进，原列表已保留")
+                seen_offsets.add(marker)
+
+        async def guarded():
+            task = asyncio.create_task(asyncio.wait_for(scan(), timeout=_CHANNEL_LIST_TIMEOUT_SECONDS))
+            try:
+                while True:
+                    check_stop()
+                    done, _ = await asyncio.wait((task,), timeout=0.2)
+                    if done:
+                        return await task
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await resolve(client.disconnect())
+
+        try:
+            coroutine = guarded()
+            loop = getattr(client, "loop", None)
+            return loop.run_until_complete(coroutine) if loop is not None else asyncio.run(coroutine)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("获取话题列表超时，原列表已保留，请检查网络后重试") from exc
+
+    def _validate_source(self, client, target) -> None:
+        if hasattr(client, "get_entity"):
+            entity = client.get_entity(target)
+            if getattr(entity, "forum", False):
+                self.source_kind = "forum"
+            elif getattr(entity, "megagroup", False):
+                self.source_kind = "supergroup"
+            elif self.topic_id:
+                raise ValueError("该来源已关闭论坛话题，请重新获取账号频道")
+        if self.source_kind == "forum" and not self.topic_id:
+            raise ValueError("该超级群组启用了话题，请在来源频道中获取并选择话题")
+
+    def _topic_options(self) -> dict:
+        # General is ordinary group history, not replies to message #1.
+        return {"reply_to": self.topic_id} if self.topic_id > 1 else {}
+
+    def _in_topic(self, message) -> bool:
+        return bool(message) and (not self.topic_id or message_topic_id(message) == self.topic_id)
+
+    async def _photo_history(self, client, target, message_id: int) -> list:
+        if not self.topic_id:
+            value = client.get_messages(target, limit=6, offset_id=message_id)
+            return await value if inspect.isawaitable(value) else value
+        iterator = client.iter_messages(target, limit=1000 if self.topic_id == 1 else 6,
+                                        offset_id=message_id, **self._topic_options())
+        history = []
+        if hasattr(iterator, "__aiter__"):
+            async for message in iterator:
+                if self.stop_event and self.stop_event.is_set():
+                    raise DownloadCancelled("已请求停止话题图片查询")
+                if self._in_topic(message):
+                    history.append(message)
+                    if len(history) == 6:
+                        break
+        else:
+            for message in iterator:
+                if self.stop_event and self.stop_event.is_set():
+                    raise DownloadCancelled("已请求停止话题图片查询")
+                if self._in_topic(message):
+                    history.append(message)
+                    if len(history) == 6:
+                        break
+        return history
+
     @staticmethod
     def normalize_channel(channel: str) -> str | int:
         value = str(channel).strip()
@@ -462,7 +588,8 @@ class TelethonTelegramAdapter:
                 item["series_total"] = len(members) if is_series else 1
 
     def _is_channel_post(self, message) -> bool:
-        if not message or getattr(message, "post", True) is False:
+        if (not self._in_topic(message)
+                or self.source_kind == "channel" and getattr(message, "post", True) is False):
             return False
         return not self.exclude_forwarded_posts or not getattr(message, "fwd_from", None)
 
@@ -581,6 +708,10 @@ class TelethonTelegramAdapter:
         group_id = None
         previous_id = archive_id
         for item in history:
+            if item is None:
+                break
+            if not self._in_topic(item):
+                continue
             # Unfiltered history preserves intervening text/files as hard boundaries.
             # message.photo alone also includes webpage and service-message photos.
             if (not self._is_channel_post(item) or not isinstance(getattr(item, "media", None), MessageMediaPhoto)
@@ -611,8 +742,7 @@ class TelethonTelegramAdapter:
             nonlocal group_id
 
             async def lookup():
-                result = client.get_messages(self.normalize_channel(chat), limit=6, offset_id=message.id)
-                return await result if inspect.isawaitable(result) else result
+                return await self._photo_history(client, self.normalize_channel(chat), message.id)
 
             history = await asyncio.wait_for(lookup(), timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS)
             photos = self._preceding_photo_group(history, message.id)
@@ -979,7 +1109,8 @@ class TelethonTelegramAdapter:
                 raise RuntimeError("Telegram API 无法连接，请检查网络或配置的代理") from exc
             if not client.is_user_authorized():
                 raise RuntimeError("Telegram API 尚未登录，请先在界面点击“首次登录 Telegram”完成账号授权")
-            iterator = (client.iter_messages(target, limit=self.scan_limit) if mode == "recent"
+            self._validate_source(client, target)
+            iterator = (client.iter_messages(target, limit=self.scan_limit, **self._topic_options()) if mode == "recent"
                         else (client.get_messages(target, ids=mid) for mid in message_ids))
             chosen = []
             scanned = 0
@@ -996,10 +1127,11 @@ class TelethonTelegramAdapter:
             logging.info("Telegram API 频道主帖扫描: 检查=%d, 排除=%d, ZIP/RAR 消息=%d, 目标=%d",
                          scanned, excluded, len(chosen), limit)
             if mode == "message_ids" and excluded and not chosen:
-                raise ValueError("所选消息不是频道主帖，或已被转发帖过滤排除")
+                raise ValueError("所选消息不属于当前来源话题、不是频道主帖，或已被转发帖过滤排除")
             messages = []
             jobs = [(message, name, _TransferEvents(self.on_event, message.id, str(target), name,
-                                                   message.message or "", getattr(message.file, "size", 0)))
+                                                   message.message or "", getattr(message.file, "size", 0),
+                                                   topic_id=self.topic_id, source_kind=self.source_kind))
                     for message, name in (reversed(chosen) if mode == "recent" else chosen)]
             for _, _, transfer in jobs:
                 transfer.emit("queued")
@@ -1034,7 +1166,8 @@ class TelethonTelegramAdapter:
                                         transfer.emit("queued", **previews)
                             path = await self._download_archive_async(client, message, name, transfer, scheduler)
                             return SourceMessage(message_id=message.id, chat=str(target),
-                                                 text=message.message or "", attachment_paths=[path])
+                                                 text=message.message or "", attachment_paths=[path],
+                                                 topic_id=self.topic_id, source_kind=self.source_kind)
                         except BaseException:
                             batch_failed = True
                             raise
@@ -1088,8 +1221,7 @@ class TelethonTelegramAdapter:
                 logging.info("缓存图片关联失效，回退相邻消息查询: %s", cover_message_id)
         if history is None:
             async def lookup():
-                result = client.get_messages(target, limit=6, offset_id=message.id)
-                return await result if inspect.isawaitable(result) else result
+                return await self._photo_history(client, target, message.id)
 
             history = await asyncio.wait_for(lookup(), timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS)
         photos = self._preceding_photo_group(history, message.id)
@@ -1182,6 +1314,7 @@ class TelethonTelegramAdapter:
                 raise RuntimeError("Telegram API 无法连接，请检查网络或配置的代理") from exc
             if not client.is_user_authorized():
                 raise RuntimeError("Telegram API 尚未登录，请先在设置中完成账号授权")
+            self._validate_source(client, target)
             async def load_catalog():
                 scheduler = DownloadScheduler(self.download_file_concurrency)
                 full_semaphore = asyncio.Semaphore(1)
@@ -1221,7 +1354,7 @@ class TelethonTelegramAdapter:
 
                 async def scan():
                     nonlocal scanned, oldest, has_more
-                    options = {"limit": scan_limit}
+                    options = {"limit": scan_limit, **self._topic_options()}
                     if before_id:
                         options["offset_id"] = before_id
                     report(stage="scanning")
@@ -1240,12 +1373,15 @@ class TelethonTelegramAdapter:
                             raise DownloadCancelled("已请求停止频道消息扫描")
                         scanned += 1
                         oldest = message.id
+                        if not self._in_topic(message):
+                            continue
                         history.append(message)
                         if self._is_channel_post(message) and (name := self._archive_name(message)):
                             cover = (known_covers or {}).get(message.id, {})
                             source_url = (f"https://t.me/c/{-target - 1000000000000}/{message.id}"
                                           if isinstance(target, int) else f"https://t.me/{target}/{message.id}")
                             row = {"message_id": message.id, "chat": str(target), "filename": name,
+                                   "topic_id": self.topic_id, "source_kind": self.source_kind,
                                    "size": getattr(message.file, "size", None), "text": message.message or "",
                                    "date": message.date.isoformat() if getattr(message, "date", None) else "",
                                    "source_url": source_url,
@@ -1301,7 +1437,8 @@ class TelethonTelegramAdapter:
                                                                        cover_message_id=request.get("cover_message_id", 0))
                             else:
                                 transfer = _TransferEvents(self.on_event, message.id, str(target), request["filename"],
-                                                           message.message or "", getattr(message.file, "size", 0))
+                                                           message.message or "", getattr(message.file, "size", 0),
+                                                           topic_id=self.topic_id, source_kind=self.source_kind)
                                 transfer.emit("queued")
 
                                 async def pictures():

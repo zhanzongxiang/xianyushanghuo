@@ -14,10 +14,11 @@ if (Test-Path -LiteralPath (Join-Path $dist "$name.zip")) { throw "Portable ZIP 
 if ($LASTEXITCODE -ne 0) { throw "Download acceleration self-test failed." }
 & $python -c "from xianyu_pipeline.runtime import telegram_crypto_backend; assert telegram_crypto_backend() == 'cryptg', 'Install requirements.txt before building.'"
 if ($LASTEXITCODE -ne 0) { throw "cryptg acceleration is required for the portable build." }
-& $python -m PyInstaller --noconfirm --onedir --name $name --distpath $dist --workpath $build --specpath $build --hidden-import playwright --collect-all playwright --collect-all cryptg --collect-all httpx --add-data "$(Join-Path $root 'third_party');third_party" --add-data "$(Join-Path $root 'xianyu_pipeline\static');xianyu_pipeline\static" (Join-Path $root "run_pipeline.py")
+& $python -m PyInstaller --noconfirm --onedir --name $name --distpath $dist --workpath $build --specpath $build --hidden-import playwright --collect-all playwright --collect-all cryptg --collect-all httpx --collect-all sqlalchemy --collect-all psycopg --collect-all psycopg_binary --collect-all pymysql --collect-all cryptography --add-data "$(Join-Path $root 'third_party');third_party" --add-data "$(Join-Path $root 'xianyu_pipeline\static');xianyu_pipeline\static" (Join-Path $root "run_pipeline.py")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 Copy-Item (Join-Path $root "config\test.example.json") (Join-Path $out "test.local.json") -Force
 Copy-Item (Join-Path $root "start_ui.cmd") (Join-Path $out "start_ui.cmd") -Force
+Copy-Item (Join-Path $root "start_database_tunnel.ps1") (Join-Path $out "start_database_tunnel.ps1") -Force
 Copy-Item (Join-Path $root "README_TEST.md") (Join-Path $out "README_TEST.md") -Force
 & $python (Join-Path $root "package_portable.py") $out (Join-Path $root "config\test.example.json") (Join-Path $dist "$name.zip")
 if ($LASTEXITCODE -ne 0) { throw "Portable ZIP build or privacy check failed." }

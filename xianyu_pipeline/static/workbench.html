@@ -77,8 +77,15 @@
           </div>
           <button type="button" class="text-button" data-view="channels"><i data-lucide="radio-tower"></i>管理来源频道</button>
         </div>
+        <div id="channel-topic-bar" class="channel-topic-bar" hidden>
+          <label for="channel-topic-select">话题分区</label>
+          <select id="channel-topic-select" aria-label="选择话题"><option value="0">请选择话题</option></select>
+          <button id="refresh-channel-topics" type="button" class="icon-button" title="刷新话题列表" aria-label="刷新话题列表"><i data-lucide="refresh-cw"></i></button>
+          <span id="channel-topic-status" role="status"></span>
+        </div>
         <div class="channel-toolbar">
           <label class="search-field"><i data-lucide="search"></i><input id="channel-search" type="search" aria-label="搜索频道消息" placeholder="搜索文件名、正文或消息 ID" autocomplete="off"></label>
+          <label class="channel-transfer-filter"><i data-lucide="list-filter"></i><select id="channel-transfer-filter" aria-label="筛选消息处理状态"><option value="all">全部状态</option><option value="new">未下载</option><option value="downloaded">已下载</option><option value="transferred">已转存夸克</option></select></label>
           <span id="channel-scan-status" role="status">尚未读取频道</span>
         </div>
         <div id="channel-loading" class="channel-loading" role="status" hidden>
@@ -136,7 +143,7 @@
             <dl class="props"><dt>来源频道</dt><dd id="detail-chat"></dd><dt>消息 ID</dt><dd id="detail-message"></dd><dt>图片来源</dt><dd id="detail-image-source"></dd><dt>图片消息</dt><dd id="detail-image-messages"></dd><dt>文件大小</dt><dd id="detail-size"></dd><dt>下载状态</dt><dd id="detail-download"></dd><dt>完整性校验</dt><dd id="detail-validation"></dd><dt>上传状态</dt><dd id="detail-upload"></dd><dt>本地位置</dt><dd id="detail-path"></dd><dt>上传方式</dt><dd id="detail-provider"></dd><dt>更新时间</dt><dd id="detail-updated"></dd></dl>
             <div id="detail-progress" class="detail-progress"></div><p id="detail-error" class="error-note" hidden></p>
             <div id="share-result" class="share-result" hidden><span>分享链接</span><a id="share-link" target="_blank" rel="noopener noreferrer"></a><button id="copy-share" class="icon-button" type="button" title="复制分享链接" aria-label="复制分享链接"><i data-lucide="copy"></i></button></div>
-            <div class="inspector-actions"><a id="source-link" class="button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>来源消息</a><button id="open-task" type="button" hidden><i data-lucide="folder-open"></i>本地目录</button><button id="retry-task" type="button" hidden><i data-lucide="rotate-cw"></i>重新下载</button><button id="retry-link" type="button" hidden><i data-lucide="link"></i>重新获取链接</button></div>
+            <div class="inspector-actions"><a id="source-link" class="button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>来源消息</a><button id="open-task" type="button" hidden><i data-lucide="folder-open"></i>本地目录</button><button id="retry-task" type="button" hidden><i data-lucide="rotate-cw"></i>重新下载</button><button id="retry-link" type="button" hidden><i data-lucide="link"></i>重新获取链接</button><button id="delete-cloud-task" class="danger-button" type="button" hidden><i data-lucide="trash-2"></i><span>删除云端文件</span></button><button id="remove-record-task" class="danger-button" type="button" hidden><i data-lucide="list-x"></i>移除记录</button></div>
           </div>
         </aside>
       </div>
@@ -173,18 +180,32 @@
       <section id="settings-section" class="settings-section" hidden>
         <form id="config-form" novalidate autocomplete="off">
           <fieldset id="config-fields" disabled>
-            <section class="form-section"><h2>服务器数据</h2><div class="form-grid">
-              <label class="toggle-field"><span>启用服务器同步</span><input id="data_server_enabled" type="checkbox" role="switch"></label>
+            <section class="form-section"><h2>在线数据库</h2><div class="form-grid">
+              <label class="toggle-field"><span>启用数据同步</span><input id="data_server_enabled" type="checkbox" role="switch"></label>
+              <label>存储方式<select id="data_server_backend"><option value="postgresql">PostgreSQL</option><option value="mysql">MySQL</option><option value="http">原有数据服务</option></select></label>
+              <div id="data-db-fields" class="wide form-grid">
+                <label>数据库地址<input id="data_server_db_host" type="text" value="47.113.126.29" autocomplete="off" spellcheck="false"></label>
+                <label>数据库端口<input id="data_server_db_port" type="number" min="1" max="65535" step="1" value="5432"></label>
+                <label>数据库名<input id="data_server_db_name" type="text" value="xianyu" autocomplete="off" spellcheck="false"></label>
+                <label>数据库用户<input id="data_server_db_user" type="text" value="xianyu_app" autocomplete="off" spellcheck="false"></label>
+                <label>数据库密码<input id="data_server_db_password" type="password" autocomplete="new-password" spellcheck="false"></label>
+                <label>连接加密<select id="data_server_db_tls"><option value="require">TLS 加密</option><option value="verify-full">TLS 加密并验证证书</option><option value="disable">本机 SSH 隧道</option></select></label>
+                <label class="wide">CA 证书路径（可选）<input id="data_server_db_ca" type="text" autocomplete="off" spellcheck="false"></label>
+              </div>
               <label>工作空间<input id="data_server_workspace" type="text" value="default" maxlength="64" autocomplete="off" spellcheck="false"></label>
-              <label>数据服务地址<input id="data_server_url" type="url" placeholder="http://127.0.0.1:8780" autocomplete="off" spellcheck="false"></label>
-              <label>访问令牌<input id="data_server_token" type="password" autocomplete="new-password" spellcheck="false"></label>
+              <div id="data-http-fields" class="wide form-grid" hidden>
+                <label>数据服务地址<input id="data_server_url" type="url" placeholder="http://127.0.0.1:8780" autocomplete="off" spellcheck="false"></label>
+                <label>访问令牌<input id="data_server_token" type="password" autocomplete="new-password" spellcheck="false"></label>
+              </div>
               <label>同步间隔（秒）<input id="data_server_interval_seconds" type="number" min="5" max="300" step="1" value="10"></label>
               <output id="data-sync-status" class="wide field-hint" role="status">未启用</output>
+              <output id="data-db-check-result" class="wide field-hint" role="status" hidden></output>
               <details id="data-sync-conflicts" class="wide sync-conflicts" hidden><summary>冲突记录对比（最多展示 20 条）</summary><div id="data-sync-conflict-list"></div></details>
-              <div class="wide inline-actions sync-actions"><button id="data-sync-now" type="button"><i data-lucide="refresh-cw"></i>立即同步</button><button id="data-sync-server" type="button" hidden><i data-lucide="cloud-download"></i>冲突采用服务器版本</button><button id="data-sync-local" type="button" hidden><i data-lucide="upload"></i>冲突保留本机版本</button></div>
+              <div class="wide inline-actions sync-actions"><button id="data-db-check" type="button"><i data-lucide="plug-zap"></i>测试连接</button><button id="data-sync-now" type="button"><i data-lucide="refresh-cw"></i>立即同步</button><button id="data-sync-server" type="button" hidden><i data-lucide="cloud-download"></i>冲突采用服务器版本</button><button id="data-sync-local" type="button" hidden><i data-lucide="upload"></i>冲突保留本机版本</button></div>
             </div></section>
             <section class="form-section"><h2>来源与获取</h2><div class="form-grid">
               <label>来源频道<select id="source_channel_url"><option value="">不选择频道</option></select></label>
+              <label id="source-topic-field" hidden>来源话题<select id="source_topic_id"><option value="0">请选择话题</option></select></label>
               <label>扫描下载数量<input id="recent_message_limit" type="number" min="1" max="100" step="1"></label>
               <label>频道消息每轮读取数量<input id="channel_message_limit" type="number" min="1" max="100" step="1"></label>
               <label class="toggle-field"><span>排除转发帖</span><input id="exclude_forwarded_posts" type="checkbox" role="switch"></label>

@@ -29,7 +29,8 @@ def service(tmp_path, monkeypatch):
                               retries=0, size_delta=0, fail_share=False, share_url=SHARE,
                               waits=[], auth_keys=[], stages=[], metadata={}, progress=[], phases=[],
                               pre_fid="file-1", hash_fid="", publish=True, receipt=None, pages=None,
-                              lose_rename_response=False)
+                              lose_rename_response=False, delete_status=2, delete_visible=False,
+                              lose_delete_response=False, delete_rejected=False, delete_requested=False)
     original_client = httpx.Client
 
     def ok(data, metadata=None):
@@ -92,6 +93,15 @@ def service(tmp_path, monkeypatch):
                 if fixture.lose_rename_response:
                     raise httpx.ReadTimeout("fixture lost rename response", request=request)
                 return ok({})
+            if path == "file/delete":
+                assert request.method == "POST"
+                assert payload == {"action_type": 2, "filelist": ["file-1"], "exclude_fids": []}
+                if fixture.delete_rejected:
+                    return httpx.Response(200, json={"status": 403, "code": 1, "message": COOKIE})
+                fixture.delete_requested = True
+                if fixture.lose_delete_response:
+                    raise httpx.ReadTimeout("fixture lost delete response", request=request)
+                return ok({"task_id": "delete-task"})
             if path == "share":
                 assert fixture.rows
                 if fixture.fail_share:
@@ -99,6 +109,10 @@ def service(tmp_path, monkeypatch):
                 assert payload["fid_list"] == ["file-1"]
                 return ok({"task_id": "share-task"})
             if path == "task":
+                if request.url.params["task_id"] == "delete-task":
+                    if fixture.delete_status == 2 and not fixture.delete_visible:
+                        fixture.rows = [row for row in fixture.rows if row["fid"] != "file-1"]
+                    return ok({"task_id": "delete-task", "status": fixture.delete_status})
                 return ok({"status": 2, "share_id": "share-id"})
             if path == "share/password":
                 return ok({"share_url": fixture.share_url})
@@ -144,6 +158,104 @@ def service(tmp_path, monkeypatch):
     monkeypatch.setattr(cloud, "_wait", fixture.waits.append)
     fixture.cloud = cloud
     return fixture
+
+
+def delete_bound(service, **changes):
+    row = service.row()
+    values = {"remote_fid": row["fid"], "size": row["size"], "md5": row["md5"], "sha1": row["sha1"]}
+    values.update(changes)
+    service.cloud.delete_existing(service.source.name, "folder-1", **values)
+
+
+def test_delete_checks_original_binding_and_waits_for_receipt_without_touching_local_file(service):
+    original = service.source.read_bytes()
+    service.rows = [service.row(), {**service.row(), "fid": "different-file"}]
+    delete_bound(service)
+    assert [row["fid"] for row in service.rows] == ["different-file"]
+    assert service.source.read_bytes() == original
+    assert service.metadata == {"cloud_delete_status": "pending", "cloud_delete_error": "",
+                                "cloud_delete_task_id": "delete-task"}
+    assert [req.method for req, _ in service.calls if req.url.path.endswith("file/delete")] == ["POST"]
+    assert any(req.url.path.endswith("/task") for req, _ in service.calls)
+
+
+@pytest.mark.parametrize("change", [
+    {"fid": "another-fid"}, {"file_name": "another.rar"}, {"size": 12}, {"pdir_fid": "other-folder"},
+    {"md5": "0" * 32}, {"dir": True}, {"file_type": 0},
+])
+def test_delete_refuses_mismatched_remote_file_before_mutation(service, change):
+    service.rows = [{**service.row(), **change}]
+    with pytest.raises(QuarkAPIError):
+        delete_bound(service)
+    assert not service.delete_requested and not service.metadata
+
+
+@pytest.mark.parametrize("fid", ["", "0", "../bad", None])
+def test_delete_requires_a_specific_valid_file_id(service, fid):
+    with pytest.raises(ValueError):
+        delete_bound(service, remote_fid=fid)
+    assert not service.calls
+
+
+def test_delete_accepts_original_bound_file_without_directory_hashes(service):
+    service.rows = [{key: value for key, value in service.row().items() if key not in {"md5", "sha1"}}]
+    delete_bound(service)
+    assert not service.rows
+
+
+def test_delete_lost_response_is_not_blindly_retried_or_reported_success(service):
+    service.rows = [service.row()]
+    service.lose_delete_response = True
+    with pytest.raises(quark_api.QuarkDeletePending, match="连接失败"):
+        delete_bound(service)
+    assert len([req for req, _ in service.calls if req.url.path.endswith("file/delete")]) == 1
+    assert service.metadata["cloud_delete_status"] == "pending"
+    assert "cloud_delete_task_id" not in service.metadata
+
+
+def test_delete_pending_receipt_is_resumed_without_submitting_another_delete(service):
+    service.rows = [service.row()]
+    service.delete_status = 1
+    with pytest.raises(quark_api.QuarkDeletePending, match="尚未完成"):
+        delete_bound(service)
+    assert service.metadata["cloud_delete_task_id"] == "delete-task"
+    service.delete_status = 2
+    delete_bound(service, delete_task_id="delete-task", pending=True)
+    assert not service.rows
+    assert len([req for req, _ in service.calls if req.url.path.endswith("file/delete")]) == 1
+
+
+def test_delete_cannot_infer_success_from_file_missing_in_original_folder(service):
+    with pytest.raises(quark_api.QuarkDeletePending, match="已移动或删除"):
+        delete_bound(service, pending=True)
+    assert not service.delete_requested
+
+
+def test_delete_requires_directory_disappearance_after_successful_task_receipt(service):
+    service.rows = [service.row()]
+    service.delete_visible = True
+    with pytest.raises(quark_api.QuarkDeletePending, match="仍有该文件"):
+        delete_bound(service)
+    assert service.metadata["cloud_delete_task_id"] == "delete-task"
+
+
+def test_delete_rejected_task_can_be_retried_after_rechecking_file(service):
+    service.rows = [service.row()]
+    service.delete_status = 3
+    with pytest.raises(QuarkAPIError, match="删除任务失败") as failure:
+        delete_bound(service)
+    assert not isinstance(failure.value, quark_api.QuarkDeletePending)
+    assert service.metadata["cloud_delete_status"] == "failed"
+    assert service.metadata["cloud_delete_task_id"] == ""
+
+
+def test_delete_rejected_api_does_not_expose_cookie_or_claim_success(service):
+    service.rows = [service.row()]
+    service.delete_rejected = True
+    with pytest.raises(quark_api.QuarkDeletePending) as failure:
+        delete_bound(service)
+    assert COOKIE not in str(failure.value) and service.rows
+    assert service.metadata["cloud_delete_status"] == "pending"
 
 
 @pytest.mark.parametrize("body_size", [1024, 614400])

@@ -13,6 +13,7 @@ class PipelineConfig:
 
     source_chat: str = ""
     source_channel_url: str = "https://t.me/free_3d_models_download"
+    source_topic_id: int = 0
     fetch_mode: str = "message_ids"
     recent_message_limit: int = 20
     channel_message_limit: int = 100
@@ -23,6 +24,14 @@ class PipelineConfig:
     work_dir: Path = Path("data/work")
     output_dir: Path = Path("data/output")
     data_server_enabled: bool = False
+    data_server_backend: str = "auto"
+    data_server_db_host: str = "47.113.126.29"
+    data_server_db_port: int = 5432
+    data_server_db_name: str = "xianyu"
+    data_server_db_user: str = "xianyu_app"
+    data_server_db_password: str = field(default="", repr=False)
+    data_server_db_tls: str = "require"
+    data_server_db_ca: str = ""
     data_server_url: str = ""
     data_server_token: str = ""
     data_server_workspace: str = "default"
@@ -95,8 +104,28 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         from .data_protocol import validate_endpoint
         import re
+        if type(self.source_topic_id) is not int or not 0 <= self.source_topic_id <= 2147483647:
+            raise ValueError("来源话题 ID 无效")
         if type(self.data_server_enabled) is not bool:
             raise ValueError("data_server_enabled 必须为布尔值")
+        if self.data_server_backend == "auto":
+            self.data_server_backend = "http" if self.data_server_url else "postgresql"
+        if self.data_server_backend not in {"postgresql", "mysql", "http"}:
+            raise ValueError("数据库类型须为 PostgreSQL 或 MySQL")
+        if (not isinstance(self.data_server_db_host, str) or
+                not re.fullmatch(r"[a-zA-Z0-9_.:\-]{1,253}", self.data_server_db_host)):
+            raise ValueError("数据库主机无效，请填写 IP 或主机名")
+        if type(self.data_server_db_port) is not int or not 1 <= self.data_server_db_port <= 65535:
+            raise ValueError("数据库端口须为 1 至 65535 的整数")
+        for value, label in ((self.data_server_db_name, "数据库名"), (self.data_server_db_user, "数据库用户")):
+            if not isinstance(value, str) or not re.fullmatch(r"[a-zA-Z0-9_.\-]{1,64}", value):
+                raise ValueError(label + "须为 1 至 64 位字母、数字、点、下划线或连字符")
+        if not isinstance(self.data_server_db_password, str) or "\x00" in self.data_server_db_password:
+            raise ValueError("数据库密码格式无效")
+        if self.data_server_db_tls not in {"require", "verify-full", "disable"}:
+            raise ValueError("数据库 TLS 选项无效")
+        if not isinstance(self.data_server_db_ca, str) or "\x00" in self.data_server_db_ca:
+            raise ValueError("数据库 CA 证书路径无效")
         self.data_server_url = validate_endpoint(self.data_server_url)
         if (not isinstance(self.data_server_token, str) or
                 (self.data_server_token and (len(self.data_server_token) < 32
@@ -106,8 +135,15 @@ class PipelineConfig:
             raise ValueError("工作空间须为 1 至 64 位字母、数字、下划线或连字符")
         if type(self.data_server_interval_seconds) is not int or not 5 <= self.data_server_interval_seconds <= 300:
             raise ValueError("同步间隔须为 5 至 300 秒")
-        if self.data_server_enabled and (not self.data_server_url or not self.data_server_token):
-            raise ValueError("启用服务器同步时必须填写数据服务地址和令牌")
+        if self.data_server_enabled:
+            if self.data_server_backend == "http":
+                if not self.data_server_url or not self.data_server_token:
+                    raise ValueError("启用服务器同步时必须填写数据服务地址和令牌")
+            else:
+                if not self.data_server_db_password:
+                    raise ValueError("启用数据库存储时必须填写数据库密码")
+                if self.data_server_db_tls == "disable" and self.data_server_db_host not in {"127.0.0.1", "localhost", "::1"}:
+                    raise ValueError("远程数据库必须使用 TLS；SSH 隧道可连接 127.0.0.1")
         if type(self.download_workers) is not int or not 1 <= self.download_workers <= 8:
             raise ValueError("download_workers 必须为 1 到 8 的整数")
         if type(self.download_file_concurrency) is not int or not 1 <= self.download_file_concurrency <= 2:

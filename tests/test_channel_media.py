@@ -245,7 +245,8 @@ def test_scanning_previews_full_image_and_file_download_overlap_in_one_client(tm
     assert signals["preview_started"] and signals["file_started"] and signals["full_done"]
     assert any(event["download_status"] == "completed" for event in events)
     assert any(event.get("image_source") == "preceding_album" for event in events)
-    assert next(event for event in events if event["download_status"] == "completed")["image_paths"]
+    # The album can finish after the file when background slots are occupied.
+    assert [event for event in events if event["download_status"] == "completed"][-1]["image_paths"]
     with zipfile.ZipFile(tmp_path / "inbox" / "100.zip") as archive:
         assert archive.testzip() is None
     assert {kind for kind, _, _ in completed} == {"cover", "download"}

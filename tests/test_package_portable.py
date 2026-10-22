@@ -12,6 +12,7 @@ def test_package_uses_clean_sample_instead_of_local_config(tmp_path: Path):
     (folder / "_internal").mkdir(parents=True)
     (folder / "Pipeline.exe").write_bytes(b"exe")
     (folder / "start_ui.cmd").write_text("start", encoding="utf-8")
+    (folder / "start_database_tunnel.ps1").write_text("tunnel launcher", encoding="utf-8")
     (folder / "README_TEST.md").write_text("readme", encoding="utf-8")
     (folder / "_internal/runtime.bin").write_bytes(b"runtime")
     (folder / "test.local.json").write_text('{"quark_cookie": "PRIVATE"}', encoding="utf-8")
@@ -27,6 +28,7 @@ def test_package_uses_clean_sample_instead_of_local_config(tmp_path: Path):
         assert contents.testzip() is None
         assert sorted(contents.namelist()) == sorted([
             "Pipeline/Pipeline.exe", "Pipeline/README_TEST.md", "Pipeline/start_ui.cmd",
+            "Pipeline/start_database_tunnel.ps1",
             "Pipeline/_internal/runtime.bin", "Pipeline/test.local.json",
         ])
         assert b"PRIVATE" not in contents.read("Pipeline/test.local.json")
@@ -38,6 +40,10 @@ def test_package_rejects_sample_with_account_values(tmp_path: Path):
     example = tmp_path / "example.json"
     example.write_text('{"telegram_api_hash": "PRIVATE"}', encoding="utf-8")
     archive = tmp_path / "Pipeline.zip"
+    with pytest.raises(ValueError, match="Sample"):
+        package(folder, example, archive)
+    assert not archive.exists()
+    example.write_text('{"data_server_db_password": "PRIVATE"}', encoding="utf-8")
     with pytest.raises(ValueError, match="Sample"):
         package(folder, example, archive)
     assert not archive.exists()

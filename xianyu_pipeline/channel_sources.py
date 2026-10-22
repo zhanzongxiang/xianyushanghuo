@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from .models import utc_now
 from .workbench import channel_key
+from .telegram_sources import source_scope
 
 
 def normalize_public_channel(value: str) -> str:
@@ -35,12 +36,12 @@ class ChannelDirectory:
     def __init__(self, output_dir: Path):
         self.path = output_dir / "channels.json"
         self.lock = threading.RLock()
-        self.data = {"channels": []}
+        self.data = self._empty()
         self._load()
 
     @staticmethod
     def _empty() -> dict:
-        return {"channels": []}
+        return {"channels": [], "topics": []}
 
     @staticmethod
     def _valid_name(value: str) -> str:
@@ -74,6 +75,9 @@ class ChannelDirectory:
             "verified": metadata.get("verified") is True,
             "scam": metadata.get("scam") is True,
             "fake": metadata.get("fake") is True,
+            "kind": metadata.get("kind") if metadata.get("kind") in {"channel", "supergroup", "forum"} else "channel",
+            "forum": metadata.get("forum") is True or metadata.get("kind") == "forum",
+            "topics_scanned_at": str(metadata.get("topics_scanned_at") or ""),
             "name_custom": metadata.get("name_custom", bool(name and name != key)) is True,
             "created_at": created_at or now,
             "updated_at": updated_at or now,
@@ -106,13 +110,23 @@ class ChannelDirectory:
                     updated_at=row.get("updated_at") if isinstance(row.get("updated_at"), str) else None,
                     metadata=row,
                 ))
-            self.data = {"channels": valid}
+            topics = []
+            for row in stored.get("topics", []):
+                try:
+                    if row.get("channel") in seen:
+                        topics.append(self._topic(row["channel"], row))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+            self.data = {"channels": valid, "topics": topics}
         except (OSError, ValueError, TypeError):
             # Keep the unreadable file for diagnosis; a clean in-memory list is safer.
             self.data = self._empty()
 
     def _flush(self, data: dict | None = None) -> None:
         data = self.data if data is None else data
+        keys = {row["key"] for row in data["channels"]}
+        data = {**data, "topics": [row for row in data.get("topics", self.data.get("topics", []))
+                                  if row["channel"] in keys]}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -141,7 +155,7 @@ class ChannelDirectory:
                 row = self._record(
                     key, self.canonical_url(key), name,
                     created_at=previous["created_at"] if previous else None,
-                    metadata={**item, "title": title, "name_custom": custom},
+                    metadata={**(previous or {}), **item, "title": title, "name_custom": custom},
                 )
                 if previous:
                     previous.update(row)
@@ -183,12 +197,52 @@ class ChannelDirectory:
             self._flush()
             return copy.deepcopy(row)
 
-    def list(self, active_url: str = "") -> dict:
+    def list(self, active_url: str = "", topic_id: int = 0) -> dict:
         active = channel_key(active_url) if active_url else ""
         with self.lock:
             rows = [copy.deepcopy(row) for row in self.data["channels"]]
+            for row in rows:
+                row["topics"] = self.topics(row["key"])
         rows.sort(key=lambda row: (row["key"] != active, row["name"].lower(), row["key"]))
-        return {"active": active, "channels": rows}
+        return {"active": active, "active_topic_id": topic_id, "channels": rows}
+
+    @staticmethod
+    def _topic(channel: str, row: dict) -> dict:
+        topic_id = row.get("topic_id")
+        if type(topic_id) is not int or not 1 <= topic_id <= 2147483647:
+            raise ValueError("话题 ID 无效")
+        title = row.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("话题名称无效")
+        return {"channel": channel, "topic_id": topic_id, "key": source_scope(channel, topic_id),
+                "title": re.sub(r"[\x00-\x1f]", "", title).strip()[:256],
+                "closed": row.get("closed") is True, "hidden": row.get("hidden") is True,
+                "top_message_id": max(0, int(row.get("top_message_id") or 0))}
+
+    def topics(self, key: str) -> list[dict]:
+        with self.lock:
+            rows = [copy.deepcopy(row) for row in self.data.get("topics", [])
+                    if row["channel"] == channel_key(key)]
+            return sorted(rows, key=lambda row: (row["topic_id"] != 1, row["title"].casefold(), row["topic_id"]))
+
+    def get_topic(self, key: str, topic_id: int) -> dict:
+        if type(topic_id) is int:
+            for row in self.topics(key):
+                if row["topic_id"] == topic_id:
+                    return row
+        raise ValueError("请先获取话题列表，并选择已保存的话题")
+
+    def merge_topics(self, key: str, rows: list[dict]) -> None:
+        """Replace a completed topic scan atomically; failures retain the old list."""
+        key = channel_key(key)
+        with self.lock:
+            self.get(key)
+            topics = {row["topic_id"]: self._topic(key, row) for row in rows}
+            data = copy.deepcopy(self.data)
+            data["topics"] = [row for row in data["topics"] if row["channel"] != key] + list(topics.values())
+            parent = next(row for row in data["channels"] if row["key"] == key)
+            parent.update(kind="forum", forum=True, topics_scanned_at=utc_now(), updated_at=utc_now())
+            self._flush(data)
 
     def get(self, key: str) -> dict:
         value = channel_key(key)

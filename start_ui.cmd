@@ -7,6 +7,15 @@ for %%F in ("%~dp0XianYuMaterialPipeline_*.exe") do (
 )
 for /f %%P in ('powershell -NoProfile -Command "$p=8765; while (Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue) { $p++ }; $p"') do set "WEB_PORT=%%P"
 if not defined WEB_PORT set "WEB_PORT=8765"
+set "APP_CONFIG=%~dp0config\test.local.json"
+if defined APP_EXE set "APP_CONFIG=%~dp0test.local.json"
+if exist "%~dp0start_database_tunnel.ps1" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_database_tunnel.ps1" -ConfigPath "%APP_CONFIG%"
+  if errorlevel 1 (
+    pause
+    exit /b 1
+  )
+)
 echo Web UI: http://127.0.0.1:%WEB_PORT%/
 if defined APP_EXE (
   "%APP_EXE%" --config "%~dp0test.local.json" --web-ui --web-port %WEB_PORT%

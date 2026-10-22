@@ -1,6 +1,9 @@
-telethon>=1.36,<2
+telethon>=1.45,<2
 cryptg>=0.5,<0.6
 python-socks[asyncio]>=2,<3
 playwright>=1.45,<2
 httpx>=0.28,<0.29
+SQLAlchemy>=2.0,<2.1
+psycopg[binary]>=3.2,<4
+PyMySQL[rsa]>=1.1,<2
 pyinstaller>=6.0,<7

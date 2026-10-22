@@ -130,8 +130,24 @@ class Fixture:
             self.posts.append((path, payload))
             if path == "/api/telegram-channels-scan":
                 self.joined.update(stage="connecting", error="")
-                self.workbench.update(running=True, action="telegram-channels-scan", error="")
+                self.workbench.update(running=True, action="telegram-channels-scan", error="",
+                                      task_id=f"fixture-account-scan-{len(self.posts)}", stop_requested=False)
                 route.fulfill(json={"message": "fixture channels requested"})
+                return
+            if path == "/api/stop":
+                assert payload == {"task_id": self.workbench["task_id"], "action": self.workbench["action"]}
+                if self.workbench["action"] == "telegram-channels-scan":
+                    self.joined.update(stage="cancelled", error="")
+                self.workbench.update(running=False, stop_requested=False, channel_requests_open=False)
+                route.fulfill(json={"message": "fixture task stopped"})
+                return
+            if path == "/api/channel-cover":
+                assert not payload.get("prefetch") or self.workbench["running"]
+                if not self.workbench["running"]:
+                    self.workbench.update(running=True, action="channel-cover", error="",
+                                          task_id="fixture-full-picture", stop_requested=False,
+                                          channel_requests_open=True)
+                route.fulfill(json={"message": "fixture image requested"})
                 return
             if path == "/api/channels/select":
                 if self.selection_fails:
@@ -156,6 +172,8 @@ class Fixture:
             if path == "/api/config":
                 if payload.pop("data_server_token", ""):
                     payload["data_server_token_configured"] = True
+                if payload.pop("data_server_db_password", ""):
+                    payload["data_server_db_password_configured"] = True
                 self.config.update(payload)
                 if self.config.get("data_server_enabled"):
                     self.workbench["data_sync"] = {"enabled": True, "stage": "connected", "pending": 0,
@@ -165,6 +183,9 @@ class Fixture:
                 self.saved["active"] = channel["key"]
                 self.catalog = self.empty_catalog(channel["key"])
                 route.fulfill(json={"message": "fixture saved"})
+                return
+            if path == "/api/data-check":
+                route.fulfill(json={"message": "数据库连接成功"})
                 return
             if path == "/api/data-sync":
                 if payload.get("resolve"):
@@ -187,6 +208,75 @@ class Fixture:
                 route.fulfill(json={"message": "fixture messages requested"})
                 return
         raise AssertionError(f"Unexpected account or action request: {route.request.method} {path}")
+
+
+def check_task_scoping(page, fixture: Fixture, label: str, unique: str) -> None:
+    fixture.catalog["messages"][0].update(cover_url="/api/channel-preview/42", full_cover_url="",
+                                          full_status="", cover_status="ready")
+    page.route("**/api/channel-preview/**",
+               lambda route: route.fulfill(content_type="image/png", body=avatar_png()))
+    refresh(page, fixture)
+    page.locator(".channel-message-cover img").wait_for(state="visible")
+    before = len(fixture.posts)
+    page.wait_for_timeout(2300)
+    assert not any(path == "/api/channel-cover" for path, _ in fixture.posts[before:]), (
+        "Viewing cached messages started an independent image task")
+    page.locator("button.channel-message-cover").click()
+    page.wait_for_function("document.getElementById('stop').hidden === false")
+    page.keyboard.press("Escape")
+    assert fixture.workbench["action"] == "channel-cover"
+
+    page.locator(".nav-item[data-view='channels']").click()
+    assert page.locator("#stop").is_hidden()
+    assert "后台正在加载高清图" in page.locator("#connection").get_attribute("aria-label")
+    assert page.locator("#add-channel").is_enabled()
+    assert page.locator("#scan-joined-channels").is_disabled()
+    assert "加载高清图" in page.locator("#scan-joined-channels").get_attribute("title")
+    editor = page.locator("[data-channel-management='edit'][data-channel-key='fixture_saved']")
+    assert editor.is_enabled()
+    editor.click()
+    page.locator("#channel-editor-name").fill("后台任务期间编辑频道")
+    page.locator("#channel-editor-form button[type='submit']").click()
+    page.locator("#channel-editor-dialog").wait_for(state="hidden")
+    assert fixture.workbench["running"] and fixture.workbench["task_id"] == "fixture-full-picture"
+    assert not any(path == "/api/stop" for path, _ in fixture.posts[before:])
+    assert_no_overflow(page, f"{label}: background image status overflow")
+    screenshot = ARTIFACTS / f"channel-background-task-{unique}-{label}.png"
+    page.screenshot(path=str(screenshot), full_page=True)
+    print(screenshot.resolve())
+
+    page.locator(".nav-item[data-view='messages']").click()
+    assert page.locator("#stop").is_visible()
+    assert "停止加载高清图" in page.locator("#stop").inner_text()
+    page.locator("#stop").click()
+    page.locator("#stop").wait_for(state="hidden")
+    assert fixture.posts[-1] == ("/api/stop", {"task_id": "fixture-full-picture", "action": "channel-cover"})
+
+    page.locator(".nav-item[data-view='channels']").click()
+    page.locator("#scan-joined-channels").click()
+    page.locator("#stop").wait_for(state="visible")
+    assert "停止获取账号频道" in page.locator("#stop").inner_text()
+    assert page.locator("#add-channel").is_disabled()
+    page.locator(".nav-item[data-view='messages']").click()
+    assert page.locator("#stop").is_hidden(), "Messages page can stop an unrelated account scan"
+    page.locator(".nav-item[data-view='channels']").click()
+    page.locator("#stop").click()
+    page.locator("#stop").wait_for(state="hidden")
+    assert fixture.joined["stage"] == "cancelled"
+
+    page.locator(".nav-item[data-view='messages']").click()
+    fixture.workbench.update(running=True, action="channel-scan", task_id="fixture-reused-scan",
+                             channel_requests_open=True, stop_requested=False)
+    refresh(page, fixture)
+    before = len(fixture.posts)
+    deadline = time.monotonic() + 6
+    while not any(path == "/api/channel-cover" for path, _ in fixture.posts[before:]):
+        assert time.monotonic() < deadline, "Active scan did not prefetch a preview"
+        page.wait_for_timeout(50)
+    assert fixture.posts[-1] == ("/api/channel-cover", {"id": 42, "prefetch": True})
+    assert fixture.workbench["task_id"] == "fixture-reused-scan"
+    page.locator("#stop").click()
+    page.locator("#stop").wait_for(state="hidden")
 
 
 def refresh(page, fixture: Fixture) -> None:
@@ -406,6 +496,7 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
 
     page.locator(".nav-item[data-view='settings']").click()
     page.locator("#data_server_enabled").check()
+    page.locator("#data_server_backend").select_option("http")
     page.locator("#data_server_url").fill("http://47.113.126.29:8780")
     page.locator("#data_server_token").fill("offline-sync-token-" + "a" * 32)
     page.locator("#save-config").click()
@@ -430,6 +521,26 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
         page.locator("#data-sync-" + choice).click()
         page.locator("#data-sync-" + choice).wait_for(state="hidden")
         assert any(path == "/api/data-sync" and payload == {"resolve": choice} for path, payload in fixture.posts)
+    page.locator("#data_server_backend").select_option("mysql")
+    assert page.locator("#data_server_db_port").input_value() == "3306"
+    assert page.locator("#data-db-fields").is_visible()
+    assert page.locator("#data-http-fields").is_hidden()
+    page.locator("#data_server_backend").select_option("postgresql")
+    assert page.locator("#data_server_db_port").input_value() == "5432"
+    page.locator("#data_server_db_host").fill("47.113.126.29")
+    page.locator("#data_server_db_password").fill("offline-database-password")
+    page.locator("#data_server_db_tls").select_option("disable")
+    page.locator("#save-config").click()
+    assert page.locator("#data_server_db_tls").get_attribute("aria-invalid") == "true"
+    page.locator("#data_server_db_tls").select_option("require")
+    page.locator("#save-config").click()
+    page.wait_for_function("document.getElementById('config-dirty').textContent === ''")
+    assert page.locator("#data_server_db_password").input_value() == "********"
+    assert "data_server_db_password" not in fixture.config
+    page.locator("#data-db-check").click()
+    page.wait_for_function("document.getElementById('data-db-check-result').textContent === '数据库连接成功'")
+    refresh(page, fixture)
+    assert page.locator("#data-db-check-result").inner_text() == "数据库连接成功"
     assert_no_overflow(page, f"{label}: data settings overflow")
     screenshot = ARTIFACTS / f"data-sync-settings-{unique}-{label}.png"
     page.screenshot(path=str(screenshot), full_page=True)
@@ -458,10 +569,11 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
     page.locator(".nav-item[data-view='messages']").click()
     page.locator("[data-message-id='42'] [data-channel-action='download']").wait_for(state="visible")
     assert page.locator("[data-message-id='42'] [data-channel-action='download']").is_enabled()
+    check_task_scoping(page, fixture, label, unique)
     assert not errors, errors
 
 
-def check(executable: Path | None = None) -> None:
+def check(executable: Path | None = None, *, check_callback=None) -> None:
     from playwright.sync_api import sync_playwright
 
     if not BROWSER.is_file():
@@ -509,7 +621,7 @@ def check(executable: Path | None = None) -> None:
                         page = browser.new_page(viewport={"width": width, "height": height})
                         page.set_default_timeout(5000)
                         try:
-                            check_view(page, Fixture(origin), origin, label, unique)
+                            (check_callback or check_view)(page, Fixture(origin), origin, label, unique)
                         except Exception:
                             print(page.locator("#errors").inner_text())
                             print(page.evaluate("document.getElementById('config-fields').disabled"))

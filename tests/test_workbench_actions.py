@@ -144,8 +144,13 @@ def app(tmp_path, monkeypatch):
         ])
         assert post("/api/channels/select", {"key": "fixture_channel"})[0] == 200
 
+    def stop():
+        snapshot = result.state.snapshot()
+        return post("/api/stop", {key: snapshot[key] for key in ("task_id", "action")})
+
     result.post, result.get, result.run, result.task, result.bind = post, get, run, task, bind
     result.acquire = acquire
+    result.stop = stop
     return result
 
 
@@ -428,6 +433,216 @@ def api_settings(app, **changes):
         "upload_provider": "quark_api", "quark_cookie": "__uid=fixture; __pus=fixture-secret",
         "quark_api_parent_fid": "folder-1", "browser_executable_path": "", **changes,
     })
+
+
+def bound_api_task(app, **changes):
+    identity = app.task()
+    source = Path(app.store.get(identity)["local_path"])
+    app.store.update(identity, **{
+        "upload_status": "completed", "upload_provider": "quark_api",
+        "upload_filename": source.name, "upload_target": "original-folder", "upload_remote_fid": "original-fid",
+        "upload_size": source.stat().st_size, "upload_md5": "a" * 32, "upload_sha1": "b" * 40,
+        "share_url": SHARE, "remote_filename": "中文模型.zip", **changes,
+    })
+    return identity
+
+
+def delete_request(app, identity, **changes):
+    return app.post("/api/cloud-delete", {"id": identity, "remote_fid": "original-fid", "confirm": True, **changes})
+
+
+def test_library_remove_hides_record_preserves_archive_and_cloud_binding_without_worker(app):
+    identity = bound_api_task(app)
+    before = app.store.get(identity)
+    source = Path(before["local_path"])
+    body = source.read_bytes()
+    assert app.get("/api/workbench")[1]["record_remove_supported"] is True
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 200
+    assert app.get("/api/workbench")[1]["tasks"] == []
+    assert source.read_bytes() == body
+    assert app.store.tasks[identity]["upload_remote_fid"] == before["upload_remote_fid"]
+    assert app.store.tasks[identity]["share_url"] == before["share_url"]
+    assert not app.workers and not app.calls
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 400
+    assert delete_request(app, identity)[0] == 400
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 400
+
+
+@pytest.mark.parametrize("changes", [
+    {"confirm": False}, {"confirm": 1}, {"id": "missing"},
+])
+def test_library_remove_requires_explicit_confirmation_and_own_task(app, changes):
+    identity = app.task()
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True, **changes})[0] == 400
+    assert app.store.get(identity)["record_removed_at"] == ""
+
+
+def test_library_remove_rejects_busy_or_pending_cloud_operations(app):
+    identity = bound_api_task(app, cloud_delete_status="pending", cloud_delete_task_id="delete-task")
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 400
+    app.store.update(identity, cloud_delete_status="completed", upload_status="deleted")
+    app.state.running = True
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 409
+    app.state.running = False
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 200
+
+
+def test_library_remove_accepts_cloud_success_without_local_success_or_file(app):
+    identity = bound_api_task(app, download_status="failed")
+    source = Path(app.store.get(identity)["local_path"])
+    source.unlink()
+    assert app.post("/api/library/remove", {"id": identity, "confirm": True})[0] == 200
+    assert app.store.snapshot()["tasks"] == []
+
+
+def test_cloud_delete_uses_original_binding_preserves_local_archive_and_clears_link(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app)
+    original_task = app.store.get(identity)
+    original_bytes = Path(original_task["local_path"]).read_bytes()
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def delete_existing(self, name, target, **options):
+            persisted = next(row for row in json.loads(app.store.path.read_text(encoding="utf-8")) if row["id"] == identity)
+            assert persisted["cloud_delete_status"] == "deleting"
+            assert self.stop_event is app.state.stop_event
+            calls.append((name, target, options))
+            self._remote(cloud_delete_status="pending", cloud_delete_task_id="delete-task")
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.get("/api/workbench")[1]["cloud_delete_supported"]
+    assert delete_request(app, identity)[0] == 200
+    assert delete_request(app, identity)[0] == 409
+    app.run()
+    task = app.store.get(identity)
+    assert calls == [("中文模型.zip", "original-folder", {
+        "remote_fid": "original-fid", "size": original_task["upload_size"], "md5": "a" * 32, "sha1": "b" * 40,
+        "delete_task_id": "", "pending": False,
+    })]
+    assert task["upload_status"] == "deleted" and task["cloud_delete_status"] == "completed"
+    assert task["cloud_deleted_at"] and task["share_url"] == "" and task["cloud_delete_error"] == ""
+    assert task["download_status"] == "completed" and task["upload_remote_fid"] == "original-fid"
+    assert Path(task["local_path"]).read_bytes() == original_bytes
+    assert delete_request(app, identity)[0] == 400
+    assert not app.state.error
+
+
+@pytest.mark.parametrize("changes", [
+    {"confirm": False}, {"confirm": 1}, {"remote_fid": "stale-file"}, {"id": "missing"},
+])
+def test_cloud_delete_rejects_unconfirmed_or_stale_requests_before_worker(app, changes):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app)
+    assert delete_request(app, identity, **changes)[0] == 400
+    assert not app.workers and app.store.get(identity)["upload_status"] == "completed"
+
+
+@pytest.mark.parametrize("changes", [
+    {"upload_provider": "quark_browser"}, {"upload_status": "link_pending"},
+    {"upload_remote_fid": ""}, {"upload_target": ""}, {"upload_target": "../invalid"},
+    {"upload_size": 0}, {"upload_filename": ""}, {"remote_device": True},
+])
+def test_cloud_delete_requires_confirmed_api_binding(app, changes):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app, **changes)
+    assert delete_request(app, identity)[0] == 400
+    assert not app.workers
+
+
+def test_cloud_delete_pending_receipt_survives_retry_and_does_not_need_local_archive(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app)
+    Path(app.store.get(identity)["local_path"]).unlink()
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def delete_existing(self, name, target, **options):
+            calls.append(options)
+            if len(calls) == 1:
+                self._remote(cloud_delete_status="pending", cloud_delete_task_id="original-delete-task")
+                raise web_ui.QuarkDeletePending("fixture deletion still running")
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert delete_request(app, identity)[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["cloud_delete_status"] == "pending" and task["upload_status"] == "completed"
+    assert task["share_url"] == SHARE and task["cloud_delete_error"]
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 400
+    assert delete_request(app, identity)[0] == 200
+    app.run()
+    assert calls[-1]["pending"] is True and calls[-1]["delete_task_id"] == "original-delete-task"
+    assert app.store.get(identity)["upload_status"] == "deleted"
+
+
+def test_cloud_delete_preflight_failure_keeps_original_upload_and_link(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app)
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def delete_existing(self, *args, **options):
+            raise ValueError("fixture remote file has changed")
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert delete_request(app, identity)[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["cloud_delete_status"] == "failed" and task["share_url"] == SHARE
+    assert task["upload_status"] == "completed" and task["cloud_deleted_at"] == ""
+    assert app.state.error and "changed" in task["cloud_delete_error"]
+
+
+def test_cloud_delete_updates_all_local_records_bound_to_same_remote_object(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app)
+    other = app.task("other.zip", upload_status="completed", upload_provider="quark_api",
+                     upload_remote_fid="original-fid", upload_target="original-folder", share_url=SHARE)
+    unrelated = app.task("unrelated.zip", upload_status="completed", upload_provider="quark_api",
+                         upload_remote_fid="different-fid", upload_target="original-folder", share_url=SHARE)
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def delete_existing(self, *args, **options):
+            pass
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert delete_request(app, identity)[0] == 200
+    app.run()
+    assert app.store.get(other)["upload_status"] == "deleted"
+    assert app.store.get(unrelated)["upload_status"] == "completed"
+    assert app.store.get(other)["download_status"] == "completed"
+
+
+def test_reupload_after_cloud_delete_starts_new_binding_and_clears_old_delete_state(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = bound_api_task(app, upload_status="deleted", cloud_delete_status="completed",
+                             cloud_delete_task_id="old-delete-task", cloud_deleted_at="old-timestamp")
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **options):
+            task = app.store.get(identity)
+            assert task["cloud_delete_status"] == "" and task["cloud_delete_task_id"] == ""
+            assert task["cloud_deleted_at"] == "" and task["remote_filename"] == ""
+            self._remote(upload_remote_fid="new-fid")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert app.store.get(identity)["upload_remote_fid"] == "new-fid"
+    assert app.store.get(identity)["upload_status"] == "completed"
+
+
+def test_cloud_delete_state_survives_restart_and_download_events(app):
+    identity = bound_api_task(app, cloud_delete_status="deleting", cloud_delete_task_id="delete-task")
+    restored = TransferStore(app.store.config)
+    assert restored.get(identity)["cloud_delete_status"] == "pending"
+    restored.event({"chat": "fixture_channel", "message_id": 123, "filename": "asset.zip",
+                    "cloud_delete_status": "completed", "cloud_delete_task_id": "wrong",
+                    "cloud_deleted_at": "wrong"})
+    task = restored.get(identity)
+    assert task["cloud_delete_status"] == "pending" and task["cloud_delete_task_id"] == "delete-task"
+    assert task["cloud_deleted_at"] == ""
 
 
 def test_naming_candidates_can_be_generated_without_cloud_or_telegram(app):
@@ -751,6 +966,84 @@ def catalog_page(ids, cursor, has_more=True):
             "oldest_scanned_id": cursor, "has_more": has_more}
 
 
+def test_stop_requires_a_specific_current_task_and_rejects_stale_same_action(app, monkeypatch):
+    monkeypatch.setattr(web_ui.TelethonTelegramAdapter, "list_joined_channels", lambda self, **options: [])
+    assert app.post("/api/telegram-channels-scan")[0] == 200
+    first = app.get("/api/workbench")[1]
+    assert first["task_id"] and not first["stop_requested"]
+    assert app.post("/api/stop")[0] == 400
+    assert app.post("/api/stop", {"task_id": first["task_id"], "action": "channel-cover"})[0] == 409
+    assert not app.state.stop_event.is_set() and app.state.running
+    app.run()
+
+    assert app.post("/api/telegram-channels-scan")[0] == 200
+    second = app.get("/api/workbench")[1]
+    assert second["task_id"] != first["task_id"]
+    stale = {key: first[key] for key in ("task_id", "action")}
+    assert app.post("/api/stop", stale)[0] == 409
+    assert not app.state.stop_event.is_set() and app.state.running
+    assert app.stop()[0] == 200
+    assert app.get("/api/workbench")[1]["stop_requested"]
+    app.run()
+    assert app.get("/api/telegram-channels")[1]["stage"] == "cancelled"
+    assert not app.get("/api/workbench")[1]["stop_requested"]
+    assert app.post("/api/stop", stale)[0] == 409
+
+
+@pytest.mark.parametrize("action", ["channel-cover", "channel-scan", "channel-download", "upload"])
+def test_background_task_allows_directory_edits_without_changing_active_source(app, action):
+    app.state.running = True
+    app.state.action = action
+    app.state.task_id = "fixture-running-task"
+    assert app.post("/api/channels", {"url": "https://t.me/other_channel", "name": "Other"})[0] == 200
+    assert app.post("/api/channels/rename", {"key": "fixture_channel", "name": "Custom name"})[0] == 200
+    assert app.post("/api/channels/select", {"key": "other_channel"})[0] == 409
+    assert app.post("/api/telegram-channels/select", {"key": "other_channel"})[0] == 409
+    assert app.post("/api/channels/remove", {"key": "fixture_channel"})[0] == 400
+    assert app.post("/api/channels/remove", {"key": "other_channel"})[0] == 200
+    listing = app.get("/api/channels")[1]
+    assert listing["active"] == "fixture_channel" and listing["channels"][0]["name"] == "Custom name"
+    assert PipelineConfig.from_json(app.config_path).source_channel_url == "https://t.me/fixture_channel"
+    assert app.state.running and app.state.action == action and not app.state.stop_event.is_set()
+    assert not app.workers
+
+
+@pytest.mark.parametrize("path,payload", [
+    ("/api/channels", {"url": "https://t.me/other_channel"}),
+    ("/api/channels/rename", {"key": "fixture_channel", "name": "Custom name"}),
+    ("/api/channels/remove", {"key": "other_channel"}),
+])
+def test_account_scan_serializes_directory_mutations(app, path, payload):
+    app.channels.add("https://t.me/other_channel")
+    before = app.channels.list()
+    assert app.post("/api/telegram-channels-scan")[0] == 200
+    status, result = app.post(path, payload)
+    assert status == 409 and "获取账号频道" in result["message"]
+    assert app.channels.list() == before and not app.state.stop_event.is_set()
+
+
+def test_picture_prefetch_never_starts_an_independent_telegram_session(app, monkeypatch):
+    app.acquire()
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            options["on_page"](catalog_page([100], 95))
+            assert app.post("/api/channel-cover", {"id": 100, "prefetch": True})[0] == 200
+            assert not app.workers
+            assert options["take_request"]()["kind"] == "cover"
+            assert options["close_requests"]()
+            return catalog_page([100], 95)
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-cover", {"id": 100, "prefetch": True})[0] == 409
+    assert not app.workers and not app.state.running
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    assert not app.state.error
+    assert app.post("/api/channel-cover", {"id": 100, "prefetch": True})[0] == 409
+    assert not app.workers and not app.state.running
+
+
 def test_catalog_worker_streams_metadata_before_cover_completion(app, monkeypatch):
     app.acquire()
     covers_started, release = threading.Event(), threading.Event()
@@ -825,7 +1118,7 @@ def test_catalog_stop_retains_streamed_messages_without_fatal_error(app, monkeyp
         def list_archives(self, channel, **options):
             options["on_page"](catalog_page([100], 95))
             options["on_progress"]({"stage": "covers", "found": 1, "total": 1})
-            assert app.post("/api/stop")[0] == 200
+            assert app.stop()[0] == 200
             assert self.stop_event.is_set()
             assert app.get("/api/workbench")[1]["channel_scan"]["stop_requested"]
             raise web_ui.DownloadCancelled("fixture stop")
@@ -915,7 +1208,7 @@ def test_stop_rejects_new_jobs_and_cancels_queued_file_and_full_image(app, monke
             options["on_page"](catalog_page([100], 95))
             assert app.post("/api/channel-download", {"ids": [100]})[0] == 200
             assert app.post("/api/channel-cover", {"id": 100})[0] == 200
-            assert app.post("/api/stop")[0] == 200
+            assert app.stop()[0] == 200
             assert app.post("/api/channel-cover", {"id": 100})[0] == 409
             raise web_ui.DownloadCancelled("fixture stop")
 

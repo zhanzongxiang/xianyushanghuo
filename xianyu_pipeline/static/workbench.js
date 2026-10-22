@@ -10,27 +10,41 @@
   };
   const uploadStates = {
     waiting: ["待上传", "gray"], uploading: ["上传中", ""], link_pending: ["结果待确认 / 链接待获取", "amber"],
-    completed: ["已完成", ""], local: ["本地模拟", "gray"], failed: ["上传失败", "red"]
+    completed: ["已完成", ""], local: ["本地模拟", "gray"], failed: ["上传失败", "red"],
+    deleted: ["云端已删除", "gray"]
   };
   const retryable = new Set(["failed", "cancelled", "interrupted"]);
   const taskViews = new Set(["download", "upload", "library", "history"]);
+  const actionLabels = { run: "执行流水线", download: "下载", retry: "重新下载", upload: "上传", "cloud-delete": "删除云端文件", "channel-scan": "获取频道消息", "telegram-channels-scan": "获取账号频道", "channel-download": "下载选中消息", "channel-cover": "加载高清图", "names/generate": "生成中文名称", "names/apply": "应用中文名称", "browser-check": "检查浏览器", "telegram-api-login": "Telegram API 登录", "quark-login": "夸克网页登录", "quark-cli-login": "夸克 CLI 登录", "quark-cli-check": "检查夸克 CLI", "quark-api-check": "检查夸克 API" };
+  const pageActions = {
+    messages: ["channel-scan", "channel-cover", "channel-download", "channel-topics-scan"],
+    download: ["run", "download", "retry", "channel-download"],
+    upload: ["run", "upload"],
+    library: ["upload", "cloud-delete", "names/generate", "names/apply"],
+    channels: ["telegram-channels-scan", "channel-topics-scan"],
+    settings: ["browser-check", "telegram-api-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check"]
+  };
   const numberFields = ["quark_share_expire_days", "recent_message_limit", "channel_message_limit", "download_start_timeout_seconds", "download_transfer_timeout_seconds", "download_workers", "download_file_concurrency", "quark_cli_timeout_seconds", "quark_api_file_concurrency", "quark_api_timeout_seconds"];
+  numberFields.push("source_topic_id");
+  actionLabels["channel-topics-scan"] = "获取群组话题";
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
-  plainFields.push("data_server_url", "data_server_workspace");
-  numberFields.push("data_server_interval_seconds");
+  plainFields.push("data_server_url", "data_server_workspace", "data_server_backend", "data_server_db_host",
+    "data_server_db_name", "data_server_db_user", "data_server_db_tls", "data_server_db_ca");
+  numberFields.push("data_server_interval_seconds", "data_server_db_port");
   booleanFields.push("data_server_enabled");
-  const formFields = [...plainFields, ...numberFields, ...booleanFields, "telegram_api_id", "telegram_api_hash", "quark_cookie", "data_server_token"];
+  const formFields = [...plainFields, ...numberFields, ...booleanFields, "telegram_api_id", "telegram_api_hash", "quark_cookie", "data_server_token", "data_server_db_password"];
   const savedHashMask = "********";
   const state = {
     view: "download", data: null, tasks: new Map(), rows: new Map(), selected: new Set(), active: null,
     images: new Map(), brokenImages: new Set(), filters: {}, errors: new Map(), config: null,
-    configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false, dataTokenConfigured: false,
+    configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false, dataTokenConfigured: false, dataPasswordConfigured: false,
     configDirty: false, formRevision: 0, pending: false, logs: null, workbenchOK: false,
     lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null,
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
     previewReturnFocus: null, previewZoom: 1, previewMessageId: null, previewRequested: new Set(), previewErrors: new Map(),
     channels: null, joinedChannels: null, joinedScanRequested: false,
+    expandedTopics: new Set(), topicScanRequested: "",
     pickerOpen: false, pickerFocusKey: "", failedAvatars: new Set(), channelRevision: 0,
     channelEditorMode: "add", channelEditorKey: "",
     namingRows: new Map(), namingDirty: new Set(), namingSelected: new Set()
@@ -42,14 +56,60 @@
   let catalogRequest = null;
   let channelsRequest = null;
   let joinedChannelsRequest = null;
+  let catalogTaskIndex = null;
   let pollTimer = null;
   let noticeTimer = null;
 
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
+  if (!$("channel-topic-bar")) {
+    $("channel-messages-section").querySelector(".channel-toolbar").insertAdjacentHTML("beforebegin",
+      '<div id="channel-topic-bar" class="channel-topic-bar" hidden><label for="channel-topic-select">话题分区</label><select id="channel-topic-select" aria-label="选择话题"></select><button id="refresh-channel-topics" type="button" class="icon-button" title="刷新话题列表" aria-label="刷新话题列表"><i data-lucide="refresh-cw"></i></button><span id="channel-topic-status" role="status"></span></div>');
+  }
+  if (!$("source_topic_id")) {
+    $("source_channel_url").closest("label").insertAdjacentHTML("afterend",
+      '<label id="source-topic-field" hidden>来源话题<select id="source_topic_id"><option value="0">请选择话题</option></select></label>');
+  }
+  // A running Python service may still hold the previous HTML template in memory.
+  if (!$("channel-transfer-filter")) {
+    const label = document.createElement("label");
+    label.className = "channel-transfer-filter";
+    label.innerHTML = icon("list-filter");
+    const select = document.createElement("select");
+    select.id = "channel-transfer-filter";
+    select.setAttribute("aria-label", "筛选消息处理状态");
+    for (const [value, title] of [["all", "全部状态"], ["new", "未下载"], ["downloaded", "已下载"], ["transferred", "已转存夸克"]]) {
+      select.add(new Option(title, value));
+    }
+    label.append(select);
+    $("channel-search").closest(".search-field").after(label);
+  }
+  if (!$("delete-cloud-task")) {
+    const button = document.createElement("button");
+    button.id = "delete-cloud-task";
+    button.type = "button";
+    button.className = "danger-button";
+    button.hidden = true;
+    button.innerHTML = `${icon("trash-2")}<span>删除云端文件</span>`;
+    $("retry-link").after(button);
+  }
+  if (!$("remove-record-task")) {
+    const button = document.createElement("button");
+    button.id = "remove-record-task";
+    button.type = "button";
+    button.className = "danger-button";
+    button.hidden = true;
+    button.innerHTML = `${icon("list-x")}移除记录`;
+    $("delete-cloud-task").after(button);
+  }
   const text = (id, value) => { const element = $(id); const next = String(value ?? ""); if (element.textContent !== next) element.textContent = next; };
   const finite = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
-  const statusInfo = (task, upload = false) => (upload ? uploadStates[task.upload_status] : downloadStates[task.download_status]) || ["状态未知", "gray"];
+  const deletionInfo = (task) => ({
+    deleting: ["正在删除云端文件", "amber"], pending: ["云端删除待确认", "amber"],
+    failed: ["云端删除失败", "red"], completed: ["云端已删除", "gray"]
+  }[task.cloud_delete_status]);
+  const deletionPending = (task) => ["deleting", "pending"].includes(task.cloud_delete_status);
+  const statusInfo = (task, upload = false) => (upload ? deletionInfo(task) || uploadStates[task.upload_status] : downloadStates[task.download_status]) || ["状态未知", "gray"];
   const taskName = (task) => String(task.remote_filename || task.rename_target || task.title || task.filename || `素材 ${task.id}`);
   const providerName = (value) => ({ local: "本地模拟", quark_browser: "夸克网页", quark_cli: "夸克 CLI / WSL", quark_api: "夸克 API" }[value] || value || "未提供");
   const uploadPhase = (task) => ({ hashing: "计算文件哈希", checking: "核对网盘文件", uploading: "上传中", merging: "合并分片", renaming: "应用中文名称", sharing: "生成分享链接" }[task.upload_phase] || "");
@@ -57,18 +117,38 @@
   const allTasks = () => [...state.tasks.values()];
   const channelName = (value) => String(value ?? "").replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "").replace(/\/.*$/, "").toLowerCase();
   const activeTask = () => state.tasks.get(state.active);
+  const isLibraryItem = (task) => !task.record_removed_at
+    && (task.download_status === "completed" || ["completed", "deleted"].includes(task.upload_status));
   const isUploadTask = (task) => task.download_status === "completed" || ["uploading", "link_pending", "completed", "local", "failed"].includes(task.upload_status);
-  const canUpload = (task) => !task.remote_device && (task.upload_status === "link_pending" || (task.download_status === "completed"
-    && (["waiting", "failed"].includes(task.upload_status) || (task.upload_status === "local" && ["quark_browser", "quark_cli", "quark_api"].includes(state.config?.upload_provider)))));
+  const canUpload = (task) => !task.remote_device && !deletionPending(task) && (task.upload_status === "link_pending" || (task.download_status === "completed"
+    && (["waiting", "failed", "deleted"].includes(task.upload_status) || (task.upload_status === "local" && ["quark_browser", "quark_cli", "quark_api"].includes(state.config?.upload_provider)))));
+  const canDeleteCloud = (task) => state.view === "library" && state.data?.cloud_delete_supported === true
+    && task && isLibraryItem(task) && !task.remote_device && task.upload_provider === "quark_api"
+    && task.upload_status === "completed" && Boolean(task.upload_remote_fid) && task.upload_remote_fid !== "0";
+  const canRemoveRecord = (task) => state.view === "library" && state.data?.record_remove_supported === true
+    && task && isLibraryItem(task) && !task.remote_device;
+  const removalBlocked = (task) => deletionPending(task) || ["queued", "downloading", "validating"].includes(task.download_status)
+    || ["uploading", "link_pending"].includes(task.upload_status);
+  const deleteCloudLabel = (task) => task.cloud_delete_status === "pending" ? "重新确认云端删除"
+    : task.cloud_delete_status === "failed" ? "重试删除云端文件" : "删除云端文件";
   const canRetry = (task) => !task.remote_device && retryable.has(task.download_status);
   const selectedUploadTasks = () => [...state.selected].map((id) => state.tasks.get(id)).filter((task) => task && canUpload(task));
   const isBusy = () => state.pending || !state.workbenchOK || Boolean(state.data?.running);
+  const channelDirectoryBusy = () => state.pending || !state.workbenchOK
+    || Boolean(state.data?.running && ["telegram-channels-scan", "channel-topics-scan"].includes(state.data.action));
+  const taskBelongsToPage = () => state.data?.running
+    && (state.view === "history" || pageActions[state.view]?.includes(state.data.action));
   const savedChannels = () => state.channels?.channels || [];
   const selectedChannel = () => savedChannels().find((row) => row.key === state.channels.active
     && row.key === channelName(state.config?.source_channel_url));
   const channelFor = (value) => savedChannels().find((row) => row.key === channelName(value));
   const channelLabel = (value) => channelFor(value)?.name || String(value || "未提供");
-  const canReadChannel = () => state.configLoaded && Boolean(selectedChannel());
+  const selectedTopic = () => (selectedChannel()?.topics || []).find((row) => row.topic_id === state.config?.source_topic_id
+    && row.topic_id === state.channels?.active_topic_id);
+  const selectedScope = () => selectedChannel() ? `${selectedChannel().key}${selectedChannel().forum && selectedTopic() ? `~${selectedTopic().topic_id}` : ""}` : "";
+  const sourceTitle = () => [selectedChannel()?.name, selectedTopic()?.title].filter(Boolean).join(" / ");
+  const canReadChannel = () => state.configLoaded && Boolean(selectedChannel())
+    && (!selectedChannel().forum || Boolean(selectedTopic()));
   const canLoadChannelMedia = () => state.configLoaded && state.workbenchOK && !state.pending
     && canReadChannel()
     && (!state.data?.running || state.data.channel_requests_open === true)
@@ -162,26 +242,27 @@
 
   function baseTasks(view = state.view) {
     if (view === "upload") return allTasks().filter(isUploadTask);
-    if (view === "library") return allTasks().filter((task) => task.download_status === "completed");
+    if (view === "library") return allTasks().filter(isLibraryItem);
     return allTasks();
   }
 
   function matchesStatus(task, status) {
     if (status === "all") return true;
     if (state.view === "upload") {
-      if (status === "waiting") return task.upload_status === "waiting" || task.upload_status === "local";
-      if (status === "active") return task.upload_status === "uploading";
-      if (status === "done") return task.upload_status === "completed";
-      return ["failed", "link_pending"].includes(task.upload_status);
+      if (status === "waiting") return ["waiting", "local", "deleted"].includes(task.upload_status);
+      if (status === "active") return task.upload_status === "uploading" || task.cloud_delete_status === "deleting";
+      if (status === "done") return task.upload_status === "completed" && !deletionPending(task);
+      return ["failed", "link_pending"].includes(task.upload_status) || ["pending", "failed"].includes(task.cloud_delete_status);
     }
     if (state.view === "library") {
       if (status === "pending") return task.validation !== "passed";
       if (status === "done") return task.validation === "passed";
-      return Boolean(task.share_url);
+      return task.upload_status !== "deleted" && !deletionPending(task) && Boolean(task.share_url);
     }
     if (status === "active") return ["queued", "downloading", "validating"].includes(task.download_status) || (state.view === "history" && task.upload_status === "uploading");
     if (status === "done") return task.download_status === "completed";
-    return retryable.has(task.download_status) || (state.view === "history" && ["failed", "link_pending"].includes(task.upload_status));
+    return retryable.has(task.download_status) || (state.view === "history"
+      && (["failed", "link_pending"].includes(task.upload_status) || ["pending", "failed"].includes(task.cloud_delete_status)));
   }
 
   function filteredTasks() {
@@ -263,14 +344,15 @@
     const row = document.createElement("article");
     row.className = "task";
     row.dataset.taskId = id;
-    row.innerHTML = `<input class="task-checkbox" type="checkbox"><button type="button" class="thumb-button" data-task-action="inspect"></button><div class="task-body"><div class="title-line"><button type="button" class="task-title" data-task-action="inspect"></button><span class="badge"></span></div><div class="task-sub"></div><div class="task-progress"></div><p class="error-note" hidden></p><button type="button" class="text-button row-retry" data-task-action="retry" hidden>${icon("rotate-cw")}重新下载</button><button type="button" class="text-button row-link" data-task-action="link" hidden>${icon("link")}重新获取链接</button></div><button type="button" class="task-tail" data-task-action="inspect" title="查看详情" aria-label="查看详情">${icon("chevron-right")}</button>`;
+    row.innerHTML = `<input class="task-checkbox" type="checkbox"><button type="button" class="thumb-button" data-task-action="inspect"></button><div class="task-body"><div class="title-line"><button type="button" class="task-title" data-task-action="inspect"></button><span class="badge"></span></div><span class="badge row-cloud-badge" hidden></span><div class="task-sub"></div><div class="task-progress"></div><p class="error-note" hidden></p><button type="button" class="text-button row-retry" data-task-action="retry" hidden>${icon("rotate-cw")}重新下载</button><button type="button" class="text-button row-link" data-task-action="link" hidden>${icon("link")}重新获取链接</button><button type="button" class="text-button danger-button row-delete-cloud" data-task-action="delete-cloud" hidden>${icon("trash-2")}<span>删除云端文件</span></button><button type="button" class="text-button danger-button row-remove-record" data-task-action="remove-record" hidden>${icon("list-x")}移除记录</button></div><button type="button" class="task-tail" data-task-action="inspect" title="查看详情" aria-label="查看详情">${icon("chevron-right")}</button>`;
     icons(row);
     return row;
   }
 
   function updateRow(row, task) {
     const id = String(task.id);
-    const upload = state.view === "upload" || (state.view === "history" && task.download_status === "completed");
+    const upload = state.view === "upload" || (state.view === "history" && task.download_status === "completed")
+      || (state.view === "library" && task.download_status !== "completed");
     const info = statusInfo(task, upload);
     row.classList.toggle("focused", state.active === id);
     row.classList.toggle("checked", state.selected.has(id));
@@ -284,20 +366,33 @@
     const badge = row.querySelector(".badge");
     badge.textContent = info[0];
     badge.className = `badge ${info[1]}`;
+    const cloudBadge = row.querySelector(".row-cloud-badge");
+    const cloudInfo = deletionInfo(task);
+    cloudBadge.hidden = upload || !cloudInfo;
+    cloudBadge.textContent = cloudInfo?.[0] || "";
+    cloudBadge.className = `badge row-cloud-badge ${cloudInfo?.[1] || ""}`;
     row.querySelector(".task-sub").textContent = [task.filename, task.chat ? channelLabel(task.chat) : "", task.remote_device ? "其他设备" : ""].filter(Boolean).join(" · ") || "来源未提供";
     const thumb = row.querySelector(".thumb-button");
     thumb.setAttribute("aria-label", `查看 ${taskName(task)} 的详情`);
     imageSlot(thumb, task.images?.[0]);
     html(row.querySelector(".task-progress"), progressMarkup(task, upload));
     const error = row.querySelector(".error-note");
-    error.hidden = !(task.error || task.naming_error);
-    error.textContent = redact(task.error || task.naming_error);
+    error.hidden = !(task.cloud_delete_error || task.error || task.naming_error);
+    error.textContent = redact(task.cloud_delete_error || task.error || task.naming_error);
     const retry = row.querySelector(".row-retry");
     retry.hidden = !canRetry(task);
     retry.disabled = isBusy();
     const link = row.querySelector(".row-link");
     link.hidden = task.remote_device || task.upload_status !== "link_pending";
     link.disabled = isBusy();
+    const remove = row.querySelector(".row-delete-cloud");
+    remove.hidden = !canDeleteCloud(task);
+    remove.disabled = isBusy();
+    remove.querySelector("span").textContent = deleteCloudLabel(task);
+    const removeRecord = row.querySelector(".row-remove-record");
+    removeRecord.hidden = !canRemoveRecord(task);
+    removeRecord.disabled = isBusy() || removalBlocked(task);
+    removeRecord.title = removalBlocked(task) ? "请先完成当前任务并确认云端结果" : "移除记录，保留本地文件和云端文件";
   }
 
   function renderFilters() {
@@ -357,10 +452,10 @@
       text("empty-title", "没有匹配的素材"); text("empty-description", "当前搜索或筛选下没有任务。");
     } else {
       text("empty-title", ({ download: "还没有下载任务", upload: "还没有可上传的素材", library: "素材库为空", history: "还没有任务记录" })[state.view]);
-      text("empty-description", ({ download: state.config?.source_channel_url ? "当前来源尚无任务记录。" : "尚未配置来源频道。", upload: "已下载的素材会显示在这里。", library: "下载完成的素材会显示在这里。", history: "运行日志显示在下方。" })[state.view]);
+      text("empty-description", ({ download: state.config?.source_channel_url ? "当前来源尚无任务记录。" : "尚未配置来源频道。", upload: "已下载的素材会显示在这里。", library: "暂无下载成功或上传成功的素材。", history: "运行日志显示在下方。" })[state.view]);
     }
     text("result-count", state.data ? `${tasks.length} / ${baseTasks().length} 个素材` : "—");
-    text("queue-status", state.view === "upload" ? "待校验素材将在上传前校验" : state.view === "library" ? "已下载文件" : state.data?.running ? "任务运行中" : state.data ? "当前空闲" : "状态未知");
+    text("queue-status", state.view === "upload" ? "待校验素材将在上传前校验" : state.view === "library" ? "已收录素材" : state.data?.running ? "任务运行中" : state.data ? "当前空闲" : "状态未知");
     renderSelection(tasks);
     renderInspector();
   }
@@ -422,32 +517,41 @@
     text("detail-validation", validationName(task)); text("detail-upload", statusInfo(task, true)[0]);
     text("detail-path", task.remote_device ? "文件位于其他设备" : task.local_path || "暂无本地路径"); text("detail-provider", providerName(task.upload_provider));
     text("detail-updated", updated(task.updated_at));
-    html($("detail-progress"), progressMarkup(task, state.view === "upload" || task.upload_status === "uploading" || task.upload_status === "link_pending"));
-    text("detail-error", redact(task.error || task.naming_error)); $("detail-error").hidden = !(task.error || task.naming_error);
+    html($("detail-progress"), progressMarkup(task, state.view === "upload" || task.upload_status === "uploading"
+      || task.upload_status === "link_pending" || state.view === "library" && task.download_status !== "completed"));
+    text("detail-error", redact(task.cloud_delete_error || task.error || task.naming_error));
+    $("detail-error").hidden = !(task.cloud_delete_error || task.error || task.naming_error);
     const source = externalURL(task.source_url);
     $("source-link").hidden = !source;
     if (source) $("source-link").href = source; else $("source-link").removeAttribute("href");
-    const share = externalURL(task.share_url);
+    const share = task.upload_status === "deleted" || deletionPending(task) ? "" : externalURL(task.share_url);
     $("share-result").hidden = !share;
     text("share-link", share);
     if (share) $("share-link").href = share; else $("share-link").removeAttribute("href");
     $("open-task").hidden = !task.local_path; $("open-task").disabled = state.pending || !state.workbenchOK;
     $("retry-task").hidden = !canRetry(task); $("retry-task").disabled = isBusy();
     $("retry-link").hidden = task.remote_device || task.upload_status !== "link_pending"; $("retry-link").disabled = isBusy();
+    $("delete-cloud-task").hidden = !canDeleteCloud(task); $("delete-cloud-task").disabled = isBusy();
+    $("delete-cloud-task").querySelector("span").textContent = deleteCloudLabel(task);
+    $("remove-record-task").hidden = !canRemoveRecord(task);
+    $("remove-record-task").disabled = isBusy() || removalBlocked(task);
+    $("remove-record-task").title = removalBlocked(task) ? "请先完成当前任务并确认云端结果" : "移除记录，保留本地文件和云端文件";
   }
 
   function renderMetrics() {
     const tasks = allTasks();
     let metrics;
     if (state.view === "upload") metrics = [
-      ["待上传素材", tasks.filter((task) => task.download_status === "completed" && ["waiting", "local"].includes(task.upload_status)).length, "个已下载文件", ""],
+      ["待上传素材", tasks.filter((task) => task.download_status === "completed" && ["waiting", "local", "deleted"].includes(task.upload_status)).length, "个已下载文件", ""],
       ["正在上传", tasks.filter((task) => task.upload_status === "uploading").length, "个任务", "green"],
-      ["上传已完成", tasks.filter((task) => task.upload_status === "completed").length, "个素材", ""],
-      ["需要处理", tasks.filter((task) => ["failed", "link_pending"].includes(task.upload_status)).length, "个任务", "amber"]
+      ["上传已完成", tasks.filter((task) => task.upload_status === "completed" && !deletionPending(task)).length, "个素材", ""],
+      ["需要处理", tasks.filter((task) => ["failed", "link_pending"].includes(task.upload_status)
+        || ["pending", "failed"].includes(task.cloud_delete_status)).length, "个任务", "amber"]
     ];
     else if (state.view === "library") metrics = [
-      ["已下载素材", baseTasks().length, "个文件", ""], ["已校验", baseTasks().filter((task) => task.validation === "passed").length, "个文件", "green"],
-      ["待校验", baseTasks().filter((task) => task.validation !== "passed").length, "个文件", "amber"], ["有分享链接", baseTasks().filter((task) => externalURL(task.share_url)).length, "个素材", ""]
+      ["素材总数", baseTasks().length, "个文件", ""], ["已校验", baseTasks().filter((task) => task.validation === "passed").length, "个文件", "green"],
+      ["待校验", baseTasks().filter((task) => task.validation !== "passed").length, "个文件", "amber"],
+      ["有分享链接", baseTasks().filter((task) => task.upload_status !== "deleted" && !deletionPending(task) && externalURL(task.share_url)).length, "个素材", ""]
     ];
     else {
       const downloading = tasks.filter((task) => task.download_status === "downloading");
@@ -456,29 +560,105 @@
       metrics = [["任务总数", tasks.length, "个素材文件", ""],
         ["实时下载速度", speedKnown ? `${bytes(downloading.reduce((sum, task) => sum + task.speed, 0))}/s` : "—", "", "green"],
         ["已接收数据", received.length ? bytes(received.reduce((sum, task) => sum + task.received, 0)) : "—", received.length && received.length !== tasks.length ? "已知接收量" : "", ""],
-        ["需要处理", tasks.filter((task) => retryable.has(task.download_status) || (state.view === "history" && ["failed", "link_pending"].includes(task.upload_status))).length, "个任务", "amber"]];
+        ["需要处理", tasks.filter((task) => retryable.has(task.download_status) || (state.view === "history"
+          && (["failed", "link_pending"].includes(task.upload_status) || ["pending", "failed"].includes(task.cloud_delete_status)))).length, "个任务", "amber"]];
     }
     html($("metrics"), metrics.map(([label, value, unit, tone]) => `<div class="metric ${tone}"><div class="metric-label">${label}</div><div class="metric-value">${escape(state.data ? value : "—")}<small>${unit}</small></div></div>`).join(""));
   }
 
+  function catalogChannel(value) {
+    const key = channelName(value).trim();
+    if (!key) return "";
+    const channel = savedChannels().find((row) => row.key === key || channelName(row.username) === key
+      || Number.isSafeInteger(row.id) && row.id > 0 && String(-(1000000000000 + row.id)) === key);
+    return channel?.id > 0 ? String(-(1000000000000 + channel.id)) : key;
+  }
+
+  function catalogTasks(message) {
+    if (!catalogTaskIndex) {
+      catalogTaskIndex = new Map();
+      for (const task of allTasks()) {
+        const key = `${catalogChannel(task.chat)}:${Number(task.message_id)}`;
+        if (!catalogTaskIndex.has(key)) catalogTaskIndex.set(key, []);
+        catalogTaskIndex.get(key).push(task);
+      }
+    }
+    return catalogTaskIndex.get(`${catalogChannel(message.chat)}:${message.message_id}`) || [];
+  }
+
   function catalogTask(message) {
-    const tasks = allTasks().filter((task) => !task.remote_device && Number(task.message_id) === message.message_id
-      && channelName(task.chat) === channelName(message.chat));
+    const tasks = catalogTasks(message).filter((task) => !task.remote_device);
     return tasks.find((task) => task.download_status === "completed")
       || tasks.find((task) => ["queued", "downloading", "validating"].includes(task.download_status))
       || tasks[0];
   }
 
+  function catalogTransfer(message) {
+    const tasks = catalogTasks(message);
+    const downloaded = tasks.find((task) => !task.remote_device && task.download_status === "completed")
+      || tasks.find((task) => task.download_status === "completed");
+    const cloudTasks = tasks.filter((task) => ["quark_api", "quark_cli", "quark_browser"].includes(task.upload_provider));
+    const deleted = cloudTasks.find((task) => task.upload_status === "deleted");
+    const deletedBindings = new Set(cloudTasks.filter((task) => task.upload_status === "deleted")
+      .map((task) => `${task.upload_target}:${task.upload_remote_fid}`));
+    const uploaded = cloudTasks.find((task) => task.upload_status === "completed" && !deletionPending(task)
+      && !(task.upload_remote_fid && deletedBindings.has(`${task.upload_target}:${task.upload_remote_fid}`)));
+    const deleting = cloudTasks.find(deletionPending);
+    const uploading = cloudTasks.find((task) => ["uploading", "link_pending", "failed"].includes(task.upload_status));
+    return { downloaded, uploaded, uploading, deleting, deleted, task: catalogTask(message) || uploaded || downloaded || tasks[0] };
+  }
+
+  function catalogBadges(message) {
+    const transfer = catalogTransfer(message);
+    const badges = [];
+    const badge = (label, tone, symbol, title = label) =>
+      `<span class="badge ${tone}" title="${escape(title)}">${icon(symbol)}${escape(label)}</span>`;
+    if (transfer.downloaded) {
+      const remote = transfer.downloaded.remote_device;
+      badges.push(badge(remote ? "已下载 · 其他设备" : "已下载", "", "circle-check",
+        remote ? "其他设备的已完成下载记录，本机可另行下载" : "本机的已完成下载记录"));
+    }
+    const local = catalogTask(message);
+    if (!transfer.downloaded || local && local.download_status !== "completed") {
+      const status = local ? statusInfo(local) : ["未下载", "gray"];
+      badges.push(badge(status[0], status[1], "arrow-down-to-line"));
+    }
+    if (transfer.uploaded) {
+      badges.push(badge("已转存夸克", "", "cloud-check", "夸克上传已完成，记录已确认"));
+    } else if (transfer.deleting) {
+      badges.push(badge("云端删除待确认", "amber", "cloud-alert"));
+    } else if (transfer.deleted) {
+      badges.push(badge("云端已删除", "gray", "cloud-off"));
+    } else if (transfer.uploading) {
+      const status = ({ uploading: ["转存中", ""], link_pending: ["转存待确认", "amber"],
+        failed: ["转存失败", "red"] })[transfer.uploading.upload_status];
+      badges.push(badge(status[0], status[1], "cloud-upload"));
+    }
+    return badges.join("");
+  }
+
   function visibleChannelMessages() {
     if (!canReadChannel()) return [];
     const query = $("channel-search").value.trim().toLocaleLowerCase();
-    return (state.catalog?.messages || []).filter((message) => !query
-      || [message.filename, message.text, message.message_id].some((value) => String(value ?? "").toLocaleLowerCase().includes(query)));
+    const filter = $("channel-transfer-filter").value;
+    return (state.catalog?.messages || []).filter((message) => {
+      if (query && ![message.filename, message.text, message.message_id]
+        .some((value) => String(value ?? "").toLocaleLowerCase().includes(query))) return false;
+      const transfer = catalogTransfer(message);
+      return filter === "all" || filter === "new" && !transfer.downloaded && !transfer.uploaded
+        || filter === "downloaded" && Boolean(transfer.downloaded)
+        || filter === "transferred" && Boolean(transfer.uploaded);
+    });
+  }
+
+  function locallyDownloadableMessage(message) {
+    const status = catalogTask(message)?.download_status;
+    return !["completed", "queued", "downloading", "validating"].includes(status);
   }
 
   function downloadableMessage(message) {
-    const status = catalogTask(message)?.download_status;
-    return !["completed", "queued", "downloading", "validating"].includes(status);
+    const transfer = catalogTransfer(message);
+    return !transfer.downloaded && !transfer.uploaded && locallyDownloadableMessage(message);
   }
 
   function seriesLabel(message) {
@@ -539,15 +719,27 @@
 
   const prefetchedPictures = new Set();
   let prefetchTimer = null;
+  let prefetchKey = "";
+  const canPrefetchPictures = () => state.view === "messages" && !document.hidden
+    && state.data?.running && state.data.channel_requests_open && !state.data.stop_requested
+    && ["channel-scan", "channel-download"].includes(state.data.action)
+    && !state.pending && !state.previewRequested.size && !$("channel-preview-dialog").open;
+
   function schedulePicturePrefetch() {
+    const candidates = canPrefetchPictures() ? visibleChannelMessages().filter((m) => m.cover_url).slice(0, 3) : [];
+    const candidate = candidates.find((m) => !m.full_cover_url && m.full_status !== "loading"
+      && !prefetchedPictures.has(`${state.catalog?.channel}:${m.message_id}`));
+    const key = candidate ? `${state.catalog?.channel}:${candidate.message_id}` : "";
+    if (prefetchTimer && key === prefetchKey) return;
     clearTimeout(prefetchTimer);
-    if (state.view !== "messages" || document.hidden || state.data?.running || state.pending || state.previewRequested.size) return;
-    const candidates = visibleChannelMessages().filter((m) => m.cover_url).slice(0, 3);
-    const candidate = candidates.find((m) => !m.full_cover_url && !prefetchedPictures.has(`${state.catalog?.channel}:${m.message_id}`));
+    prefetchTimer = null;
+    prefetchKey = key;
     if (!candidate) return;
     prefetchTimer = setTimeout(async () => {
-      if (state.view !== "messages" || document.hidden || state.data?.running || state.pending || $("channel-preview-dialog").open) return;
-      prefetchedPictures.add(`${state.catalog?.channel}:${candidate.message_id}`);
+      prefetchTimer = null;
+      prefetchKey = "";
+      if (!canPrefetchPictures()) return;
+      prefetchedPictures.add(key);
       try { await post("/api/channel-cover", { id: candidate.message_id, prefetch: true }); } catch (_) { /* Click remains available for retry. */ }
     }, 1500);
   }
@@ -565,21 +757,24 @@
       if (!message || !downloadableMessage(message)) state.catalogSelection.delete(id);
     }
     text("channel-selected-count", state.catalogSelection.size ? `已选择 ${state.catalogSelection.size} 条` : "未选择");
-    $("channel-select-all").checked = rows.length > 0 && rows.filter(downloadableMessage).every((message) => state.catalogSelection.has(message.message_id));
-    $("channel-select-all").disabled = !canSelect || !rows.some(downloadableMessage);
+    const selectable = rows.filter(downloadableMessage);
+    $("channel-select-all").checked = selectable.length > 0 && selectable.every((message) => state.catalogSelection.has(message.message_id));
+    $("channel-select-all").disabled = !canSelect || !selectable.length;
     $("channel-download-selected").disabled = !canAct || !selected.length;
     $("channel-load-older").hidden = !state.catalog?.has_more || !state.catalog?.oldest_scanned_id;
     $("channel-load-older").disabled = !canScan;
-    text("channel-result-count", state.catalog ? `${rows.length} / ${state.catalog.messages.length} 条压缩包消息` : "等待频道消息");
+    const transfers = (state.catalog?.messages || []).map(catalogTransfer);
+    text("channel-result-count", state.catalog ? `${rows.length} / ${state.catalog.messages.length} 条压缩包消息 · 已下载 ${transfers.filter((item) => item.downloaded).length} · 已转存 ${transfers.filter((item) => item.uploaded).length}` : "等待频道消息");
     const showEmpty = !rows.length;
     $("channel-empty").hidden = !showEmpty;
     $("channel-empty-action").hidden = loading || !canReadChannel() || Boolean(state.catalog?.messages.length);
     $("channel-empty-action").disabled = !canScan;
     if (showEmpty) {
       text("channel-empty-title", !savedChannels().length ? "尚未保存频道"
+        : selectedChannel()?.forum && !selectedTopic() ? "请选择话题分区"
         : !canReadChannel() ? "尚未选择频道"
         : state.catalog?.messages.length ? "没有匹配的消息" : loading ? "正在读取消息" : state.catalog?.scanned_at ? "未找到 ZIP/RAR 消息" : "尚未获取频道消息");
-      text("channel-empty-detail", state.catalog?.messages.length ? "试试其他文件名或消息 ID。" : "");
+      text("channel-empty-detail", state.catalog?.messages.length ? "试试其他文件名、消息 ID 或处理状态。" : "");
     }
     const list = $("channel-message-list");
     const visible = new Set(rows.map((message) => message.message_id));
@@ -607,18 +802,22 @@
       cover.title = message.cover_url ? "放大图片" : pending ? "封面加载中" : message.cover_status === "failed" ? "重新加载图片" : "暂无配图";
       cover.setAttribute("aria-label", `${message.filename}：${cover.title}`);
       imageSlot(cover, { url: message.cover_url || "", name: message.filename, pending });
-      const task = catalogTask(message);
-      const status = task ? statusInfo(task) : ["未下载", "gray"];
+      const transfer = catalogTransfer(message);
+      const task = transfer.task;
+      const share = externalURL(transfer.uploaded?.share_url);
+      const downloadLabel = (transfer.downloaded || transfer.uploaded) && locallyDownloadableMessage(message)
+        ? "下载到本机" : "下载";
       const source = externalURL(message.source_url);
       const caption = String(message.text || "").trim().slice(0, 280);
       html(row.querySelector(".channel-message-body"), `
-          <div class="channel-message-head"><h2>${escape(message.filename)}</h2><span class="badge ${status[1]}">${escape(status[0])}</span></div>
+          <div class="channel-message-head"><h2>${escape(message.filename)}</h2><div class="channel-message-badges">${catalogBadges(message)}</div></div>
           <div class="channel-message-meta"><span>消息 #${id}</span><span>${escape(bytes(message.size))}</span><time>${escape(updated(message.date))}</time>${message.series ? `<span class="cover-quality">${escape(seriesLabel(message))}</span>` : ""}${message.cover_url ? `<span class="cover-quality">${message.cover_quality === "full" ? "高清图" : message.cover_quality === "preview" ? "预览图" : "缩略图"}</span>` : ""}</div>
           ${caption ? `<p class="channel-caption">${escape(caption)}</p>` : ""}
           <div class="channel-message-actions">
-            <button type="button" data-channel-action="download" ${!canAct || !downloadableMessage(message) ? "disabled" : ""}>${icon("arrow-down-to-line")}下载</button>
+            <button type="button" data-channel-action="download" ${!canAct || !locallyDownloadableMessage(message) ? "disabled" : ""}>${icon("arrow-down-to-line")}${downloadLabel}</button>
+            ${share ? `<a class="button" href="${escape(share)}" target="_blank" rel="noopener noreferrer">${icon("cloud")}查看夸克</a>` : ""}
             ${source ? `<a class="button" href="${escape(source)}" target="_blank" rel="noopener noreferrer">${icon("external-link")}原消息</a>` : ""}
-            ${task ? `<button type="button" class="text-button" data-channel-action="task">${icon("list-checks")}下载任务</button>` : ""}
+            ${task ? `<button type="button" class="text-button" data-channel-action="task">${icon("list-checks")}任务记录</button>` : ""}
           </div>
       `);
     });
@@ -635,6 +834,7 @@
     text("channel-selected-title", current?.name || (rows.length ? "选择频道" : "尚未保存频道"));
     text("channel-active-hint", current ? channelSubtitle(current) : rows.length ? `${rows.length} 个已保存频道` : "");
     html($("channel-selected-avatar"), avatarMarkup(current));
+    renderTopicSwitcher();
     if (select.disabled && state.pickerOpen) closeChannelPicker(false);
     renderChannelOptions();
     const joined = state.joinedChannels;
@@ -647,12 +847,41 @@
       : joined?.stage === "completed" ? `获取 ${joined.found || 0} 个 · 新增 ${joined.added || 0} 个 · 更新 ${joined.updated || 0} 个${joined.scanned_at ? ` · ${updated(joined.scanned_at)}` : ""}`
       : "");
     $("scan-joined-channels").disabled = isBusy() || !state.configLoaded || scanning;
+    $("scan-joined-channels").title = state.data?.running && !scanning
+      ? `正在${actionLabels[state.data.action] || "执行其他任务"}，结束后可获取账号频道` : "";
     html($("scan-joined-channels"), `${icon(scanning ? "loader-circle" : "radio-tower")}${scanning ? "获取中" : joined?.stage === "completed" ? "重新获取频道" : "获取账号频道"}`);
     $("scan-joined-channels").querySelector(".lucide")?.classList.toggle("loading-spinner", Boolean(scanning));
   }
 
   function channelSubtitle(row) {
-    return row.username ? `@${row.username}` : `私有频道 · ${row.key}`;
+    const kind = row.forum ? "话题群组" : row.kind === "supergroup" ? "超级群组" : "频道";
+    return row.username ? `${kind} · @${row.username}` : `私有${kind} · ${row.key}`;
+  }
+
+  function topicScanLabel(key) {
+    const scan = state.data?.telegram_topics;
+    if (state.topicScanRequested === key || scan?.channel === key && scan.stage === "loading") return "正在获取话题";
+    if (scan?.channel === key && scan.stage === "failed") return `获取失败：${redact(scan.error || "请重试")}；原列表保留`;
+    if (scan?.channel === key && scan.stage === "cancelled") return "获取已停止，原列表保留";
+    const row = channelFor(key);
+    return row?.topics_scanned_at ? `${row.topics?.length || 0} 个话题 · ${updated(row.topics_scanned_at)}` : "尚未获取话题";
+  }
+
+  function topicOptions(row) {
+    return '<option value="0">请选择话题</option>' + (row?.topics || []).map((topic) =>
+      `<option value="${topic.topic_id}">${escape(topic.title)}${topic.closed ? " · 已关闭" : ""}${topic.hidden ? " · 已隐藏" : ""}</option>`).join("");
+  }
+
+  function renderTopicSwitcher() {
+    const row = selectedChannel();
+    $("channel-topic-bar").hidden = !row?.forum;
+    if (!row?.forum) return;
+    const select = $("channel-topic-select");
+    html(select, topicOptions(row));
+    select.value = String(selectedTopic()?.topic_id || 0);
+    select.disabled = isBusy();
+    $("refresh-channel-topics").disabled = isBusy();
+    text("channel-topic-status", topicScanLabel(row.key));
   }
 
   function avatarMarkup(row) {
@@ -783,15 +1012,17 @@
   function renderHeader() {
     const data = state.data;
     const source = state.config?.source_channel_url;
-    const subtitle = ({ messages: selectedChannel()?.name || "已保存频道", download: source ? channelLabel(source) : "尚未配置来源频道", upload: data?.upload_target || "上传目标尚未读取", library: "本地已下载素材", history: "任务状态与运行日志", channels: `${savedChannels().length} 个已保存频道`, settings: "本地配置" })[state.view];
+    const subtitle = ({ messages: sourceTitle() || "已保存频道", download: source ? sourceTitle() || channelLabel(source) : "尚未配置来源频道", upload: data?.upload_target || "上传目标尚未读取", library: "已下载或已上传的素材", history: "任务状态与运行日志", channels: `${savedChannels().length} 个已保存频道`, settings: "本地配置" })[state.view];
     text("page-subtitle", state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
-    text("download-source", source ? channelLabel(source) : state.configLoaded ? "尚未配置来源频道" : "来源配置尚未读取");
+    text("download-source", source ? sourceTitle() || channelLabel(source) : state.configLoaded ? "尚未配置来源频道" : "来源配置尚未读取");
     text("upload-target", data?.upload_target || "未配置");
-    const connectionLabel = !state.workbenchOK ? state.errors.has("workbench") ? "接口连接失败" : "正在读取状态" : data.running ? "任务运行中" : "工作台可用";
+    const runningLabel = actionLabels[data?.action] || "执行任务";
+    const connectionLabel = !state.workbenchOK ? state.errors.has("workbench") ? "接口连接失败" : "正在读取状态"
+      : data.running ? `${taskBelongsToPage() ? "正在" : "后台正在"}${runningLabel}` : "工作台可用";
     $("connection").querySelector("span:last-child").textContent = connectionLabel;
     $("connection").querySelector(".status-dot").className = `status-dot ${!state.workbenchOK ? state.errors.has("workbench") ? "error" : "unknown" : data.running ? "busy" : ""}`;
-    const actionLabels = { download: "下载", upload: "上传", "channel-scan": "获取频道消息", "telegram-channels-scan": "获取账号频道", "channel-download": "下载选中消息", "channel-cover": "加载高清图", "browser-check": "检查浏览器", "telegram-api-login": "Telegram API 登录", "quark-login": "夸克网页登录", "quark-cli-login": "夸克 CLI 登录", "quark-cli-check": "检查夸克 CLI", "quark-api-check": "检查夸克 API" };
-    $("connection").title = data?.running && data.action ? actionLabels[String(data.action).replace(/^\/api\//, "")] || redact(data.action) : connectionLabel;
+    $("connection").title = connectionLabel;
+    $("connection").setAttribute("aria-label", connectionLabel);
     $("download").hidden = state.view !== "download";
     $("download").disabled = isBusy() || !state.configLoaded || Boolean(source && !canReadChannel());
     $("scan-channel").hidden = state.view !== "messages";
@@ -799,8 +1030,12 @@
     const scanning = state.scanRequested || data?.running && data.action === "channel-scan";
     html($("scan-channel"), `${icon(scanning ? "loader-circle" : "messages-square")}${scanning ? "获取中" : "获取频道消息"}`);
     $("scan-channel").querySelector(".lucide")?.classList.toggle("loading-spinner", Boolean(scanning));
-    $("stop").hidden = !data?.running;
-    $("stop").disabled = state.pending || !state.workbenchOK;
+    $("stop").hidden = !taskBelongsToPage();
+    $("stop").disabled = state.pending || !state.workbenchOK || !data?.task_id || Boolean(data?.stop_requested);
+    $("stop").dataset.taskId = data?.task_id || "";
+    $("stop").dataset.action = data?.action || "";
+    html($("stop"), `${icon("square")}${data?.stop_requested ? "正在停止" : `停止${runningLabel}`}`);
+    $("stop").title = data?.running && !data.task_id ? "请重启本地程序后再停止任务" : `停止${runningLabel}`;
     $("open-downloads").hidden = !["download", "library", "settings"].includes(state.view);
     $("open-downloads").disabled = state.pending || (!data && !state.configLoaded);
     const cloudURL = externalURL(data?.upload_target);
@@ -811,8 +1046,8 @@
     $("open-naming").disabled = isBusy() || !allTasks().some((task) => task.download_status === "completed" && !task.remote_device);
     $("edit-channel").hidden = state.view !== "channels";
     $("add-channel").hidden = state.view !== "channels";
-    $("add-channel").disabled = isBusy();
-    $("channel-add-section").disabled = isBusy();
+    $("add-channel").disabled = channelDirectoryBusy();
+    $("channel-add-section").disabled = channelDirectoryBusy();
     $("destination").hidden = state.view !== "upload";
     $("download-settings").hidden = state.view !== "download";
     for (const id of ["save-config", "telegram-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "browser-check"]) $(id).disabled = isBusy() || !state.configLoaded;
@@ -824,7 +1059,7 @@
     text("nav-download", data ? state.tasks.size : "—");
     text("nav-messages", state.catalog ? state.catalog.messages.length : "—");
     text("nav-upload", data ? allTasks().filter(isUploadTask).length : "—");
-    text("nav-library", data ? allTasks().filter((task) => task.download_status === "completed").length : "—");
+    text("nav-library", data ? allTasks().filter(isLibraryItem).length : "—");
     const disk = data?.disk;
     const diskKnown = disk && finite(disk.free) && finite(disk.total) && disk.total > 0 && disk.free <= disk.total;
     $("disk-track").hidden = !diskKnown;
@@ -852,16 +1087,26 @@
       const current = row.key === active;
       const link = externalURL(row.url);
       const count = allTasks().filter((task) => channelName(task.chat) === row.key).length;
+      const expanded = state.expandedTopics.has(row.key);
       return `<div class="channel-row saved-channel-row${current ? " active" : ""}">
-        <div class="saved-channel-info"><span class="channel-avatar avatar-tone-${Number(row.id || 0) % 4}" aria-hidden="true">${avatarMarkup(row)}</span><div><h3>${escape(row.name)}${current ? ' <span class="badge">当前</span>' : ""}</h3><p>${escape(channelSubtitle(row))} · ${count} 个素材</p></div></div>
+        <div class="saved-channel-info">${row.forum ? `<button class="icon-button topic-expand" type="button" data-channel-management="topics" data-channel-key="${escape(row.key)}" aria-label="${expanded ? "收起" : "展开"} ${escape(row.name)} 的话题" aria-expanded="${expanded}" title="${expanded ? "收起" : "展开"}话题">${icon(expanded ? "chevron-down" : "chevron-right")}</button>` : ""}<span class="channel-avatar avatar-tone-${Number(row.id || 0) % 4}" aria-hidden="true">${avatarMarkup(row)}</span><div><h3>${escape(row.name)}${current ? ' <span class="badge">当前</span>' : ""}</h3><p>${escape(channelSubtitle(row))} · ${count} 个素材</p></div></div>
         <div class="channel-actions">
           ${current ? `<button type="button" disabled>${icon("check")}当前频道</button>` : `<button type="button" data-channel-management="select" data-channel-key="${escape(row.key)}" ${isBusy() ? "disabled" : ""}>${icon("radio-tower")}切换</button>`}
           ${count ? `<button type="button" data-channel="${escape(row.key)}">${icon("list-checks")}任务</button>` : ""}
           ${link ? `<a class="button" href="${escape(link)}" target="_blank" rel="noopener noreferrer">${icon("external-link")}打开</a>` : ""}
-          <button type="button" data-channel-management="edit" data-channel-key="${escape(row.key)}" ${isBusy() ? "disabled" : ""}>${icon("pencil")}编辑</button>
-          <button type="button" data-channel-management="remove" data-channel-key="${escape(row.key)}" ${current || isBusy() ? "disabled" : ""}>${icon("trash-2")}删除</button>
+          <button type="button" data-channel-management="edit" data-channel-key="${escape(row.key)}" ${channelDirectoryBusy() ? "disabled" : ""}>${icon("pencil")}编辑</button>
+          <button type="button" data-channel-management="remove" data-channel-key="${escape(row.key)}" ${current || channelDirectoryBusy() ? "disabled" : ""}>${icon("trash-2")}删除</button>
         </div>
-      </div>`;
+      </div>${row.forum && expanded ? `<div class="topic-children" data-topic-parent="${escape(row.key)}">
+        <div class="topic-toolbar"><button type="button" data-channel-management="refresh-topics" data-channel-key="${escape(row.key)}" ${isBusy() ? "disabled" : ""}>${icon("refresh-cw")}刷新话题</button><span class="channel-topic-status" role="status">${escape(topicScanLabel(row.key))}</span></div>
+        ${(row.topics || []).map((topic) => {
+          const selected = current && selectedTopic()?.topic_id === topic.topic_id;
+          return `<div class="topic-row${selected ? " active" : ""}" data-topic-id="${topic.topic_id}">
+            <div class="topic-copy">${icon("hash")}<strong>${escape(topic.title)}</strong><small>#${topic.topic_id}${topic.closed ? " · 已关闭" : ""}${topic.hidden ? " · 已隐藏" : ""}</small></div>
+            <button type="button" data-channel-management="select" data-channel-key="${escape(row.key)}" data-topic-id="${topic.topic_id}" ${selected || isBusy() ? "disabled" : ""}>${icon(selected ? "check" : "arrow-right")}${selected ? "当前话题" : "选择"}</button>
+          </div>`;
+        }).join("")}
+      </div>` : ""}`;
     }).join("") : '<div class="empty-state compact"><p>暂无已保存频道</p></div>');
   }
 
@@ -875,6 +1120,12 @@
       input.dataset.options = options;
     }
     input.value = savedChannels().find((row) => row.key === channelName(selected))?.url || "";
+    const parent = channelFor(input.value);
+    const topic = $("source_topic_id");
+    const topicId = state.configDirty ? Number(topic.value) : state.config?.source_topic_id || 0;
+    html(topic, topicOptions(parent));
+    topic.value = String(parent?.topics?.some((row) => row.topic_id === topicId) ? topicId : 0);
+    $("source-topic-field").hidden = !parent?.forum;
   }
 
   function renderDataSync() {
@@ -886,7 +1137,7 @@
       sync.last_sync ? `最近同步 ${updated(sync.last_sync)}` : "", sync.error || ""].filter(Boolean).join(" · ") : "未启用");
     $("data-sync-now").disabled = state.pending || !sync?.enabled || sync.stage === "syncing";
     $("data-sync-conflicts").hidden = !sync?.conflicts;
-    const kinds = {channels: "频道", messages: "消息", cursors: "读取游标", tasks: "任务"};
+    const kinds = {channels: "频道", topics: "话题", messages: "消息", cursors: "读取游标", tasks: "任务"};
     html($("data-sync-conflict-list"), (sync?.conflict_rows || []).map((row) =>
       `<div class="sync-conflict"><strong>${escape(kinds[row.kind] || row.kind)} · ${escape(row.key)}</strong>
       ${row.local_deleted || row.server_deleted ? `<p>${row.local_deleted ? "本机已删除" : "服务器已删除"}</p>` : ""}
@@ -991,6 +1242,11 @@
     if (!views[view]) view = "download";
     state.scroll[state.view] = window.scrollY;
     state.view = view;
+    if (view !== "messages") {
+      clearTimeout(prefetchTimer);
+      prefetchTimer = null;
+      prefetchKey = "";
+    }
     closeChannelPicker(false);
     closeInspector();
     if (push) { const url = new URL(location.href); url.searchParams.set("view", view); history.pushState({}, "", url); }
@@ -1052,9 +1308,14 @@
         }
         state.data = data;
         state.tasks = tasks;
+        catalogTaskIndex = null;
         state.workbenchOK = true;
         state.lastSync = new Date();
         for (const id of state.selected) if (!tasks.has(id)) state.selected.delete(id);
+        if (state.active && !tasks.has(state.active)) {
+          state.active = null;
+          closeInspector();
+        }
         setError("workbench", ""); setError("backend", data.error ? `任务错误：${redact(data.error)}` : "");
         if (state.browserRefreshPending && !data.running) {
           state.browserRefreshPending = false;
@@ -1080,7 +1341,7 @@
       try {
         const data = await request("/api/channel-messages");
         if (!Array.isArray(data.messages) || typeof data.channel !== "string") throw new Error("/api/channel-messages：消息列表无效");
-        if (revision !== state.channelRevision || !canReadChannel() || data.channel !== selectedChannel()?.key) return;
+        if (revision !== state.channelRevision || !canReadChannel() || data.channel !== selectedScope()) return;
         if (state.catalog?.channel !== data.channel) {
           state.catalogSelection.clear();
           for (const row of state.catalogRows.values()) row.remove();
@@ -1100,9 +1361,12 @@
       try {
         const data = await request("/api/channels");
         if (!data || !Array.isArray(data.channels) || typeof data.active !== "string") throw new Error("/api/channels：频道列表无效");
-        if (state.channels && state.channels.active !== data.active) clearChannelView();
+        if (state.channels && (state.channels.active !== data.active
+          || (state.channels.active_topic_id || 0) !== (data.active_topic_id || 0))) clearChannelView();
         state.channels = data;
-        if (state.configLoaded && channelName(state.config?.source_channel_url) !== data.active && !state.configDirty) await loadConfig();
+        catalogTaskIndex = null;
+        if (state.configLoaded && !state.configDirty && (channelName(state.config?.source_channel_url) !== data.active
+          || (state.config?.source_topic_id || 0) !== (data.active_topic_id || 0))) await loadConfig();
         setError("channels", "");
       } catch (error) { setError("channels", error.message, "channels"); }
       render();
@@ -1174,6 +1438,14 @@
       required.add("quark_api_parent_fid");
       if (!state.quarkConfigured) required.add("quark_cookie");
     }
+    const database = $("data_server_backend").value !== "http";
+    $("data-db-fields").hidden = !database;
+    $("data-http-fields").hidden = database;
+    $("data-db-check").hidden = !database;
+    if (database && $("data_server_enabled").checked) {
+      for (const id of ["data_server_db_host", "data_server_db_port", "data_server_db_name", "data_server_db_user"]) required.add(id);
+      if (!state.dataPasswordConfigured) required.add("data_server_db_password");
+    }
     for (const id of formFields) {
       $(id).required = required.has(id);
       $(id).setAttribute("aria-required", String(required.has(id)));
@@ -1211,6 +1483,7 @@
         if (config.telegram_access_mode !== "api" || !["local", "quark_browser", "quark_cli", "quark_api"].includes(config.upload_provider)) throw new Error("/api/config：缺少有效获取方式或上传方式");
         state.quarkConfigured = config.quark_cookie_configured === true;
         state.dataTokenConfigured = config.data_server_token_configured === true;
+        state.dataPasswordConfigured = config.data_server_db_password_configured === true;
         // Hashes stay server-side; the public API ID can be displayed as saved.
         state.apiConfigured = config.telegram_api_configured === true;
         state.apiIdConfigured = config.telegram_api_id_configured === true || (Number.isInteger(config.telegram_api_id) && config.telegram_api_id > 0);
@@ -1221,7 +1494,7 @@
         state.configLoaded = true;
         if (revision === state.formRevision) {
           for (const id of [...plainFields, ...numberFields]) {
-            if (id === "source_channel_url") continue;
+            if (["source_channel_url", "source_topic_id"].includes(id)) continue;
             const input = $(id);
             const value = state.config[id];
             if (input instanceof HTMLSelectElement && value != null && ![...input.options].some((option) => option.value === String(value))) input.add(new Option(String(value), String(value)));
@@ -1232,6 +1505,7 @@
           $("telegram_api_hash").value = state.apiConfigured ? savedHashMask : "";
           $("quark_cookie").value = state.quarkConfigured ? savedHashMask : "";
           $("data_server_token").value = state.dataTokenConfigured ? savedHashMask : "";
+          $("data_server_db_password").value = state.dataPasswordConfigured ? savedHashMask : "";
           $("telegram_api_hash").setAttribute("aria-label", state.apiConfigured ? "Telegram API Hash，已保存并隐藏" : "Telegram API Hash");
           state.configDirty = false;
           text("config-dirty", "");
@@ -1265,7 +1539,7 @@
   function validate(purpose = "save") {
     $("form-error").hidden = true;
     for (const id of formFields) { $(id).classList.remove("field-error"); $(id).removeAttribute("aria-invalid"); }
-    if ($("data_server_enabled").checked) {
+    if ($("data_server_enabled").checked && $("data_server_backend").value === "http") {
       let endpoint;
       try { endpoint = new URL($("data_server_url").value.trim()); } catch { return failField("data_server_url", "请填写数据服务地址"); }
       if (!["http:", "https:"].includes(endpoint.protocol) || endpoint.username || endpoint.password
@@ -1276,6 +1550,18 @@
       const token = $("data_server_token").value.trim();
       if ((!token && !state.dataTokenConfigured) || (token && !(state.dataTokenConfigured && token === savedHashMask) && !/^[!-~]{32,}$/.test(token))) {
         return failField("data_server_token", "请填写至少 32 位的访问令牌");
+      }
+    }
+    if ($("data_server_backend").value !== "http") {
+      if (!/^[A-Za-z0-9_.:\-]{1,253}$/.test($("data_server_db_host").value.trim())) return failField("data_server_db_host", "请填写数据库 IP 或主机名");
+      for (const id of ["data_server_db_name", "data_server_db_user"]) {
+        if (!/^[A-Za-z0-9_.\-]{1,64}$/.test($(id).value.trim())) return failField(id, "请填写有效的数据库名和用户");
+      }
+      if ($("data_server_enabled").checked) {
+        if (!$("data_server_db_password").value && !state.dataPasswordConfigured) return failField("data_server_db_password", "请填写数据库密码");
+        if ($("data_server_db_tls").value === "disable" && !["127.0.0.1", "localhost", "::1"].includes($("data_server_db_host").value.trim())) {
+          return failField("data_server_db_tls", "远程连接须使用 TLS；SSH 隧道请填写本机地址 127.0.0.1");
+        }
       }
     }
     if (!/^[A-Za-z0-9_-]{1,64}$/.test($("data_server_workspace").value.trim())) return failField("data_server_workspace", "工作空间只能包含字母、数字、下划线或连字符");
@@ -1328,6 +1614,8 @@
     if (cookie && !(state.quarkConfigured && cookie === savedHashMask)) output.quark_cookie = cookie;
     const token = $("data_server_token").value.trim();
     if (token && !(state.dataTokenConfigured && token === savedHashMask)) output.data_server_token = token;
+    const password = $("data_server_db_password").value;
+    if (password && !(state.dataPasswordConfigured && password === savedHashMask)) output.data_server_db_password = password;
     // Omit non-form fields so advanced configuration remains unchanged.
     return output;
   }
@@ -1385,6 +1673,29 @@
     await mutation(async () => { await post("/api/retry", { id: task.id }); notice("已请求重新下载"); });
   }
 
+  async function deleteCloudTask(task) {
+    if (isBusy() || !canDeleteCloud(task)) return;
+    if (state.configDirty || state.config?.upload_provider !== "quark_api") {
+      setError("action", "请先在设置中保存夸克 API 配置，再删除云端文件。");
+      goSettings("upload_provider"); return;
+    }
+    const label = deleteCloudLabel(task);
+    if (!window.confirm(`${label}？\n\n${task.remote_filename || task.upload_filename || task.filename}\n原上传目录 FID：${task.upload_target}\n\n云端分享链接可能失效，本地文件和任务记录将保留。`)) return;
+    await mutation(async () => {
+      await post("/api/cloud-delete", { id: task.id, remote_fid: task.upload_remote_fid, confirm: true });
+      notice("已提交云端删除核对，请等待任务结果");
+    });
+  }
+
+  async function removeRecord(task) {
+    if (isBusy() || !canRemoveRecord(task) || removalBlocked(task)) return;
+    if (!window.confirm(`移除此条素材记录？\n\n${taskName(task)}\n\n该记录将从素材库和各个任务列表移除，本地文件、图片和夸克文件保留。`)) return;
+    await mutation(async () => {
+      await post("/api/library/remove", { id: task.id, confirm: true });
+      notice("记录已移除，本地文件和云端文件保留");
+    });
+  }
+
   async function scanChannel(older = false) {
     if (isBusy() || !canReadChannel()) return;
     if (state.configDirty) { setError("action", "请先保存设置，再读取频道消息。"); return; }
@@ -1418,21 +1729,34 @@
     for (const row of state.catalogRows.values()) row.remove();
     state.catalogRows.clear();
     $("channel-search").value = "";
+    $("channel-transfer-filter").value = "all";
   }
 
-  async function selectChannel(key) {
+  async function scanTopics(key) {
+    if (isBusy() || !key) return;
+    if (state.configDirty) { setError("action", "请先保存设置，再获取话题。"); return; }
+    state.topicScanRequested = key;
+    try {
+      await mutation(async () => { await post("/api/channel-topics-scan", { key }); });
+    } finally { state.topicScanRequested = ""; render(); }
+  }
+
+  async function selectChannel(key, topicId = 0) {
     if (isBusy() || !key || !savedChannels().some((row) => row.key === key)) return;
     if (state.configDirty) { setError("action", "请先保存设置，再切换频道。"); return; }
     closeChannelPicker();
     await mutation(async () => {
-      const result = await post("/api/channels/select", { key });
+      const result = await post("/api/channels/select", topicId ? { key, topic_id: topicId } : { key });
       clearChannelView();
       await loadConfig();
-      notice(`已切换到 ${result.channel?.name || `@${key}`}`);
+      const topic = result.channel?.topics?.find((row) => row.topic_id === topicId)
+        || savedChannels().find((row) => row.key === key)?.topics?.find((row) => row.topic_id === topicId);
+      notice(`已切换到 ${result.channel?.name || `@${key}`}${topic ? ` / ${topic.title}` : ""}`);
     });
   }
 
   function openChannelEditor(mode = "add", row = null) {
+    if (channelDirectoryBusy()) return;
     state.channelEditorMode = mode;
     state.channelEditorKey = row?.key || "";
     text("channel-editor-title", mode === "edit" ? "编辑频道" : "添加频道");
@@ -1478,7 +1802,7 @@
   }
 
   async function removeChannel(key) {
-    if (isBusy()) return;
+    if (channelDirectoryBusy()) return;
     const row = (state.channels?.channels || []).find((item) => item.key === key);
     if (!row || !window.confirm(`确定移除“${row.name}”吗？已下载任务和消息缓存不会删除。`)) return;
     await mutation(async () => {
@@ -1494,6 +1818,15 @@
     await mutation(async () => {
       await post("/api/channel-download", { ids });
       notice(`已提交 ${ids.length} 条下载任务`);
+    });
+  }
+
+  async function stopPageTask() {
+    if (!taskBelongsToPage() || $("stop").disabled) return;
+    const task = { task_id: $("stop").dataset.taskId, action: $("stop").dataset.action };
+    await mutation(async () => {
+      await post("/api/stop", task);
+      notice("已请求停止指定任务，等待任务响应");
     });
   }
 
@@ -1537,7 +1870,16 @@
     if (management) {
       const key = management.dataset.channelKey;
       const row = (state.channels?.channels || []).find((item) => item.key === key);
-      if (management.dataset.channelManagement === "select") void selectChannel(key);
+      if (management.dataset.channelManagement === "select") void selectChannel(key, Number(management.dataset.topicId) || 0);
+      if (management.dataset.channelManagement === "topics") {
+        if (state.expandedTopics.has(key)) state.expandedTopics.delete(key);
+        else {
+          state.expandedTopics.add(key);
+          if (!row?.topics_scanned_at && !(row?.topics || []).length) void scanTopics(key);
+        }
+        renderChannels();
+      }
+      if (management.dataset.channelManagement === "refresh-topics") void scanTopics(key);
       if (management.dataset.channelManagement === "edit") openChannelEditor("edit", row);
       if (management.dataset.channelManagement === "remove") void removeChannel(key);
       return;
@@ -1567,6 +1909,8 @@
     if (button.dataset.taskAction === "inspect") inspect(id, button);
     if (button.dataset.taskAction === "retry") void retryTask(task);
     if (button.dataset.taskAction === "link" && task?.upload_status === "link_pending") void uploadTasks([task]);
+    if (button.dataset.taskAction === "delete-cloud") void deleteCloudTask(task);
+    if (button.dataset.taskAction === "remove-record") void removeRecord(task);
   });
   $("task-list").addEventListener("change", (event) => {
     if (!event.target.matches(".task-checkbox")) return;
@@ -1581,14 +1925,14 @@
     const message = state.catalog?.messages.find((item) => item.message_id === Number(button.closest("[data-message-id]")?.dataset.messageId));
     if (!message) return;
     if (button.dataset.channelAction === "preview") openChannelPreview(message, button);
-    if (button.dataset.channelAction === "download" && downloadableMessage(message)) {
+    if (button.dataset.channelAction === "download" && locallyDownloadableMessage(message)) {
       const ids = message.series
-        ? (state.catalog?.messages || []).filter((item) => item.series_key === message.series_key && downloadableMessage(item)).map((item) => item.message_id)
+        ? (state.catalog?.messages || []).filter((item) => item.series_key === message.series_key && locallyDownloadableMessage(item)).map((item) => item.message_id)
         : [message.message_id];
       void downloadChannelMessages(ids);
     }
     if (button.dataset.channelAction === "task") {
-      const task = catalogTask(message);
+      const task = catalogTransfer(message).task;
       if (task) { state.active = String(task.id); setView("download"); }
     }
   });
@@ -1632,6 +1976,7 @@
     renderCatalog();
   });
   $("channel-search").addEventListener("input", renderCatalog);
+  $("channel-transfer-filter").addEventListener("change", renderCatalog);
   $("channel-download-selected").addEventListener("click", () => {
     const selected = (state.catalog?.messages || []).filter((message) => state.catalogSelection.has(message.message_id) && downloadableMessage(message));
     const selectedSeries = new Set(selected.filter((message) => message.series).map((message) => message.series_key));
@@ -1674,6 +2019,16 @@
   $("download").addEventListener("click", () => void configuredAction("/api/download", "download", "已请求扫描并下载"));
   $("scan-channel").addEventListener("click", () => void scanChannel());
   $("channel-select").addEventListener("click", () => state.pickerOpen ? closeChannelPicker() : openChannelPicker());
+  $("channel-topic-select").addEventListener("change", (event) => {
+    if (selectedChannel()) void selectChannel(selectedChannel().key, Number(event.target.value));
+  });
+  $("refresh-channel-topics").addEventListener("click", () => {
+    if (selectedChannel()) void scanTopics(selectedChannel().key);
+  });
+  $("source_channel_url").addEventListener("change", () => {
+    $("source_topic_id").value = "0";
+    renderSourceOptions();
+  });
   $("channel-select").addEventListener("keydown", (event) => {
     if (["ArrowDown", "ArrowUp"].includes(event.key)) { event.preventDefault(); openChannelPicker(); }
   });
@@ -1719,7 +2074,7 @@
   $("scan-joined-channels").addEventListener("click", () => void scanJoinedChannels());
   $("channel-editor-close").addEventListener("click", closeChannelEditor);
   $("channel-editor-cancel").addEventListener("click", closeChannelEditor);
-  $("channel-editor-form").addEventListener("submit", (event) => { event.preventDefault(); if (!isBusy()) void saveChannelEditor(); });
+  $("channel-editor-form").addEventListener("submit", (event) => { event.preventDefault(); if (!channelDirectoryBusy()) void saveChannelEditor(); });
   $("upload").addEventListener("click", () => void uploadTasks(selectedUploadTasks()));
   $("open-naming").addEventListener("click", openNaming);
   $("naming-close").addEventListener("click", () => $("naming-dialog").close());
@@ -1732,7 +2087,9 @@
   $("naming-apply").addEventListener("click", () => void namingAction("apply"));
   $("retry-link").addEventListener("click", () => { if (activeTask()?.upload_status === "link_pending") void uploadTasks([activeTask()]); });
   $("retry-task").addEventListener("click", () => void retryTask(activeTask()));
-  $("stop").addEventListener("click", () => void mutation(async () => { await post("/api/stop"); notice("已请求停止，等待当前任务响应"); }));
+  $("delete-cloud-task").addEventListener("click", () => void deleteCloudTask(activeTask()));
+  $("remove-record-task").addEventListener("click", () => void removeRecord(activeTask()));
+  $("stop").addEventListener("click", () => void stopPageTask());
   $("open-downloads").addEventListener("click", () => void mutation(async () => { await post("/api/open-downloads"); notice("已请求打开下载目录"); }));
   $("open-task").addEventListener("click", () => {
     const task = activeTask();
@@ -1752,6 +2109,29 @@
     state.configDirty = true; state.formRevision++; text("config-dirty", "未保存更改");
   });
   $("upload_provider").addEventListener("change", markRequired);
+  $("data_server_enabled").addEventListener("change", markRequired);
+  $("data_server_backend").addEventListener("change", () => {
+    const backend = $("data_server_backend").value;
+    const port = $("data_server_db_port");
+    if (backend === "mysql" && port.value === "5432") port.value = "3306";
+    else if (backend === "postgresql" && port.value === "3306") port.value = "5432";
+    markRequired();
+  });
+  $("data-db-check").addEventListener("click", () => {
+    if (state.configDirty) { setError("action", "请先保存数据库设置"); return; }
+    void mutation(async () => {
+      $("data-db-check").disabled = true;
+      $("data-db-check-result").hidden = false;
+      text("data-db-check-result", "正在测试数据库连接…");
+      try {
+        const result = await post("/api/data-check");
+        text("data-db-check-result", result.message); notice(result.message);
+      } catch (error) {
+        text("data-db-check-result", error.message);
+        throw error;
+      } finally { $("data-db-check").disabled = false; }
+    });
+  });
   for (const [id, choice] of [["data-sync-now", null], ["data-sync-server", "server"], ["data-sync-local", "local"]]) {
     $(id).addEventListener("click", () => {
       if (state.configDirty) { setError("action", "请先保存服务器设置"); return; }

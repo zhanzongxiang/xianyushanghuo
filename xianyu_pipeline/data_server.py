@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from .data_protocol import DIGEST, MAX_ASSET, MAX_JSON, PROTOCOL_VERSION, encoded, validate_record
+from .data_protocol import DIGEST, MAX_ASSET, MAX_JSON, PROTOCOL_VERSION, encoded, validate_exchange
 
 
 class DataDatabase:
@@ -56,19 +56,7 @@ class DataDatabase:
                 "value": json.loads(row["value"]), "seq": row["seq"]}
 
     def exchange(self, payload: dict) -> dict:
-        workspace, device = payload.get("workspace"), payload.get("device_id")
-        cursor, operations = payload.get("cursor"), payload.get("operations")
-        if (not isinstance(workspace, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", workspace)
-                or not isinstance(device, str) or not re.fullmatch(r"[a-f0-9]{32}", device)
-                or type(cursor) is not int or cursor < 0
-                or not isinstance(operations, list) or len(operations) > 50):
-            raise ValueError("同步请求格式无效")
-        for operation in operations:
-            if (not isinstance(operation, dict) or set(operation) != {"id", "kind", "key", "base_revision", "value"}
-                    or not isinstance(operation["id"], str) or not re.fullmatch(r"[a-f0-9]{32}", operation["id"])
-                    or type(operation["base_revision"]) is not int or operation["base_revision"] < 0):
-                raise ValueError("同步操作格式无效")
-            validate_record(operation["kind"], operation["key"], operation["value"], device)
+        workspace, cursor, operations = validate_exchange(payload)
         results = []
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

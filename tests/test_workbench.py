@@ -9,7 +9,7 @@ import pytest
 
 from xianyu_pipeline.config import PipelineConfig
 from xianyu_pipeline.models import SourceMessage
-from xianyu_pipeline.workbench import TransferStore, task_key
+from xianyu_pipeline.workbench import TransferStore, is_library_item, task_key
 
 
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aPioAAAAASUVORK5CYII=")
@@ -33,6 +33,67 @@ def test_progress_survives_refresh_and_recovers_after_restart(config):
     assert task["download_status"] == "interrupted" and task["speed"] == 0
     assert task["received"] == 40 and task["error"]
     assert task_key("https://t.me/free_3d_models_download/", 123, "asset.zip") == identity
+
+
+@pytest.mark.parametrize("download,upload,expected", [
+    ("completed", "waiting", True), ("failed", "completed", True), ("failed", "deleted", True),
+    ("failed", "failed", False), ("queued", "waiting", False), ("failed", "local", False),
+])
+def test_library_collects_download_or_upload_success(download, upload, expected):
+    task = {"download_status": download, "upload_status": upload}
+    assert is_library_item(task) is expected
+    assert not is_library_item({**task, "record_removed_at": "removed"})
+
+
+def test_record_removal_preserves_files_but_stays_out_of_lists_and_imports_after_restart(config):
+    store = TransferStore(config)
+    source, image = config.inbox_dir / "asset.zip", config.inbox_dir / "preview.png"
+    source.write_bytes(b"archive fixture")
+    image.write_bytes(PNG)
+    identity = store.event(event(download_status="completed", local_path=str(source), image_paths=[str(image)]))
+    store.update(identity, upload_status="completed", upload_provider="quark_api", upload_remote_fid="bound-file",
+                 share_url="https://pan.quark.cn/s/Fixture")
+    store.remove_record(identity)
+    assert store.snapshot()["tasks"] == []
+    assert not store.has_completed_message("free_3d_models_download", 123)
+    with pytest.raises(ValueError):
+        store.get(identity)
+    assert source.read_bytes() == b"archive fixture" and image.read_bytes() == PNG
+    stored = store.tasks[identity]
+    assert stored["record_removed_at"] and stored["upload_remote_fid"] == "bound-file"
+    assert stored["share_url"] == "https://pan.quark.cn/s/Fixture"
+    restored = TransferStore(config)
+    assert restored.snapshot()["tasks"] == [] and list(restored.tasks) == [identity]
+
+
+def test_record_removal_can_only_be_revoked_by_a_new_download(config):
+    store = TransferStore(config)
+    identity = store.event(event(download_status="completed"))
+    store.remove_record(identity)
+    removed_at = store.tasks[identity]["record_removed_at"]
+    store.event(event(download_status="completed", record_removed_at=""))
+    assert store.tasks[identity]["record_removed_at"] == removed_at
+    assert store.snapshot()["tasks"] == []
+    store.event(event(download_status="queued"))
+    assert store.get(identity)["record_removed_at"] == ""
+    assert store.snapshot()["tasks"][0]["download_status"] == "queued"
+    store.event(event(download_status="completed"))
+    assert store.has_completed_message("free_3d_models_download", 123)
+
+
+@pytest.mark.parametrize("changes", [
+    {"download_status": "failed", "upload_status": "waiting"},
+    {"download_status": "downloading", "upload_status": "completed"},
+    {"upload_status": "uploading"}, {"upload_status": "link_pending"},
+    {"cloud_delete_status": "pending"}, {"cloud_delete_status": "deleting"}, {"remote_device": True},
+])
+def test_record_removal_refuses_incomplete_or_unconfirmed_operations(config, changes):
+    store = TransferStore(config)
+    identity = store.event(event(download_status="completed"))
+    store.update(identity, **changes)
+    with pytest.raises(ValueError):
+        store.remove_record(identity)
+    assert not store.get(identity)["record_removed_at"]
 
 
 def test_completed_download_not_lost_when_later_task_fails(config):

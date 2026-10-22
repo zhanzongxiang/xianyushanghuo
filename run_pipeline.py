@@ -106,6 +106,7 @@ def main() -> None:
             config.telegram_api_hash,
             config.telegram_session,
             config.inbox_dir,
+            topic_id=config.source_topic_id,
             exclude_forwarded_posts=config.exclude_forwarded_posts,
             scan_limit=config.telegram_scan_limit,
             archive_test_executable_path=config.archive_test_executable_path,

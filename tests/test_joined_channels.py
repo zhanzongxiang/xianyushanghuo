@@ -68,15 +68,18 @@ def adapter(tmp_path, monkeypatch, dialogs, *, authorized=True, stop_event=None)
     return result, client
 
 
-def test_joined_scan_includes_all_public_private_and_archived_broadcasts(tmp_path, monkeypatch):
+def test_joined_scan_includes_broadcasts_supergroups_and_forums(tmp_path, monkeypatch):
     forbidden = type("ChannelForbidden", (), {"id": 8, "broadcast": True})()
     data = [dialog(1, "Example"), dialog(2), dialog(3, folder_id=1),
             dialog(4, megagroup=True), dialog(5, broadcast=False),
             dialog(6, left=True), dialog(7, deactivated=True),
-            SimpleNamespace(entity=forbidden), dialog(1, "Example")]
+            SimpleNamespace(entity=forbidden), dialog(1, "Example"),
+            dialog(9, "Forum", broadcast=False, megagroup=True, forum=True)]
     telegram, client = adapter(tmp_path, monkeypatch, data)
     rows = telegram.list_joined_channels(avatar_dir=tmp_path / ".channel-avatars")
-    assert [row["id"] for row in rows] == [1, 2, 3]
+    assert [row["id"] for row in rows] == [1, 2, 3, 4, 9]
+    assert rows[3]["kind"] == "supergroup" and rows[3]["forum"] is False
+    assert rows[4]["kind"] == "forum" and rows[4]["forum"] is True
     assert rows[0]["key"] == "example" and rows[0]["target"] == "https://t.me/Example"
     assert rows[1]["key"] == rows[1]["target"] == "-1000000000002"
     assert rows[1]["url"] == rows[1]["avatar_url"] == ""

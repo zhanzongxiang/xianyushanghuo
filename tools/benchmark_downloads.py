@@ -113,6 +113,8 @@ def tdl_version(executable: Path) -> str:
 
 
 def preflight(config: PipelineConfig, executable: Path) -> dict:
+    if config.telegram_proxy_mode != "manual":
+        raise RuntimeError("The standalone tdl benchmark currently requires manual proxy mode; it cannot reuse the in-process Ghelper bridge.")
     result = {"proxy": check_proxy(config.telegram_api_proxy_url), "tdl": {}, "session_key_present": False}
     try:
         result["session_key_present"] = bool(memory_session(Path(config.telegram_session)).auth_key)

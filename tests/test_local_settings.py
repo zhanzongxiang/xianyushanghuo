@@ -203,3 +203,14 @@ def test_shared_write_failure_does_not_lose_successful_project_save(tmp_path, de
     assert saved["recent_message_limit"] == 17 and saved["telegram_api_hash"] == "a" * 32
     assert "本机 Telegram 升级配置未同步" in caplog.text
     assert "private-secret" not in caplog.text and "a" * 32 not in caplog.text
+
+
+def test_ghelper_mode_and_profile_survive_clean_portable_upgrade(tmp_path, defaults):
+    values = account(telegram_proxy_mode="ghelper", telegram_ghelper_profile=str(tmp_path / "Default"))
+    old = save_json(tmp_path / "old" / "test.local.json", {**template(), **values})
+    local_settings.remember_telegram_settings(old, values)
+    new = save_json(tmp_path / "new" / "test.local.json", template())
+    local_settings.restore_telegram_settings(new)
+    assert json.loads(new.read_text()) == {**template(), **values}
+    write_config(new, {"telegram_proxy_mode": "manual"})
+    assert json.loads(defaults.read_text())["telegram_proxy_mode"] == "manual"

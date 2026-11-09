@@ -30,6 +30,8 @@
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
   plainFields.push("telegram_download_engine");
+  plainFields.push("telegram_proxy_mode", "telegram_ghelper_profile");
+  plainFields.push("quark_api_folder_path");
   plainFields.push("data_server_url", "data_server_workspace", "data_server_backend", "data_server_db_host",
     "data_server_db_name", "data_server_db_user", "data_server_db_tls", "data_server_db_ca");
   numberFields.push("data_server_interval_seconds", "data_server_db_port");
@@ -70,6 +72,9 @@
   let tdlibActionError = "";
   let tdlibStatusError = "";
   let tdlibStatus = { available: true, state: "loading" };
+  let ghelperCheckRevision = 0;
+  const quarkFolders = { revision: 0, trail: [], items: [], nextPage: null, page: 1,
+    loading: false, ready: false, error: "", cookie: "" };
 
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
@@ -256,9 +261,9 @@
     if (message) noticeTimer = setTimeout(() => { $("notice").hidden = true; }, 6500);
   }
 
-  async function request(path, options = {}) {
+  async function request(path, options = {}, timeoutMs = 15000) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetch(path, { cache: "no-store", credentials: "same-origin", ...options, signal: controller.signal });
       let payload;
@@ -1286,6 +1291,7 @@
     $("download-settings").hidden = state.view !== "download";
     for (const id of ["save-config", "telegram-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "browser-check"]) $(id).disabled = isBusy() || !state.configLoaded;
     $("quark-api-check").hidden = $("upload_provider").value !== "quark_api";
+    $("quark-folder-browse").disabled = !state.configLoaded;
     $("quark-login").hidden = $("upload_provider").value !== "quark_browser";
     $("quark-cli-login").hidden = $("upload_provider").value !== "quark_cli";
     $("quark-cli-check").hidden = $("upload_provider").value !== "quark_cli";
@@ -1668,6 +1674,9 @@
   }
 
   function markRequired() {
+    const ghelper = $("telegram_proxy_mode").value === "ghelper";
+    $("telegram-manual-proxy-field").hidden = ghelper;
+    $("ghelper-fields").hidden = !ghelper;
     const quark = $("upload_provider").value === "quark_browser";
     const quarkCLI = $("upload_provider").value === "quark_cli";
     const quarkAPI = $("upload_provider").value === "quark_api";
@@ -1699,6 +1708,7 @@
     $("quark-api-fields").hidden = !quarkAPI;
     $("quark-api-check").hidden = !quarkAPI;
     text("quark-cookie-status", state.quarkConfigured ? "已保存" : "未配置");
+    $("quark_api_folder_path").placeholder = $("quark_api_parent_fid").value === "0" ? "根目录" : "未记录目录名称";
     $("quark-cli-login").hidden = !quarkCLI;
     $("quark-cli-check").hidden = !quarkCLI;
     $("quark-login").hidden = !quark;
@@ -1710,6 +1720,79 @@
     if (tdlib) void refreshTdlibStatus();
     text("api-status", `API ID ${state.apiIdConfigured ? "已保存" : "未配置"} · API Hash ${state.apiConfigured ? "已保存" : "未配置"}`);
     renderHeader();
+  }
+
+  function quarkFolderPath() {
+    return "/" + quarkFolders.trail.slice(1).map((entry) => entry.name).join("/");
+  }
+
+  function renderQuarkFolders() {
+    const folder = quarkFolders.trail.at(-1);
+    $("quark-folder-crumbs").innerHTML = quarkFolders.trail.map((entry, index) =>
+      `<button type="button" class="text-button" data-folder-level="${index}" ${index === quarkFolders.trail.length - 1 ? 'aria-current="page"' : ""}>${index === 0 ? icon("hard-drive") : ""}${escape(entry.name)}</button>`).join('<span aria-hidden="true">/</span>');
+    $("quark-folder-list").innerHTML = quarkFolders.items.map((entry, index) =>
+      `<button type="button" class="quark-folder-row" data-folder-index="${index}" aria-label="进入 ${escape(entry.name)}" ${quarkFolders.loading ? "disabled" : ""}>${icon("folder")}<span>${escape(entry.name)}</span>${icon("chevron-right")}</button>`).join("");
+    $("quark-folder-list").setAttribute("aria-busy", String(quarkFolders.loading));
+    text("quark-folder-status", quarkFolders.loading ? "正在读取夸克目录…" : quarkFolders.error ? "目录读取失败" :
+      quarkFolders.items.length ? `已加载 ${quarkFolders.items.length} 个子目录${quarkFolders.nextPage ? "，还有更多内容" : ""}` :
+      quarkFolders.nextPage ? "本页没有子目录，还有更多内容" : "此目录没有子目录");
+    $("quark-folder-error").hidden = !quarkFolders.error;
+    $("quark-folder-error").querySelector("span").textContent = quarkFolders.error;
+    $("quark-folder-retry").disabled = quarkFolders.loading;
+    $("quark-folder-more").hidden = !quarkFolders.nextPage || Boolean(quarkFolders.error);
+    $("quark-folder-more").disabled = quarkFolders.loading;
+    $("quark-folder-up").disabled = quarkFolders.trail.length < 2;
+    $("quark-folder-refresh").disabled = quarkFolders.loading;
+    $("quark-folder-use").disabled = !quarkFolders.ready || quarkFolders.loading;
+    text("quark-folder-current", folder ? `${quarkFolderPath()} · FID ${folder.fid}` : "");
+    icons($("quark-folder-dialog"));
+  }
+
+  async function loadQuarkFolders(trail, page = 1) {
+    const revision = ++quarkFolders.revision;
+    const folder = trail.at(-1);
+    if (page === 1) {
+      quarkFolders.trail = trail;
+      quarkFolders.items = [];
+      quarkFolders.nextPage = null;
+      quarkFolders.ready = false;
+      $("quark-folder-dialog").querySelector(".quark-folder-body").scrollTop = 0;
+    }
+    quarkFolders.page = page;
+    quarkFolders.loading = true;
+    quarkFolders.error = "";
+    renderQuarkFolders();
+    try {
+      const payload = { parent_fid: folder.fid, page };
+      if (quarkFolders.cookie) payload.quark_cookie = quarkFolders.cookie;
+      const data = await request("/api/quark-folders", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }, 65000);
+      if (revision !== quarkFolders.revision || !$("quark-folder-dialog").open) return;
+      if (data.parent_fid !== folder.fid || data.page !== page || !Array.isArray(data.folders)
+          || data.folders.some((entry) => typeof entry.name !== "string" || typeof entry.fid !== "string")
+          || (data.next_page !== null && data.next_page !== page + 1)) throw new Error("夸克目录返回格式无效");
+      const existing = new Set(quarkFolders.items.map((entry) => entry.fid));
+      for (const entry of data.folders) if (!existing.has(entry.fid)) {
+        quarkFolders.items.push(entry); existing.add(entry.fid);
+      }
+      quarkFolders.nextPage = data.next_page;
+      quarkFolders.ready = true;
+    } catch (error) {
+      if (revision === quarkFolders.revision) quarkFolders.error = error.message;
+    } finally {
+      if (revision === quarkFolders.revision) { quarkFolders.loading = false; renderQuarkFolders(); }
+    }
+  }
+
+  function openQuarkFolders() {
+    if (!state.configLoaded) return;
+    const cookie = $("quark_cookie").value.trim();
+    if ((!cookie || cookie === savedHashMask) && !state.quarkConfigured) {
+      failField("quark_cookie", "请先填写夸克 Cookie"); return;
+    }
+    quarkFolders.cookie = cookie && cookie !== savedHashMask ? cookie : "";
+    $("quark-folder-dialog").showModal();
+    void loadQuarkFolders([{ fid: "0", name: "根目录" }]);
   }
 
   function showBrowser(config) {
@@ -2536,6 +2619,66 @@
     state.configDirty = true; state.formRevision++; text("config-dirty", "未保存更改");
   });
   $("upload_provider").addEventListener("change", markRequired);
+  $("telegram_proxy_mode").addEventListener("change", () => {
+    ghelperCheckRevision++;
+    $("ghelper-check").disabled = false;
+    text("ghelper-status", "尚未检测");
+    markRequired();
+  });
+  $("telegram_ghelper_profile").addEventListener("input", () => {
+    ghelperCheckRevision++;
+    $("ghelper-check").disabled = false;
+    text("ghelper-status", "目录已修改，尚未检测");
+  });
+  $("ghelper-check").addEventListener("click", async () => {
+    if ($("ghelper-check").disabled) return;
+    const revision = ++ghelperCheckRevision;
+    $("ghelper-check").disabled = true;
+    text("ghelper-status", "正在读取 Ghelper 线路并连接 Telegram…");
+    try {
+      const result = await request("/api/telegram-proxy-check", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ telegram_ghelper_profile: $("telegram_ghelper_profile").value.trim() }) }, 60000);
+      if (revision === ghelperCheckRevision) text("ghelper-status",
+        `${result.message} · ${result.nodes} 条 HTTPS 线路 · ${result.elapsed_ms} ms`);
+    } catch (error) {
+      if (revision === ghelperCheckRevision) text("ghelper-status", error.message);
+    } finally {
+      if (revision === ghelperCheckRevision) $("ghelper-check").disabled = false;
+    }
+  });
+  $("quark-folder-browse").addEventListener("click", openQuarkFolders);
+  for (const id of ["quark-folder-close", "quark-folder-cancel"]) $(id).addEventListener("click", () => $("quark-folder-dialog").close());
+  $("quark-folder-dialog").addEventListener("close", () => {
+    quarkFolders.revision++; quarkFolders.cookie = ""; quarkFolders.loading = false;
+    $("quark-folder-browse").focus();
+  });
+  $("quark-folder-crumbs").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-folder-level]");
+    if (button) void loadQuarkFolders(quarkFolders.trail.slice(0, Number(button.dataset.folderLevel) + 1));
+  });
+  $("quark-folder-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-folder-index]");
+    if (!button || quarkFolders.loading) return;
+    const entry = quarkFolders.items[Number(button.dataset.folderIndex)];
+    if (entry) void loadQuarkFolders([...quarkFolders.trail, entry]);
+  });
+  $("quark-folder-up").addEventListener("click", () => void loadQuarkFolders(quarkFolders.trail.slice(0, -1)));
+  $("quark-folder-refresh").addEventListener("click", () => void loadQuarkFolders(quarkFolders.trail));
+  $("quark-folder-more").addEventListener("click", () => void loadQuarkFolders(quarkFolders.trail, quarkFolders.nextPage));
+  $("quark-folder-retry").addEventListener("click", () => void loadQuarkFolders(quarkFolders.trail, quarkFolders.page));
+  $("quark-folder-use").addEventListener("click", () => {
+    if (!quarkFolders.ready || quarkFolders.loading) return;
+    $("quark_api_parent_fid").value = quarkFolders.trail.at(-1).fid;
+    $("quark_api_folder_path").value = quarkFolderPath();
+    $("quark_api_folder_path").dispatchEvent(new Event("input", { bubbles: true }));
+    $("quark-folder-dialog").close();
+    notice("上传目标目录已选择，尚未保存");
+  });
+  $("quark_api_parent_fid").addEventListener("input", () => {
+    $("quark_api_folder_path").value = "";
+    $("quark_api_folder_path").placeholder = $("quark_api_parent_fid").value.trim() === "0" ? "根目录" : "未记录目录名称";
+  });
   $("telegram_download_engine").addEventListener("change", markRequired);
   $("tdlib-login").addEventListener("click", () => {
     tdlibActionError = "";

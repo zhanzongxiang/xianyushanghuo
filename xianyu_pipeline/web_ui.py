@@ -28,7 +28,7 @@ from .config import PipelineConfig
 from .pipeline import run_pipeline
 from .quark_browser import QuarkBrowserStorageAdapter
 from .quark_cli import QuarkCLIStorageAdapter, validate_quark_cli_settings
-from .quark_api import (FID, QuarkAPIStorageAdapter, QuarkDeletePending,
+from .quark_api import (FID, QuarkAPIError, QuarkAPIStorageAdapter, QuarkDeletePending,
                         validate_cookie, validate_quark_api_settings)
 from .models import utc_now
 from .runtime import configure_logging, validate_browser_path, telegram_crypto_backend
@@ -139,6 +139,8 @@ def config_payload(config: PipelineConfig) -> dict:
         "telegram_api_id": config.telegram_api_id,
         "telegram_api_configured": bool(config.telegram_api_hash),
         "telegram_api_proxy_url": visible_proxy_url,
+        "telegram_proxy_mode": config.telegram_proxy_mode,
+        "telegram_ghelper_profile": config.telegram_ghelper_profile,
         "telegram_api_dc2_server": config.telegram_api_dc2_server,
         "download_start_timeout_seconds": config.download_start_timeout_seconds,
         "download_transfer_timeout_seconds": config.download_transfer_timeout_seconds,
@@ -163,6 +165,7 @@ def config_payload(config: PipelineConfig) -> dict:
         "upload_provider": config.upload_provider,
         "quark_cookie_configured": bool(config.quark_cookie),
         "quark_api_parent_fid": config.quark_api_parent_fid,
+        "quark_api_folder_path": config.quark_api_folder_path,
         "quark_api_timeout_seconds": config.quark_api_timeout_seconds,
         "quark_api_file_concurrency": config.quark_api_file_concurrency,
         "quark_folder_url": config.quark_folder_url,
@@ -199,6 +202,10 @@ def browser_payload(config: PipelineConfig) -> dict:
 def write_config(path: Path, payload: dict) -> None:
     existing = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     updates = dict(payload)
+    if ("quark_api_parent_fid" in updates
+            and updates["quark_api_parent_fid"] != existing.get("quark_api_parent_fid", "0")
+            and "quark_api_folder_path" not in updates):
+        updates["quark_api_folder_path"] = ""
     for secret in ("telegram_api_hash", "quark_cookie", "data_server_token", "data_server_db_password"):
         if not updates.get(secret):
             updates.pop(secret, None)
@@ -294,7 +301,11 @@ def validate_telegram_settings(payload: dict, existing: PipelineConfig) -> None:
     """Validate account access independently of source links and upload setup."""
     if payload.get("telegram_access_mode", existing.telegram_access_mode) != "api":
         raise ValueError("仅支持 Telegram API 获取消息，请先保存 API 配置")
-    parse_telegram_api_proxy(payload.get("telegram_api_proxy_url", existing.telegram_api_proxy_url))
+    from .ghelper_proxy import validate_settings
+    mode = payload.get("telegram_proxy_mode", existing.telegram_proxy_mode)
+    validate_settings(mode, payload.get("telegram_ghelper_profile", existing.telegram_ghelper_profile))
+    if mode == "manual":
+        parse_telegram_api_proxy(payload.get("telegram_api_proxy_url", existing.telegram_api_proxy_url))
     parse_telegram_dc2_server(payload.get("telegram_api_dc2_server", existing.telegram_api_dc2_server))
     engine = payload.get("telegram_download_engine", existing.telegram_download_engine)
     if not isinstance(engine, str) or engine not in {"telethon", "tdlib"}:
@@ -400,6 +411,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             scan_limit=config.telegram_scan_limit, archive_test_executable_path=config.archive_test_executable_path,
             archive_test_timeout_seconds=config.archive_test_timeout_seconds,
             proxy_url=config.telegram_api_proxy_url, dc2_server=config.telegram_api_dc2_server,
+            proxy_mode=config.telegram_proxy_mode, ghelper_profile=config.telegram_ghelper_profile,
             download_start_timeout_seconds=config.download_start_timeout_seconds,
             download_transfer_timeout_seconds=config.download_transfer_timeout_seconds,
             download_workers=config.download_workers,
@@ -663,6 +675,37 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     raise ValueError("请求必须为 JSON 对象")
             except (ValueError, UnicodeDecodeError) as exc:
                 self.json_response({"message": str(exc)}, 400)
+                return
+            if path == "/api/telegram-proxy-check":
+                try:
+                    if set(arguments) - {"telegram_ghelper_profile"}:
+                        raise ValueError("Ghelper 检测参数无效")
+                    config = PipelineConfig.from_json(config_path)
+                    from .ghelper_proxy import check_ghelper
+                    result = check_ghelper(arguments.get("telegram_ghelper_profile", config.telegram_ghelper_profile))
+                except (ValueError, RuntimeError) as exc:
+                    self.json_response({"message": str(exc)}, 400)
+                    return
+                self.json_response(result)
+                return
+            if path == "/api/quark-folders":
+                try:
+                    if set(arguments) - {"parent_fid", "page", "quark_cookie"}:
+                        raise ValueError("夸克目录请求参数无效")
+                    config = PipelineConfig.from_json(config_path)
+                    cookie = arguments.get("quark_cookie", config.quark_cookie)
+                    validate_cookie(cookie)
+                    # Browsing owns its client and never starts or stops a transfer worker.
+                    cloud = QuarkAPIStorageAdapter(cookie, timeout_seconds=15)
+                    result = cloud.list_folders(arguments.get("parent_fid", "0"),
+                                                page=arguments.get("page", 1))
+                except ValueError as exc:
+                    self.json_response({"message": str(exc)}, 400)
+                    return
+                except QuarkAPIError as exc:
+                    self.json_response({"message": str(exc)}, 502)
+                    return
+                self.json_response(result)
                 return
             if path in {"/api/tdlib/login", "/api/tdlib/auth"}:
                 with state.control_lock:
@@ -1569,5 +1612,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         server_sync.close()
         from .tdlib_client import close_clients
         close_clients()
+        from .ghelper_proxy import close_bridges
+        close_bridges()
         if hasattr(server, "server_close"):
             server.server_close()

@@ -222,7 +222,9 @@ class TelethonTelegramAdapter:
                  on_event: Callable[[dict], None] | None = None,
                  exclude_forwarded_posts: bool = False, download_workers: int = 4,
                  download_file_concurrency: int = 2, source_kind: str = "channel", topic_id: int = 0,
-                 download_engine: str = "telethon"):
+                 download_engine: str = "telethon", proxy_mode: str = "manual", ghelper_profile: str = ""):
+        from .ghelper_proxy import validate_settings
+        validate_settings(proxy_mode, ghelper_profile)
         if not api_id or not api_hash:
             raise ValueError("Telegram 适配器需要 api_id 和 api_hash")
         if type(download_workers) is not int or not 1 <= download_workers <= 8:
@@ -236,7 +238,8 @@ class TelethonTelegramAdapter:
         self.scan_limit = scan_limit
         self.archive_test_executable_path = archive_test_executable_path
         self.archive_test_timeout_seconds = archive_test_timeout_seconds
-        self.proxy = parse_telegram_api_proxy(proxy_url)
+        self.proxy_mode, self.ghelper_profile = proxy_mode, ghelper_profile
+        self.proxy = parse_telegram_api_proxy(proxy_url) if proxy_mode == "manual" else None
         self.dc2_server = parse_telegram_dc2_server(dc2_server)
         self.download_start_timeout_seconds = download_start_timeout_seconds
         self.download_transfer_timeout_seconds = download_transfer_timeout_seconds
@@ -255,6 +258,7 @@ class TelethonTelegramAdapter:
         self.topic_id = topic_id
 
     def _client(self, *, session=None):
+        self._prepare_proxy()
         from telethon.sync import TelegramClient
         backend = telegram_crypto_backend()
         logging.info("Telegram 下载解密组件: %s; 同时下载文件=%d, 单文件分块=%d, 媒体请求上限=%d",
@@ -284,6 +288,8 @@ class TelethonTelegramAdapter:
 
             client_type = Dc2TelegramClient
         options = {"proxy": self.proxy} if self.proxy else {}
+        if self.proxy_mode == "ghelper":
+            options["timeout"] = 50
         if session is not None:
             options["receive_updates"] = False
         client = client_type(self.session_path if session is None else session,
@@ -302,7 +308,13 @@ class TelethonTelegramAdapter:
                          self.proxy["proxy_type"], self.proxy["addr"], self.proxy["port"])
         return client
 
+    def _prepare_proxy(self) -> None:
+        if self.proxy_mode == "ghelper":
+            from .ghelper_proxy import proxy_for_ghelper
+            self.proxy = proxy_for_ghelper(self.ghelper_profile)
+
     def _check_proxy(self) -> None:
+        self._prepare_proxy()
         if self.proxy and self.proxy["addr"] in {"127.0.0.1", "localhost", "::1"}:
             try:
                 with socket.create_connection((self.proxy["addr"], self.proxy["port"]), timeout=1):

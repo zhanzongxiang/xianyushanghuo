@@ -275,7 +275,8 @@ def test_real_tdlib_initializes_proxy_and_database_without_network(tmp_path, mon
         return request(identity, query)
 
     monkeypatch.setattr(hub, "request", offline)
-    proxy = {"proxy_type": proxy_type, "addr": "127.0.0.1", "port": 9} if proxy_type else None
+    proxy = {"proxy_type": proxy_type, "addr": "127.0.0.1", "port": 9,
+             "username": "fixture", "password": "fixture-password"} if proxy_type else None
     client = tdlib_client.TdLibClient(12345, "a" * 32, tmp_path / "account.session", tmp_path / "inbox", proxy)
     try:
         deadline = time.monotonic() + 10
@@ -291,6 +292,8 @@ def test_real_tdlib_initializes_proxy_and_database_without_network(tmp_path, mon
         proxies = client.call({"@type": "getProxies"})["proxies"]
         if proxy_type:
             assert proxies and proxies[0]["is_enabled"]
+            assert proxies[0]["proxy"]["type"]["username"] == "fixture"
+            assert proxies[0]["proxy"]["type"]["password"] == "fixture-password"
         assert "setTdlibParameters" in requests
     finally:
         client.close()

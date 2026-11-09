@@ -238,7 +238,9 @@
               <div id="api-fields" class="wide form-grid">
                 <label>Telegram API ID<input id="telegram_api_id" type="text" inputmode="numeric" autocomplete="off" placeholder="填写 API ID" spellcheck="false"></label>
                 <label>Telegram API Hash<input id="telegram_api_hash" type="password" autocomplete="new-password" placeholder="填写 API Hash" spellcheck="false"></label>
-                <label>API 代理地址（可选）<input id="telegram_api_proxy_url" type="text" placeholder="socks5://127.0.0.1:7890" spellcheck="false"></label>
+                <label>Telegram 代理方式<select id="telegram_proxy_mode"><option value="manual">手动代理 / 直连</option><option value="ghelper">Ghelper 当前线路</option></select></label>
+                <label id="telegram-manual-proxy-field">Telegram 代理地址（可选）<input id="telegram_api_proxy_url" type="text" placeholder="socks5://127.0.0.1:7890" spellcheck="false"></label>
+                <div id="ghelper-fields" class="wide form-grid" hidden><label class="wide">Ghelper 浏览器用户配置目录（可选）<input id="telegram_ghelper_profile" type="text" placeholder="自动识别 Chrome / Edge / Quark 用户配置" spellcheck="false"></label><div class="wide browser-info-field"><button id="ghelper-check" type="button"><i data-lucide="network"></i>检测 Ghelper 线路</button><output id="ghelper-status" role="status">尚未检测</output></div></div>
                 <label>DC 2 节点<select id="telegram_api_dc2_server"><option value="">沿用会话 / Telethon 自动选择</option><option value="149.154.167.50:443">生产 149.154.167.50:443</option></select></label>
                 <output id="api-status" class="wide field-hint"></output>
               </div>
@@ -262,6 +264,7 @@
               <label>分享有效期<select id="quark_share_expire_days"><option value="7">7天（默认）</option><option value="1">1天</option><option value="30">30天</option><option value="0">永久有效</option></select></label>
               <div id="quark-api-fields" class="wide form-grid" hidden>
                 <label class="wide">夸克 Cookie<input id="quark_cookie" type="password" autocomplete="new-password" spellcheck="false" placeholder="__uid=...; __pus=...; __puus=..."><span id="quark-cookie-status" class="field-hint">未配置</span></label>
+                <div class="wide quark-folder-setting"><label>上传目标目录<input id="quark_api_folder_path" type="text" readonly placeholder="根目录"></label><button id="quark-folder-browse" type="button" disabled><i data-lucide="folder-open"></i>选择目录</button></div>
                 <label>目标目录 FID<input id="quark_api_parent_fid" type="text" placeholder="0" spellcheck="false"></label>
                 <label>同时上传文件数<input id="quark_api_file_concurrency" type="number" min="1" max="3" step="1"></label>
                 <label>单次请求超时（秒）<input id="quark_api_timeout_seconds" type="number" min="10" max="600" step="1"></label>
@@ -287,6 +290,12 @@
           <div class="form-actions"><button id="save-config" type="submit" class="primary" disabled><i data-lucide="save"></i>保存配置</button><button id="browser-check" type="button" disabled><i data-lucide="scan-line"></i>检查浏览器</button><button id="telegram-login" type="button" disabled><i data-lucide="log-in"></i>首次登录 Telegram</button><button id="quark-login" type="button" disabled><i data-lucide="log-in"></i>首次登录夸克网页</button><button id="quark-api-check" type="button" disabled hidden><i data-lucide="circle-check"></i>检查夸克 API</button><button id="quark-cli-login" type="button" disabled hidden><i data-lucide="log-in"></i>夸克 CLI 登录</button><button id="quark-cli-check" type="button" disabled hidden><i data-lucide="circle-check"></i>检查夸克 CLI</button><button id="reload-config" type="button" hidden><i data-lucide="refresh-cw"></i>重新读取配置</button><span id="config-dirty" role="status"></span></div>
         </form>
       </section>
+      <dialog id="quark-folder-dialog" class="quark-folder-dialog" aria-labelledby="quark-folder-title">
+        <div class="channel-editor-head"><h2 id="quark-folder-title">选择夸克上传目录</h2><button id="quark-folder-close" type="button" class="icon-button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>
+        <div class="quark-folder-toolbar"><button id="quark-folder-up" type="button" class="icon-button" title="上级目录" aria-label="上级目录"><i data-lucide="arrow-up"></i></button><nav id="quark-folder-crumbs" aria-label="夸克目录路径"></nav><button id="quark-folder-refresh" type="button" class="icon-button" title="刷新目录" aria-label="刷新目录"><i data-lucide="refresh-cw"></i></button></div>
+        <div class="quark-folder-body"><p id="quark-folder-status" role="status"></p><div id="quark-folder-error" class="error-note" role="alert" hidden><span></span><button id="quark-folder-retry" type="button"><i data-lucide="rotate-cw"></i>重试</button></div><div id="quark-folder-list" aria-label="子目录"></div><button id="quark-folder-more" type="button" hidden><i data-lucide="chevrons-down"></i>加载更多</button></div>
+        <div class="quark-folder-footer"><span id="quark-folder-current"></span><div><button id="quark-folder-cancel" type="button">取消</button><button id="quark-folder-use" type="button" class="primary" disabled><i data-lucide="check"></i>使用此目录</button></div></div>
+      </dialog>
       <dialog id="tdlib-dialog" class="channel-editor-dialog tdlib-dialog" aria-labelledby="tdlib-title">
         <form id="tdlib-auth-form" autocomplete="off">
           <div class="channel-editor-head"><h2 id="tdlib-title">TDLib 登录</h2><button id="tdlib-close" type="button" class="icon-button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>

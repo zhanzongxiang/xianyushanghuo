@@ -244,9 +244,10 @@ class TdLibClient:
             self._request_qr()
 
         if self.proxy:
-            proxy_type = ({"@type": "proxyTypeSocks5", "username": "", "password": ""}
+            auth = {"username": self.proxy.get("username", ""), "password": self.proxy.get("password", "")}
+            proxy_type = ({"@type": "proxyTypeSocks5", **auth}
                           if self.proxy["proxy_type"] == "socks5" else
-                          {"@type": "proxyTypeHttp", "username": "", "password": "", "http_only": False})
+                          {"@type": "proxyTypeHttp", **auth, "http_only": False})
             self._automatic({"@type": "addProxy", "enable": True, "proxy": {
                 "@type": "proxy", "server": self.proxy["addr"], "port": self.proxy["port"], "type": proxy_type,
             }}, ready)
@@ -408,7 +409,13 @@ def get_client(api_id, api_hash, session_path, download_dir, proxy=None) -> TdLi
 
 def client_for_config(config, *, create=True):
     from .adapters import parse_telegram_api_proxy
-    proxy = parse_telegram_api_proxy(config.telegram_api_proxy_url)
+    if config.telegram_proxy_mode == "ghelper":
+        from .ghelper_proxy import proxy_for_ghelper
+        proxy = proxy_for_ghelper(config.telegram_ghelper_profile, create=create)
+        if not create and proxy is None:
+            return None
+    else:
+        proxy = parse_telegram_api_proxy(config.telegram_api_proxy_url)
     key = (str(Path(config.telegram_session).resolve()), config.telegram_api_id, config.telegram_api_hash,
            json.dumps(proxy, sort_keys=True))
     if not create:

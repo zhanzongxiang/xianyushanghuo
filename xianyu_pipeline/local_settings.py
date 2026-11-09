@@ -42,8 +42,15 @@ def _telegram_values(payload: dict) -> dict | None:
             or not isinstance(api_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", api_hash)):
         return None
     values = {key: payload.get(key, "") for key in TELEGRAM_SETTINGS}
+    for key in ("telegram_proxy_mode", "telegram_ghelper_profile"):
+        if key in payload:
+            values[key] = payload[key]
     try:
-        parse_telegram_api_proxy(values["telegram_api_proxy_url"])
+        from .ghelper_proxy import validate_settings
+        mode = values.get("telegram_proxy_mode", "manual")
+        validate_settings(mode, values.get("telegram_ghelper_profile", ""))
+        if mode == "manual":
+            parse_telegram_api_proxy(values["telegram_api_proxy_url"])
         parse_telegram_dc2_server(values["telegram_api_dc2_server"])
     except (ValueError, TypeError):
         return None

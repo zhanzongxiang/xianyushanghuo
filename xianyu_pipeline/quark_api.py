@@ -85,6 +85,10 @@ def validate_quark_api_settings(payload: dict, existing=None, *, require_cookie:
     folder = value("quark_api_parent_fid", "0")
     if not isinstance(folder, str) or not FID.fullmatch(folder):
         raise ValueError("夸克 API 目标目录 FID 必须为字母、数字、下划线或连字符；根目录填 0")
+    folder_path = value("quark_api_folder_path", "")
+    if (not isinstance(folder_path, str) or len(folder_path) > 8192
+            or re.search(r"[\x00-\x1f\x7f]", folder_path)):
+        raise ValueError("夸克目录显示路径无效")
     for key, lower, upper in (("quark_api_timeout_seconds", 10, 600),
                                ("quark_api_file_concurrency", 1, 3)):
         number = value(key, lower)
@@ -214,6 +218,42 @@ class QuarkAPIStorageAdapter:
         if not isinstance(folder, str) or not FID.fullmatch(folder):
             raise ValueError("夸克 API 目标目录 FID 无效")
         return folder
+
+    def list_folders(self, parent_fid="0", *, page=1):
+        if not isinstance(parent_fid, str) or not FID.fullmatch(parent_fid):
+            raise ValueError("夸克目录 FID 无效")
+        if type(page) is not int or not 1 <= page <= 1000:
+            raise ValueError("夸克目录页码必须为 1 到 1000 的整数")
+        with self._clients():
+            result = self._api("GET", "file/sort", params={
+                "pdir_fid": parent_fid, "_page": page, "_size": 100, "_fetch_total": 1,
+                "_sort": "file_type:asc,file_name:asc", "fetch_all_file": 1,
+            })
+        data = result.get("data")
+        rows = data.get("list") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise QuarkAPIError("夸克目录列表格式无效")
+        folders, seen = [], set()
+        for row in rows:
+            if not (row.get("dir") is True or type(row.get("file_type")) is int and row["file_type"] == 0):
+                continue
+            fid, name = row.get("fid"), row.get("file_name")
+            if (not isinstance(fid, str) or not FID.fullmatch(fid) or fid in {"0", parent_fid}
+                    or not isinstance(name, str) or not name or len(name) > 1024
+                    or re.search(r"[\x00-\x1f\x7f]", name)
+                    or str(row.get("pdir_fid", parent_fid)) != parent_fid):
+                raise QuarkAPIError("夸克返回的子目录信息无效")
+            if fid not in seen:
+                folders.append({"fid": fid, "name": name})
+                seen.add(fid)
+        metadata = result.get("metadata")
+        total = metadata.get("_total", metadata.get("total")) if isinstance(metadata, dict) else None
+        # Pagination counts all entries, including files filtered out of the picker.
+        has_more = len(rows) >= 100 and not (type(total) is int and total >= 0 and page * 100 >= total)
+        if has_more and page == 1000:
+            raise QuarkAPIError("目录内容过多，请缩小目录范围或填写目标 FID")
+        return {"parent_fid": parent_fid, "folders": folders, "page": page,
+                "has_more": has_more, "next_page": page + 1 if has_more else None}
 
     def _find(self, name, folder, *, fid=""):
         matches = []

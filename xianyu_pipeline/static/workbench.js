@@ -47,7 +47,7 @@
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
     catalogMode: "grid", resourceId: null, resourceReturnFocus: null, channelViews: new Map(),
     restoredScope: "", restoreCatalogScroll: null, sidebarTopics: new Map(),
-    previewReturnFocus: null, previewZoom: 1, previewMessageId: null, previewRequested: new Set(), previewErrors: new Map(),
+    previewReturnFocus: null, previewZoom: 1, previewMessageId: null, previewPhotoId: null, previewRequested: new Set(), previewErrors: new Map(),
     channels: null, joinedChannels: null, joinedScanRequested: false,
     expandedTopics: new Set(), topicScanRequested: "",
     pickerOpen: false, pickerFocusKey: "", failedAvatars: new Set(), channelRevision: 0,
@@ -1162,6 +1162,7 @@
     state.previewReturnFocus = trigger;
     state.previewZoom = 1;
     state.previewMessageId = message.message_id;
+    state.previewPhotoId = null;
     text("channel-preview-title", message.filename);
     const image = $("channel-preview-image");
     image.alt = `频道消息 ${message.message_id} 的封面`;
@@ -1172,62 +1173,112 @@
     $("channel-preview-dialog").showModal();
     $("channel-preview-close").focus();
     renderChannelPreview();
-    if (!message.full_cover_url) void loadChannelFullImage(message.message_id);
+    if (!message.full_images?.length || channelPreviewImages(message).some((item) => !item.full_cover_url)) void loadChannelFullImage(message.message_id);
+  }
+
+  function channelPreviewImages(message) {
+    if (message.full_images?.length) return message.full_images.map((item, index) => ({ ...item,
+      cover_url: item.message_id === message.cover_message_id || !message.cover_message_id && index === 0 ? message.cover_url : "" }));
+    return [{ ...message, message_id: message.full_cover_message_id || message.cover_message_id || message.message_id }];
+  }
+
+  function selectChannelPhoto(index) {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.previewMessageId);
+    if (!message) return;
+    const images = channelPreviewImages(message);
+    if (index < 0 || index >= images.length) return;
+    state.previewPhotoId = images[index].message_id;
+    state.previewZoom = 1;
+    updatePreviewZoom();
+    const canvas = $("channel-preview-image").parentElement;
+    canvas.scrollTop = canvas.scrollLeft = 0;
+    renderChannelPreview();
+    const thumbnail = $("channel-preview-strip").querySelector('[aria-pressed="true"]');
+    thumbnail?.focus({ preventScroll: true });
+    thumbnail?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
   function renderChannelPreview() {
     if (!$("channel-preview-dialog").open) return;
     const message = state.catalog?.messages.find((row) => row.message_id === state.previewMessageId);
     if (!message) return;
-    const candidate = safeURL(message.full_cover_url);
+    const images = channelPreviewImages(message);
+    let index = images.findIndex((item) => item.message_id === state.previewPhotoId);
+    if (index < 0) index = 0;
+    const selected = images[index];
+    state.previewPhotoId = selected.message_id;
+    const photoKey = `${message.message_id}:${selected.message_id}`;
+    const candidate = safeURL(selected.full_cover_url);
     const full = state.brokenImages.has(candidate) ? "" : candidate;
-    const cover = safeURL(message.cover_url);
+    const cover = safeURL(selected.cover_url);
     const source = full || (state.brokenImages.has(cover) ? "" : cover);
     const image = $("channel-preview-image");
+    image.alt = `${message.filename}，第 ${index + 1} 张，共 ${images.length} 张`;
     image.hidden = !source;
+    if (!source) {
+      cancelImageLoad(image);
+      image.removeAttribute("src");
+      delete image.dataset.sourceUrl;
+    }
     if (source && image.dataset.sourceUrl !== source) {
       image.dataset.sourceUrl = source;
       const revision = state.channelRevision;
       loadImageWithRetry(image, source, {
         current: () => $("channel-preview-dialog").open && revision === state.channelRevision
-          && state.previewMessageId === message.message_id && image.dataset.sourceUrl === source,
+          && state.previewMessageId === message.message_id && state.previewPhotoId === selected.message_id && image.dataset.sourceUrl === source,
         loaded: () => {
           if (full) {
-            state.previewErrors.delete(message.message_id);
+            state.previewErrors.delete(photoKey);
             renderChannelPreview();
           }
         },
         failed: () => {
           state.brokenImages.add(source);
-          state.previewErrors.set(message.message_id, "图片缓存读取失败，可重新获取；已有预览图会保留");
+          state.previewErrors.set(photoKey, "图片缓存读取失败，可重新获取；已有预览图会保留");
           renderChannelPreview();
         }
       });
     }
-    const loading = message.full_status === "loading" || state.previewRequested.has(message.message_id);
-    const error = state.previewErrors.get(message.message_id) || message.full_error;
-    const failed = !loading && (Boolean(error) || !full && ["failed", "cancelled"].includes(message.full_status)
+    const albumLoading = message.full_status === "loading" || state.previewRequested.has(message.message_id);
+    const loading = selected.full_status === "loading" || selected.full_status === "pending" && albumLoading || state.previewRequested.has(message.message_id);
+    const error = state.previewErrors.get(photoKey) || state.previewErrors.get(message.message_id) || selected.full_error;
+    const failed = !loading && (Boolean(error) || !full && ["failed", "cancelled"].includes(selected.full_status)
       || candidate && state.brokenImages.has(candidate) || !source && state.brokenImages.has(cover));
-    text("channel-preview-status-text", loading ? "正在加载高清图" : failed ? `高清图未加载：${redact(error || "请重试")}`
-      : full ? message.full_quality === "document_thumbnail" ? "附件预览图" : message.full_quality === "large" ? "清晰大图（非最大尺寸）" : "最大尺寸图" : "预览图");
+    const ready = images.filter((item) => item.full_cover_url && item.full_status === "ready").length;
+    text("channel-preview-status-text", loading ? `正在加载图集 · ${ready}/${images.length} 张就绪` : failed ? `高清图未加载：${redact(error || "请重试")}`
+      : full ? selected.full_quality === "document_thumbnail" ? "附件预览图" : selected.full_quality === "large" ? "清晰大图（非最大尺寸）" : "最大尺寸图" : "预览图");
     html($("channel-preview-status-icon"), icon(loading ? "loader-circle" : failed ? "circle-alert" : full ? "image" : "eye"));
     $("channel-preview-status-icon").querySelector(".lucide")?.classList.toggle("loading-spinner", loading);
     $("channel-preview-retry").hidden = !failed;
-    $("channel-preview-retry").disabled = !canLoadChannelMedia();
-    $("channel-preview-original").disabled = loading || !canLoadChannelMedia();
+    $("channel-preview-retry").disabled = albumLoading || !canLoadChannelMedia();
+    $("channel-preview-original").disabled = albumLoading || !canLoadChannelMedia();
     $("channel-preview-status").dataset.stage = loading ? "loading" : failed ? "failed" : "ready";
+    $("channel-preview-gallery").hidden = images.length < 2;
+    $("channel-preview-prev").disabled = index === 0;
+    $("channel-preview-next").disabled = index === images.length - 1;
+    text("channel-preview-count", `${index + 1} / ${images.length}`);
+    const thumbnailFocused = $("channel-preview-strip").contains(document.activeElement);
+    html($("channel-preview-strip"), images.map((item, position) => {
+      const url = [item.full_cover_url, item.cover_url].map(safeURL).find((url) => url && !state.brokenImages.has(url));
+      const failed = ["failed", "cancelled"].includes(item.full_status) || state.brokenImages.has(safeURL(item.full_cover_url));
+      return `<button type="button" data-photo-index="${position}" aria-label="查看第 ${position + 1} 张图片" aria-pressed="${position === index}" title="第 ${position + 1} 张${failed ? ' · 加载失败' : ''}">${url ? `<img src="${escape(url)}" alt="" decoding="async">` : icon(failed ? "image-off" : "image")}${failed ? '<span class="gallery-image-error">!</span>' : ""}</button>`;
+    }).join(""));
+    if (thumbnailFocused) $("channel-preview-strip").querySelector('[aria-pressed="true"]')?.focus({ preventScroll: true });
   }
 
-  async function loadChannelFullImage(id, original = false) {
+  async function loadChannelFullImage(id, original = false, photoId = 0) {
     if (!canLoadChannelMedia() || state.previewRequested.has(id)) return;
     const revision = state.channelRevision;
     const message = state.catalog?.messages.find((row) => row.message_id === id);
-    const refresh = [message?.full_cover_url, message?.cover_url].some((url) => state.brokenImages.has(safeURL(url)));
+    const selected = message && channelPreviewImages(message).find((item) => item.message_id === photoId);
+    const refresh = [selected?.full_cover_url || message?.full_cover_url, selected?.cover_url || message?.cover_url].some((url) => state.brokenImages.has(safeURL(url)));
     state.previewErrors.delete(id);
+    if (selected) state.previewErrors.delete(`${id}:${photoId}`);
     state.previewRequested.add(id);
     renderChannelPreview();
     try {
-      await post("/api/channel-cover", { id, original, ...(refresh ? { refresh: true } : {}) });
+      await post("/api/channel-cover", { id, original, gallery: true,
+        ...(photoId && message?.full_images?.length ? { photo_id: photoId } : {}), ...(refresh ? { refresh: true } : {}) });
       if (revision !== state.channelRevision) return;
       await Promise.all([refreshCatalog(), refreshWorkbench()]);
     } catch (error) {
@@ -2392,12 +2443,31 @@
     if (state.previewReturnFocus?.isConnected) state.previewReturnFocus.focus({ preventScroll: true });
     state.previewReturnFocus = null;
     state.previewMessageId = null;
+    state.previewPhotoId = null;
+    $("channel-preview-strip").replaceChildren();
   });
   $("channel-preview-original").addEventListener("click", () => {
-    if (state.previewMessageId) void loadChannelFullImage(state.previewMessageId, true);
+    if (state.previewMessageId) void loadChannelFullImage(state.previewMessageId, true, state.previewPhotoId);
   });
   $("channel-preview-retry").addEventListener("click", () => {
-    if (state.previewMessageId) void loadChannelFullImage(state.previewMessageId);
+    if (state.previewMessageId) void loadChannelFullImage(state.previewMessageId, false, state.previewPhotoId);
+  });
+  $("channel-preview-strip").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-photo-index]");
+    if (button) selectChannelPhoto(Number(button.dataset.photoIndex));
+  });
+  function stepChannelPhoto(step) {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.previewMessageId);
+    if (message) selectChannelPhoto(channelPreviewImages(message).findIndex((item) => item.message_id === state.previewPhotoId) + step);
+  }
+  $("channel-preview-prev").addEventListener("click", () => stepChannelPhoto(-1));
+  $("channel-preview-next").addEventListener("click", () => stepChannelPhoto(1));
+  $("channel-preview-dialog").addEventListener("keydown", (event) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      event.stopPropagation();
+      stepChannelPhoto(event.key === "ArrowLeft" ? -1 : 1);
+    }
   });
   $("channel-zoom-in").addEventListener("click", () => {
     state.previewZoom = Math.min(3, state.previewZoom + .5); updatePreviewZoom();

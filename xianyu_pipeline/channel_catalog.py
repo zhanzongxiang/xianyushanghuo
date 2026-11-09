@@ -91,12 +91,13 @@ class ChannelCatalog:
                     continue
                 changed = False
                 for row in current["messages"]:
-                    for prefix in ("cover", "full"):
-                        if row.get(f"{prefix}_status") not in {"pending", "loading"}:
+                    for entry, prefix in [(row, "cover"), (row, "full"),
+                                          *((image, "full") for image in self._album(row))]:
+                        if entry.get(f"{prefix}_status") not in {"pending", "loading"}:
                             continue
-                        cached_cover = prefix == "cover" and self._cover(row)
-                        row[f"{prefix}_status"] = "ready" if cached_cover else "cancelled"
-                        row[f"{prefix}_error"] = "" if cached_cover else "上次图片加载已中断，可重新加载"
+                        cached_cover = prefix == "cover" and self._cover(entry)
+                        entry[f"{prefix}_status"] = "ready" if cached_cover else "cancelled"
+                        entry[f"{prefix}_error"] = "" if cached_cover else "上次图片加载已中断，可重新加载"
                         recovered += 1
                         changed = True
                 if changed:
@@ -104,6 +105,23 @@ class ChannelCatalog:
                     temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
                     temporary.replace(path)
             return recovered
+
+    @staticmethod
+    def _album(row):
+        images = row.get("full_images", [])
+        if not isinstance(images, list):
+            return []
+        return [item for item in images[:5] if isinstance(item, dict)
+                and type(item.get("message_id")) is int and item["message_id"] > 0]
+
+    def album_cache(self, channel: str, message_id: int) -> list[dict]:
+        with self.lock:
+            row = next((row for row in self._current(channel)["messages"] if row["message_id"] == message_id), {})
+            images = self._album(row)
+            if not images and row.get("full_cover_message_id"):
+                images = [{"message_id": row["full_cover_message_id"],
+                           **{key: value for key, value in row.items() if key.startswith("full_") and key != "full_images"}}]
+            return copy.deepcopy(images)
 
     def covers(self, channel: str) -> dict[int, dict]:
         with self.lock:
@@ -129,6 +147,16 @@ class ChannelCatalog:
                         row[f"{prefix}_error"] = "本地图片缓存已失效，可重新加载"
                 row.pop("cover_path", None)
                 row.pop("full_cover_path", None)
+                if "full_images" in row:
+                    images = []
+                    for item in self._album(row):
+                        asset = self._cover(item, full=True)
+                        images.append({"message_id": item["message_id"],
+                            "full_cover_url": (f"/api/channel-full-preview/{row['message_id']}?v={image_version(asset)}&source={current['channel']}&photo={item['message_id']}" if asset else ""),
+                            "full_quality": item.get("full_quality", ""),
+                            "full_status": "failed" if not asset and item.get("full_status") == "ready" else item.get("full_status", "pending"),
+                            "full_error": "本地图片缓存已失效，可重新加载" if not asset and item.get("full_status") == "ready" else item.get("full_error", "")})
+                    row["full_images"] = images
             return {**{key: value for key, value in current.items() if key != "messages"},
                     "messages": rows}
 
@@ -139,11 +167,13 @@ class ChannelCatalog:
                        for row in self._current(channel)["messages"])
 
     def preview(self, channel: str, message_id: int, *, exclude_forwarded_posts: bool = False,
-                full: bool = False) -> tuple[Path, str]:
+                full: bool = False, photo_id: int = 0) -> tuple[Path, str]:
         with self.lock:
             row = next((row for row in self._current(channel)["messages"]
                         if isinstance(row, dict) and row.get("message_id") == message_id
                         and (not exclude_forwarded_posts or not row.get("forwarded", False))), None)
+            if photo_id and row:
+                row = next((image for image in self._album(row) if image["message_id"] == photo_id), None)
             cover = self._cover(row, full=full) if row else None
             if cover is None:
                 raise ValueError("频道预览图不存在")

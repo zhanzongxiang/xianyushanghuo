@@ -1487,7 +1487,73 @@ class TelethonTelegramAdapter:
             return {"full_cover_path": path, "full_cover_message_id": message_id,
                     "full_status": "ready", "full_error": "", "full_quality": quality}
         return {"cover_path": path, "cover_message_id": message_id,
+                "cover_message_ids": [item.id for item in photos] if photos else [message.id],
                 "cover_quality": quality, "cover_status": "ready", "cover_error": ""}
+
+    async def _catalog_album(self, client, target, message, preview_dir, *, original=False,
+                             photo_id=0, refresh=False, cached=None, scheduler=None, on_progress=None):
+        from .workbench import image_type
+
+        history = await asyncio.wait_for(self._photo_history(client, target, message.id),
+                                         timeout=_PHOTO_LOOKUP_TIMEOUT_SECONDS)
+        photos = self._preceding_photo_group(history, message.id)
+        if not photos and not getattr(getattr(message, "document", None), "thumbs", None):
+            raise ValueError("该消息没有可用的图片")
+        sources = photos or [message]
+        if photo_id and photo_id not in {item.id for item in sources}:
+            raise ValueError("所选图片已不属于该资源的相邻图集，请重新获取图集")
+        previous = {item["message_id"]: item for item in cached or []}
+        images = []
+        for item in sources:
+            saved = dict(previous.get(item.id, {}))
+            path = Path(saved.get("full_cover_path") or ".").resolve()
+            usable = path.is_relative_to(preview_dir.resolve()) and bool(image_type(path))
+            upgrade = original and (not photo_id or photo_id == item.id) and saved.get("full_quality") not in {"full", "document_thumbnail"}
+            replace = refresh and (not photo_id or photo_id == item.id)
+            images.append({**saved, "message_id": item.id, "full_status": "ready" if usable and not upgrade and not replace else "loading",
+                           "full_error": ""})
+        semaphore = asyncio.Semaphore(2)
+        scheduler = scheduler or DownloadScheduler(self.download_file_concurrency)
+
+        def result(finished=False):
+            errors = sum(item["full_status"] == "failed" for item in images)
+            first = images[0]
+            return {**{key: value for key, value in first.items() if key.startswith("full_")},
+                    "full_images": copy.deepcopy(images),
+                    "full_status": ("failed" if errors else "ready") if finished else "loading",
+                    "full_error": f"{errors} 张图片未加载，可单独重试" if errors else ""}
+
+        def publish():
+            if on_progress:
+                on_progress(result())
+
+        async def load(item, row):
+            if row["full_status"] == "ready":
+                return
+            try:
+                async with semaphore, scheduler.requests:
+                    if self.stop_event and self.stop_event.is_set():
+                        raise DownloadCancelled("已停止图集加载")
+                    values = await self._catalog_cover(client, target, message, preview_dir,
+                        [item] if photos else [], full=True,
+                        original=original and (not photo_id or photo_id == item.id))
+                    row.update(values)
+            except (DownloadCancelled, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                row.update(full_status="failed", full_error=f"{type(exc).__name__}: {exc}")
+            publish()
+
+        publish()
+        tasks = [asyncio.create_task(load(item, row)) for item, row in zip(sources, images)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return result(finished=True)
 
     def list_archives(self, channel: str, *, before_id: int = 0, limit: int = 12,
                       preview_dir: Path, known_covers: dict[int, dict] | None = None,
@@ -1496,6 +1562,7 @@ class TelethonTelegramAdapter:
                       take_request: Callable[[], dict | None] | None = None,
                       close_requests: Callable[[], bool] | None = None,
                       on_request_done: Callable[[dict, dict, str], None] | None = None,
+                      on_request_progress: Callable[[dict, dict], None] | None = None,
                       media_only: bool = False) -> dict:
         target = self.normalize_channel(channel)
         if (type(before_id) is not int or before_id < 0
@@ -1660,10 +1727,17 @@ class TelethonTelegramAdapter:
                                     or self._archive_name(message) != request["filename"]):
                                 raise ValueError("频道附件已改变或不符合频道主帖筛选条件，请重新读取")
                             if request["kind"] == "cover":
-                                async with scheduler.requests:
-                                    result = await self._catalog_cover(client, target, message, preview_dir, None, full=True,
-                                                                       original=request.get("original", False),
-                                                                       cover_message_id=request.get("cover_message_id", 0))
+                                if request.get("gallery"):
+                                    result = await self._catalog_album(client, target, message, preview_dir,
+                                        original=request.get("original", False), photo_id=request.get("photo_id", 0),
+                                        refresh=request.get("refresh", False), cached=request.get("cached_images"),
+                                        scheduler=scheduler, on_progress=(lambda value: on_request_progress(request, value))
+                                        if on_request_progress else None)
+                                else:
+                                    async with scheduler.requests:
+                                        result = await self._catalog_cover(client, target, message, preview_dir, None, full=True,
+                                                                           original=request.get("original", False),
+                                                                           cover_message_id=request.get("cover_message_id", 0))
                             else:
                                 transfer = _TransferEvents(self.on_event, message.id, str(target), request["filename"],
                                                            message.message or "", getattr(message.file, "size", 0),

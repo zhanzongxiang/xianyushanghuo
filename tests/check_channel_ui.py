@@ -99,7 +99,7 @@ def check_loading(page, address: str, result_dir: Path, unique: str, label: str,
     progress.update(stage="covers", found=3, scanned=42, total=3, processed=1, ready=1, elapsed_seconds=4)
     catalog["messages"] = [{**row, "cover_status": "ready" if index == 0 else "pending",
                             "cover_url": row["cover_url"] if index == 0 else "",
-                            "cover_quality": "preview", "full_cover_url": ""}
+                            "cover_quality": "preview", "full_cover_url": "", "full_images": []}
                            for index, row in enumerate(original["messages"])]
     refresh("covers")
     page.locator(".channel-message-cover img").first.wait_for(state="visible")
@@ -112,14 +112,14 @@ def check_loading(page, address: str, result_dir: Path, unique: str, label: str,
     page.screenshot(path=str(loading_screenshot), full_page=True)
     page.locator("button.channel-message-cover").first.click()
     page.wait_for_function(
-        "document.getElementById('channel-preview-status-text').textContent === '正在加载高清图'")
+        "document.getElementById('channel-preview-status-text').textContent.includes('正在加载图集')")
     assert full_requests == [30218]
     catalog["messages"][0].update(full_status="failed", full_error="fixture full-image timeout")
     refresh("covers")
     page.wait_for_function("!document.getElementById('channel-preview-retry').hidden")
     page.locator("#channel-preview-retry").click()
     page.wait_for_function(
-        "document.getElementById('channel-preview-status-text').textContent === '正在加载高清图'")
+        "document.getElementById('channel-preview-status-text').textContent.includes('正在加载图集')")
     assert full_requests == [30218, 30218]
     catalog["messages"][0].update(full_status="ready", full_error="", full_quality="full",
                                   full_cover_url=original["messages"][0]["full_cover_url"])
@@ -496,6 +496,9 @@ def check(executable: Path | None = None) -> None:
                           "cover_status": "ready", "full_status": "ready", "full_quality": "full"}
                          for row in rows],
         }
+        for item in original["messages"]:
+            item["full_images"] = [{"message_id": item["cover_message_id"], "full_cover_url": item["full_cover_url"],
+                                    "full_status": "ready", "full_quality": "full"}]
         saved = {
             "active": "demo_channel",
             "channels": [{"key": "demo_channel", "target": "demo_channel", "id": 1001,

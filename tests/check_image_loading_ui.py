@@ -42,6 +42,10 @@ def check_recovery(page, address):
     item = listing["messages"][0]
     item.update(full_cover_url="/api/channel-full-preview/100?test=broken",
                 full_status="ready", full_quality="large")
+    def known_photo():
+        item["full_images"] = [{"message_id": 99, "full_cover_url": item["full_cover_url"],
+                                "full_status": item["full_status"], "full_quality": "large", "full_error": item.get("full_error", "")}]
+    known_photo()
     page.route("**/api/channel-messages", lambda route: route.fulfill(json=listing))
     full_attempts, posts = [], []
 
@@ -56,6 +60,7 @@ def check_recovery(page, address):
         posts.append(route.request.post_data_json)
         item.update(full_cover_url="/api/channel-full-preview/100?test=repaired",
                     full_status="ready", full_error="")
+        known_photo()
         route.fulfill(json={"url": item["full_cover_url"]})
 
     page.route("**/api/channel-full-preview/100?*", full_image)
@@ -77,17 +82,19 @@ def check_recovery(page, address):
         const image = document.getElementById('channel-preview-image');
         return image.complete && image.naturalWidth > 0 && image.src.includes('test=repaired');
     }""")
-    assert posts == [{"id": 100, "original": False, "refresh": True}], posts
+    assert posts == [{"id": 100, "original": False, "gallery": True, "photo_id": 99, "refresh": True}], posts
     assert page.locator("#channel-preview-retry").is_hidden()
     assert page.locator("#channel-preview-dialog").evaluate("dialog => dialog.open")
     page.locator("#channel-preview-close").click()
 
     # A failed Telegram request must leave the cached medium image available.
     item.update(full_cover_url="", full_status="cancelled", full_error="previous request interrupted")
+    known_photo()
 
     def offline(route):
         posts.append(route.request.post_data_json)
         item.update(full_status="failed", full_error="API proxy 127.0.0.1:7890 unavailable")
+        known_photo()
         route.fulfill(json={"message": "queued"})
 
     page.unroute("**/api/channel-cover")

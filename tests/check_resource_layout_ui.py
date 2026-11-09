@@ -33,6 +33,10 @@ class ResourceFixture(harness.Fixture):
                         (30, "Alpha-long-model-" + "details" * 25 + ".rar", 1000),
                         (21, "Local-model.zip", 2000), (10, "Cloud-model.rar", 3000))]}
         self.catalog = self.catalogs["fixture_saved"]
+        for catalog in self.catalogs.values():
+            for row in catalog["messages"]:
+                row["full_images"] = [{"message_id": row["cover_message_id"], "full_cover_url": row["full_cover_url"],
+                                       "full_status": "ready", "full_quality": "full"}]
         self.workbench["tasks"].append({"id": "cloud-task", "chat": "fixture_saved", "message_id": 10,
             "filename": "Cloud-model.rar", "download_status": "completed", "upload_status": "completed",
             "upload_provider": "quark_api", "share_url": "https://pan.quark.cn/s/fixture", "images": []})

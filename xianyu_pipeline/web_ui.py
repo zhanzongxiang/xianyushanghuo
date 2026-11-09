@@ -581,6 +581,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     config = PipelineConfig.from_json(config_path)
                     asset, content_type = catalog.preview(scope, message_id,
                                                           exclude_forwarded_posts=config.exclude_forwarded_posts,
+                                                          photo_id=int(query.get("photo", ["0"])[0]),
                                                           full=path.startswith("/api/channel-full-preview/"))
                     self.file_response(asset, content_type,
                                        version=query.get("v", [""])[0] if query.get("source") else "")
@@ -1101,6 +1102,12 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             if path in {"/api/channel-download", "/api/channel-cover"}:
                                 if path == "/api/channel-cover" and type(arguments.get("refresh", False)) is not bool:
                                     raise ValueError("图片刷新参数无效")
+                                if path == "/api/channel-cover":
+                                    if type(arguments.get("gallery", False)) is not bool or type(arguments.get("original", False)) is not bool:
+                                        raise ValueError("图集参数无效")
+                                    photo_id = arguments.get("photo_id", 0)
+                                    if type(photo_id) is not int or not 0 <= photo_id <= 2147483647 or photo_id and not arguments.get("gallery"):
+                                        raise ValueError("图片消息 ID 无效")
                                 ids = arguments.get("ids") if path == "/api/channel-download" else [arguments.get("id")]
                                 if (not isinstance(ids, list) or not 1 <= len(ids) <= 20
                                         or any(type(mid) is not int or mid <= 0 for mid in ids)
@@ -1114,7 +1121,18 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                         raise ValueError(f"消息 {mid} 不在当前频道列表中，请先重新读取")
                                     if path == "/api/channel-download" and transfers.has_completed_message(config.source_channel_url, mid):
                                         raise ValueError(f"消息 {mid} 已下载，请在下载任务中查看")
-                                if (path == "/api/channel-cover" and messages[ids[0]].get("full_cover_url")
+                                if path == "/api/channel-cover" and arguments.get("gallery"):
+                                    images = messages[ids[0]].get("full_images", [])
+                                    selected = [item for item in images if not photo_id or item["message_id"] == photo_id]
+                                    if photo_id and not selected:
+                                        raise ValueError("所选图片不在该资源图集中")
+                                    if (selected and not arguments.get("refresh") and all(
+                                            item.get("full_cover_url") and item.get("full_status") == "ready"
+                                            and (not arguments.get("original") or item.get("full_quality") in {"full", "document_thumbnail"})
+                                            for item in selected)):
+                                        self.json_response({"message": "图集已缓存", "images": selected})
+                                        return
+                                if (path == "/api/channel-cover" and not arguments.get("gallery") and messages[ids[0]].get("full_cover_url")
                                         and not arguments.get("refresh", False)
                                         and (not arguments.get("original", False) or messages[ids[0]].get("full_quality") in {"full", "document_thumbnail"})):
                                     self.json_response({"message": "高清图已缓存",
@@ -1143,6 +1161,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                     prepared.append({"kind": kind, "message_id": mid, "filename": row["filename"],
                                                      "original": arguments.get("original") is True,
                                                      "refresh": arguments.get("refresh") is True,
+                                                     "gallery": arguments.get("gallery") is True,
+                                                     "photo_id": arguments.get("photo_id", 0),
+                                                     "cached_images": catalog.album_cache(catalog_source(config), mid) if kind == "cover" else [],
                                                      "auto_upload_after_download": config.auto_upload_after_download,
                                                      "cover_message_id": row.get("cover_message_id", 0)})
                                     if kind == "download":
@@ -1485,6 +1506,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     on_progress=state.scan_progress if action == "/api/channel-scan" else None,
                     take_request=state.take_channel_request, close_requests=state.close_channel_requests,
                     on_request_done=lambda request, result, error: media_job_result(config, request, result, error),
+                    on_request_progress=lambda request, result: catalog.update_cover(
+                        catalog_source(config), request["message_id"], **result),
                     media_only=action != "/api/channel-scan")
                 if action == "/api/channel-scan":
                     publish(page)

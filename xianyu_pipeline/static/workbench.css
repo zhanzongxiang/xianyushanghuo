@@ -201,6 +201,22 @@ button.channel-message-cover:hover { outline: 2px solid var(--green); outline-of
 #channel-zoom-level { min-width: 38px; text-align: center; font-variant-numeric: tabular-nums; font-size: 11px; }
 .channel-preview-canvas { display: flex; align-items: flex-start; justify-content: center; max-height: calc(94vh - 104px); min-height: 120px; overflow: auto; background: #f1f4f2; }
 .channel-preview-canvas img { display: block; width: auto; max-width: 100%; max-height: calc(94vh - 104px); height: auto; object-fit: contain; }
+.channel-preview-dialog[open] { display: flex; flex-direction: column; overflow: hidden; }
+.channel-preview-head, .channel-preview-status { flex: 0 0 auto; }
+.channel-preview-status { flex-wrap: wrap; }
+.channel-preview-head .inline-actions { flex-shrink: 0; }
+.channel-preview-dialog .channel-preview-canvas { height: min(64dvh, 640px); min-height: 120px; flex: 1 1 auto; }
+.channel-preview-dialog .channel-preview-canvas img { max-height: min(64dvh, 640px); }
+.channel-preview-dialog:has(#channel-preview-gallery:not([hidden])) .channel-preview-canvas img { max-height: calc(94dvh - 222px); }
+.channel-preview-gallery { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--line); flex: 0 0 auto; }
+.channel-preview-gallery > button { flex-shrink: 0; }
+.channel-preview-strip { display: flex; gap: 6px; flex: 1; min-width: 0; overflow-x: auto; padding: 3px; }
+.channel-preview-strip button { position: relative; flex: 0 0 58px; width: 58px; height: 58px; padding: 2px; overflow: hidden; border-radius: 4px; }
+.channel-preview-strip button[aria-pressed="true"] { border: 2px solid var(--green); background: #e7f1ec; }
+.channel-preview-strip img { width: 100%; height: 100%; display: block; object-fit: contain; }
+.channel-preview-strip img[hidden] { display: none; }
+.channel-preview-strip .gallery-image-error { position: absolute; bottom: 2px; right: 2px; background: white; color: var(--red); width: 16px; height: 16px; }
+#channel-preview-count { flex: 0 0 40px; text-align: center; white-space: nowrap; font-size: 12px; font-variant-numeric: tabular-nums; }
 .channel-message-body { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 20px; }
 .channel-message-copy { min-width: 0; }
 .channel-message-operation { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; max-width: 260px; }

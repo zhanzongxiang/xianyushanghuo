@@ -339,7 +339,7 @@ from xianyu_pipeline import web_ui
 from xianyu_pipeline.models import SourceMessage
 def listing(self, channel, *, before_id=0, limit=12, preview_dir, known_covers=None,
             on_page=None, on_progress=None, take_request=None, close_requests=None,
-            on_request_done=None, media_only=False):
+            on_request_done=None, on_request_progress=None, media_only=False):
     if media_only:
         while (job := take_request()) is not None:
             assert job["kind"] == "download" and job["message_id"] == 42

@@ -53,6 +53,9 @@ def check_forum(page, fixture: Fixture, origin: str, label: str, unique: str):
                                                  "full_cover_url": f"/api/channel-preview/99?source={scope}",
                                                  "full_quality": "full", "cover_quality": "preview"}]}
                 catalogs[scope] = fixture.catalog
+                item = fixture.catalog["messages"][0]
+                item["full_images"] = [{"message_id": 98, "full_cover_url": item["full_cover_url"],
+                                        "full_status": "ready", "full_quality": "full"}]
                 fixture.workbench.update(running=False, action="", channel_scan={})
                 request.fulfill(json={"message": "fixture messages loaded"})
                 return

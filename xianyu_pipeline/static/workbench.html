@@ -29,6 +29,12 @@
         <a class="nav-item" href="?view=channels" data-view="channels" title="来源频道"><i data-lucide="radio-tower"></i><span>来源频道</span></a>
         <a class="nav-item" href="?view=settings" data-view="settings" title="设置"><i data-lucide="settings-2"></i><span>设置</span></a>
       </nav>
+      <section class="sidebar-sources" aria-label="快捷来源频道">
+        <div class="sidebar-source-heading"><span>来源频道</span><button type="button" class="icon-button" data-view="channels" title="管理来源频道" aria-label="管理来源频道"><i data-lucide="settings-2"></i></button></div>
+        <label class="sidebar-search"><i data-lucide="search"></i><input id="sidebar-source-search" type="search" placeholder="查找频道或话题" aria-label="查找频道或话题" autocomplete="off"></label>
+        <div id="sidebar-source-list" class="sidebar-source-list"></div>
+        <p id="sidebar-source-empty" class="sidebar-source-empty" hidden>暂无已保存频道</p>
+      </section>
       <div class="side-bottom">
         <div class="storage-label"><span>本地存储</span><span id="disk-percent">—</span></div>
         <div id="disk-track" class="storage-track" hidden><span></span></div>
@@ -44,13 +50,14 @@
       <div id="errors" class="alerts" aria-live="polite"></div>
       <div id="notice" class="notice" role="status" hidden></div>
       <section class="heading">
-        <div><h1 id="page-title" tabindex="-1">下载任务</h1><p id="page-subtitle">正在读取来源</p></div>
+        <div class="page-heading-title"><span id="page-channel-avatar" class="channel-avatar" hidden></span><div><h1 id="page-title" tabindex="-1">下载任务</h1><p id="page-subtitle">正在读取来源</p></div></div>
         <div class="heading-actions">
           <button id="open-downloads" type="button"><i data-lucide="folder-open"></i><span>下载目录</span></button>
           <a id="open-cloud" class="button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>打开网盘</a>
           <button id="stop" type="button" class="danger-button" hidden><i data-lucide="square"></i>停止任务</button>
           <button id="scan-channel" class="primary" type="button" hidden disabled><i data-lucide="messages-square"></i>获取频道消息</button>
-          <button id="download" class="primary" type="button"><i data-lucide="refresh-cw"></i>扫描并下载</button>
+          <button id="download" type="button"><i data-lucide="arrow-down-to-line"></i>扫描并下载</button>
+          <button id="download-upload" class="primary" type="button" hidden><i data-lucide="cloud-upload"></i>扫描下载并上传</button>
           <button id="upload" class="primary" type="button" hidden><i data-lucide="cloud-upload"></i><span>上传选中素材</span></button>
           <button id="open-naming" type="button" hidden><i data-lucide="languages"></i>中文命名</button>
           <button id="add-channel" type="button" hidden><i data-lucide="plus"></i>添加频道</button>
@@ -59,6 +66,7 @@
       </section>
       <section id="metrics" class="metrics" aria-label="任务统计"></section>
       <section id="channel-messages-section" class="channel-messages-section" aria-label="频道消息" hidden>
+        <div id="channel-catalog-pane" class="channel-catalog-pane">
         <div class="channel-switcher">
           <div class="channel-switcher-main">
             <span class="channel-switcher-label">当前频道</span>
@@ -75,7 +83,7 @@
               </div>
             </div>
           </div>
-          <button type="button" class="text-button" data-view="channels"><i data-lucide="radio-tower"></i>管理来源频道</button>
+          <button type="button" class="icon-button" data-view="channels" title="管理来源频道" aria-label="管理来源频道"><i data-lucide="settings-2"></i></button>
         </div>
         <div id="channel-topic-bar" class="channel-topic-bar" hidden>
           <label for="channel-topic-select">话题分区</label>
@@ -86,22 +94,40 @@
         <div class="channel-toolbar">
           <label class="search-field"><i data-lucide="search"></i><input id="channel-search" type="search" aria-label="搜索频道消息" placeholder="搜索文件名、正文或消息 ID" autocomplete="off"></label>
           <label class="channel-transfer-filter"><i data-lucide="list-filter"></i><select id="channel-transfer-filter" aria-label="筛选消息处理状态"><option value="all">全部状态</option><option value="new">未下载</option><option value="downloaded">已下载</option><option value="transferred">已转存夸克</option></select></label>
-          <span id="channel-scan-status" role="status">尚未读取频道</span>
+          <select id="channel-format" aria-label="文件格式"><option value="all">全部格式</option><option value="rar">RAR</option><option value="zip">ZIP</option></select>
+          <select id="channel-sort" aria-label="资源排序"><option value="latest">最新发布</option><option value="size">文件从小到大</option><option value="name">名称 A → Z</option></select>
+          <div class="catalog-modes" role="group" aria-label="展示方式"><button id="channel-grid-mode" type="button" class="icon-button" title="画廊视图" aria-label="画廊视图" aria-pressed="true"><i data-lucide="layout-grid"></i></button><button id="channel-list-mode" type="button" class="icon-button" title="紧凑列表" aria-label="紧凑列表" aria-pressed="false"><i data-lucide="list"></i></button></div>
         </div>
+        <div class="catalog-filter-line"><div id="channel-status-tabs" class="catalog-tabs" role="group" aria-label="资源处理状态"></div><span id="channel-scan-status" role="status">尚未读取频道</span></div>
         <div id="channel-loading" class="channel-loading" role="status" hidden>
           <span id="channel-loading-icon"></span>
           <div class="channel-loading-text"><strong id="channel-loading-title"></strong><span id="channel-loading-detail"></span></div>
           <span id="channel-loading-time" aria-live="off"></span>
           <progress id="channel-loading-progress" max="100" aria-label="频道加载进度"></progress>
         </div>
-        <div class="channel-batch">
-          <label><input id="channel-select-all" type="checkbox">选择当前结果</label>
-          <span id="channel-selected-count">未选择</span>
-          <button id="channel-download-selected" type="button" class="primary" disabled><i data-lucide="arrow-down-to-line"></i>下载选中</button>
-        </div>
+        <div class="catalog-list-label"><label><input id="channel-select-all" type="checkbox">全选当前结果</label><span id="channel-visible-count"></span><span id="channel-sort-label">按发布时间排列</span></div>
         <div id="channel-message-list" class="channel-message-list"></div>
         <div id="channel-empty" class="empty-state" hidden><i data-lucide="inbox"></i><h2 id="channel-empty-title">暂无消息</h2><p id="channel-empty-detail"></p><button id="channel-empty-action" type="button"><i data-lucide="messages-square"></i>获取频道消息</button></div>
         <div class="channel-more"><span id="channel-result-count"></span><button id="channel-load-older" type="button" hidden><i data-lucide="chevrons-down"></i>读取更早消息</button></div>
+        </div>
+        <aside id="resource-inspector" class="resource-inspector" aria-label="资源详情" tabindex="-1" hidden>
+          <div class="resource-inspector-head"><h2>资源详情</h2><button id="resource-close" class="icon-button" type="button" title="关闭资源详情" aria-label="关闭资源详情"><i data-lucide="x"></i></button></div>
+          <div class="resource-inspector-scroll">
+            <button id="resource-picture" class="resource-picture" type="button" title="放大图片" aria-label="放大资源图片"></button>
+            <div class="resource-picture-note"><span id="resource-picture-status"></span><button id="resource-zoom" class="icon-button" type="button" title="放大图片" aria-label="放大图片"><i data-lucide="expand"></i></button></div>
+            <h3 id="resource-title"></h3><div id="resource-badges" class="channel-message-badges"></div>
+            <section class="resource-detail-section"><h4>原文件</h4><p id="resource-filename"></p><dl><dt>文件大小</dt><dd id="resource-size"></dd><dt>类型</dt><dd id="resource-format"></dd></dl><p id="resource-series" hidden></p></section>
+            <section class="resource-detail-section"><h4>来源与关联</h4><dl><dt>来源</dt><dd id="resource-channel"></dd><dt>文件消息</dt><dd><button id="resource-copy-id" class="text-button" type="button" title="复制消息 ID"><span id="resource-mid"></span><i data-lucide="copy"></i></button></dd><dt>预览图消息</dt><dd id="resource-photo-id"></dd><dt>图片关联</dt><dd id="resource-association"></dd><dt>发布时间</dt><dd id="resource-date"></dd></dl><a id="resource-source" class="text-button" target="_blank" rel="noopener noreferrer"><i data-lucide="external-link"></i>查看 Telegram 原消息</a></section>
+            <section id="resource-caption-section" class="resource-detail-section" hidden><h4>消息正文</h4><p id="resource-caption"></p></section>
+            <section class="resource-detail-section"><h4>存储位置</h4><dl><dt>本地下载</dt><dd id="resource-local"></dd><dt>上传目标</dt><dd id="resource-cloud"></dd></dl><div class="resource-detail-links"><a id="resource-cloud-link" class="text-button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="cloud"></i>查看夸克</a><button id="resource-task" class="text-button" type="button" hidden><i data-lucide="list-checks"></i>任务记录</button></div></section>
+          </div>
+          <div class="resource-detail-actions"><button id="resource-download" type="button"><i data-lucide="arrow-down-to-line"></i><span>仅下载</span></button><button id="resource-download-upload" type="button" class="primary"><i data-lucide="cloud-upload"></i>下载并上传</button></div>
+        </aside>
+        <footer class="channel-batch">
+          <div class="catalog-selection-summary"><span class="catalog-selection-icon"><i data-lucide="square-check"></i></span><div><strong id="channel-selected-count">未选择资源</strong><small id="channel-selected-size"></small></div><button id="channel-clear-selection" class="icon-button" type="button" title="清除资源选择" aria-label="清除资源选择" hidden><i data-lucide="x"></i></button></div>
+          <div class="catalog-queue"><span id="channel-queue-status"></span><button type="button" class="icon-button" data-view="download" title="查看下载任务" aria-label="查看下载任务"><i data-lucide="arrow-up-right"></i></button></div>
+          <div class="catalog-batch-actions"><button id="channel-download-selected" type="button" disabled><i data-lucide="arrow-down-to-line"></i>仅下载</button><button id="channel-download-upload-selected" type="button" class="primary" disabled><i data-lucide="cloud-upload"></i>下载并上传</button></div>
+        </footer>
       </section>
       <dialog id="channel-preview-dialog" class="channel-preview-dialog" aria-label="频道图片预览">
         <div class="channel-preview-head"><span id="channel-preview-title"></span><div class="inline-actions">
@@ -224,13 +250,15 @@
               <label>下载启动 / 无进展等待（秒）<input id="download_start_timeout_seconds" type="number" min="1" max="86400" step="1"></label>
               <label>下载传输时限（秒）<input id="download_transfer_timeout_seconds" type="number" min="1" max="604800" step="1"></label>
               <label>同时下载文件数<input id="download_file_concurrency" type="number" min="1" max="2" step="1"></label>
+              <label>Telegram 下载引擎<select id="telegram_download_engine"><option value="telethon">Telethon</option><option value="tdlib">TDLib</option></select></label>
               <label>单文件分块并发<input id="download_workers" type="number" min="1" max="8" step="1"></label>
+              <div id="tdlib-controls" class="wide browser-info-field" hidden><span>TDLib</span><output id="tdlib-status" role="status">尚未读取</output><button id="tdlib-login" type="button"><i data-lucide="log-in"></i>登录 TDLib</button></div>
               <div class="wide browser-info-field"><span>下载解密组件</span><output id="download-crypto-info">尚未读取</output></div>
               <label class="wide">RAR 校验程序路径（可选）<input id="archive_test_executable_path" placeholder="UnRAR.exe 或 7z.exe 的完整路径" spellcheck="false"></label>
             </div></section>
             <section class="form-section"><h2>上传与存储</h2><div class="form-grid">
               <label>上传方式<select id="upload_provider"><option value="local">本地模拟（先验证下载）</option><option value="quark_api">夸克 API 批量上传</option><option value="quark_cli">夸克 CLI / WSL</option><option value="quark_browser">夸克网页上传</option></select></label>
-              <label class="toggle-field"><span>本次下载完成后自动上传（分卷除外）</span><input id="auto_upload_after_download" type="checkbox" role="switch"></label>
+              <label class="toggle-field"><span>默认下载后自动上传（分卷除外）</span><input id="auto_upload_after_download" type="checkbox" role="switch"></label>
               <label>分享有效期<select id="quark_share_expire_days"><option value="7">7天（默认）</option><option value="1">1天</option><option value="30">30天</option><option value="0">永久有效</option></select></label>
               <div id="quark-api-fields" class="wide form-grid" hidden>
                 <label class="wide">夸克 Cookie<input id="quark_cookie" type="password" autocomplete="new-password" spellcheck="false" placeholder="__uid=...; __pus=...; __puus=..."><span id="quark-cookie-status" class="field-hint">未配置</span></label>
@@ -259,6 +287,17 @@
           <div class="form-actions"><button id="save-config" type="submit" class="primary" disabled><i data-lucide="save"></i>保存配置</button><button id="browser-check" type="button" disabled><i data-lucide="scan-line"></i>检查浏览器</button><button id="telegram-login" type="button" disabled><i data-lucide="log-in"></i>首次登录 Telegram</button><button id="quark-login" type="button" disabled><i data-lucide="log-in"></i>首次登录夸克网页</button><button id="quark-api-check" type="button" disabled hidden><i data-lucide="circle-check"></i>检查夸克 API</button><button id="quark-cli-login" type="button" disabled hidden><i data-lucide="log-in"></i>夸克 CLI 登录</button><button id="quark-cli-check" type="button" disabled hidden><i data-lucide="circle-check"></i>检查夸克 CLI</button><button id="reload-config" type="button" hidden><i data-lucide="refresh-cw"></i>重新读取配置</button><span id="config-dirty" role="status"></span></div>
         </form>
       </section>
+      <dialog id="tdlib-dialog" class="channel-editor-dialog tdlib-dialog" aria-labelledby="tdlib-title">
+        <form id="tdlib-auth-form" autocomplete="off">
+          <div class="channel-editor-head"><h2 id="tdlib-title">TDLib 登录</h2><button id="tdlib-close" type="button" class="icon-button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>
+          <p id="tdlib-auth-status" role="status">请选择登录方式</p>
+          <div id="tdlib-login-methods" class="inline-actions"><button id="tdlib-qr-login" type="button"><i data-lucide="qr-code"></i>二维码登录</button><button id="tdlib-phone-login" type="button"><i data-lucide="smartphone"></i>手机号登录</button></div>
+          <img id="tdlib-qr-image" class="tdlib-qr-image" alt="Telegram 登录二维码" width="240" height="240" hidden>
+          <label id="tdlib-auth-field" hidden><span id="tdlib-auth-label">手机号</span><input id="tdlib-auth-value" type="text" maxlength="512" autocomplete="off" spellcheck="false"></label>
+          <p id="tdlib-auth-error" class="error-note" role="alert" hidden></p>
+          <div class="form-actions"><button id="tdlib-save-config" type="button" class="primary" hidden><i data-lucide="save"></i>保存配置并继续</button><button id="tdlib-auth-submit" type="submit" class="primary" hidden><i data-lucide="check"></i>确认</button></div>
+        </form>
+      </dialog>
       <footer class="footer"><span id="footer-context">本地工作空间</span><span id="last-sync">尚未同步</span></footer>
     </main>
   </div>

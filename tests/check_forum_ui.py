@@ -112,7 +112,8 @@ def check_forum(page, fixture: Fixture, origin: str, label: str, unique: str):
     page.wait_for_function("document.querySelector('.channel-message h2')?.textContent === 'topic-40.rar'")
     page.locator("[data-channel-action='download']").click()
     page.wait_for_function("!document.getElementById('channel-topic-select').disabled")
-    assert fixture.posts[-1] == ("/api/channel-download", {"ids": [99]})
+    assert fixture.posts[-1] == ("/api/channel-download", {
+        "ids": [99], "auto_upload_after_download": False})
     assert_no_overflow(page, f"{label}: forum messages")
     message_image = ARTIFACTS / f"forum-messages-{unique}-{label}.png"
     page.screenshot(path=str(message_image), full_page=True)

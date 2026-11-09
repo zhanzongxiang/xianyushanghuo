@@ -13,6 +13,7 @@ import sys
 import ctypes
 import time
 import zipfile
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -26,6 +27,7 @@ from .models import SourceMessage
 from .browser_profiles import launch_browser_context
 from .download_scheduler import DownloadScheduler
 from .download_diagnostics import DownloadTrace
+from .download_resume import DownloadCheckpoint
 from .runtime import telegram_crypto_backend
 from .telegram_sources import message_topic_id, source_scope
 
@@ -94,12 +96,19 @@ class _TransferEvents:
                          size=size or 0, received=0, speed=0, eta=None, image_paths=[],
                          image_source="", image_message_ids=[], image_group_id="")
         self.data.update(topic_id=topic_id, source_kind=source_kind)
+        self.data.update(resumable=False, resumed_bytes=0, average_speed=0,
+                         download_phase="", download_note="", download_engine="telethon")
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", chat) and chat != "joinchat" and message_id > 0:
             self.data["source_url"] = f"https://t.me/{chat}/{message_id}"
         elif re.fullmatch(r"-[0-9]+", chat) and int(chat) < -1000000000000 and message_id > 0:
             self.data["source_url"] = f"https://t.me/c/{-int(chat) - 1000000000000}/{message_id}"
         self.sample_time = None
         self.sample_bytes = 0
+        self.samples = deque()
+        self.last_emit = None
+        self.started_at = None
+        self.started_bytes = 0
+        self.reported_bytes = False
         self.terminal = False
 
     def emit(self, status: str, **fields) -> None:
@@ -116,19 +125,36 @@ class _TransferEvents:
             except (Exception, asyncio.CancelledError):
                 logging.exception("下载事件回调失败，继续处理附件")
 
-    def start(self) -> None:
+    def start(self, received: int = 0) -> None:
         self.sample_time = time.monotonic()
-        self.sample_bytes = 0
-        self.emit("downloading")
+        self.started_at = self.sample_time
+        self.sample_bytes = self.started_bytes = received
+        self.samples = deque([(self.sample_time, received)])
+        self.last_emit = self.sample_time
+        self.emit("downloading", received=received, resumed_bytes=received,
+                  download_phase="transferring", download_note="")
 
     def progress(self, received: int, size: int | None) -> None:
         now = time.monotonic()
-        elapsed = now - self.sample_time if self.sample_time is not None else 0
-        speed = max(0, received - self.sample_bytes) / elapsed if elapsed > 0 else 0
-        self.sample_time, self.sample_bytes = now, received
+        if self.started_at is None:
+            self.start()
+        self.samples.append((now, received))
+        while len(self.samples) > 2 and self.samples[1][0] <= now - 5:
+            self.samples.popleft()
+        sampled_at, sampled_bytes = self.samples[0]
+        elapsed = now - sampled_at
+        speed = max(0, received - sampled_bytes) / elapsed if elapsed >= 1 else 0
+        total_elapsed = now - self.started_at
+        average = max(0, received - self.started_bytes) / total_elapsed if total_elapsed >= 1 else 0
         total = size if size is not None else self.data["size"]
         eta = max(0, total - received) / speed if total > 0 and speed > 0 else None
-        self.emit("downloading", received=received, size=total, speed=speed, eta=eta)
+        self.data.update(received=received, size=total, speed=speed, eta=eta,
+                         average_speed=average, download_phase="transferring", download_note="")
+        if (not self.reported_bytes and received > self.started_bytes
+                or now - self.last_emit >= 1 or received == total):
+            self.reported_bytes = received > self.started_bytes
+            self.last_emit = now
+            self.emit("downloading")
 
     def fail(self, error: BaseException, local_path: Path | None = None) -> None:
         cause = error
@@ -145,9 +171,9 @@ class _TransferEvents:
 
 
 _PREVIEW_TIMEOUT_SECONDS = 3.0
-_PHOTO_LOOKUP_TIMEOUT_SECONDS = 5.0
-_PHOTO_TIMEOUT_SECONDS = 8.0
-_ALBUM_TIMEOUT_SECONDS = 25.0
+_PHOTO_LOOKUP_TIMEOUT_SECONDS = 15.0
+_PHOTO_TIMEOUT_SECONDS = 30.0
+_ALBUM_TIMEOUT_SECONDS = 90.0
 _CATALOG_COVER_CONCURRENCY = 4
 _CATALOG_PREVIEW_TIMEOUT_SECONDS = 30.0
 _CATALOG_FULL_TIMEOUT_SECONDS = 90.0
@@ -156,6 +182,29 @@ _CHANNEL_AVATAR_TIMEOUT_SECONDS = 4.0
 _CHANNEL_AVATAR_BATCH_TIMEOUT_SECONDS = 30.0
 _ARCHIVE_PARALLEL_MIN_BYTES = 8 * 1024 * 1024
 _ARCHIVE_REQUEST_BYTES = 512 * 1024
+_ARCHIVE_CHUNK_TIMEOUT_SECONDS = 60.0
+_ARCHIVE_CHUNK_RETRIES = 2
+_ARCHIVE_RETRY_DELAY_SECONDS = 1.0
+_ARCHIVE_CONNECTION_RECOVERIES = 3
+_ARCHIVE_CONNECT_TIMEOUT_SECONDS = 45.0
+
+
+class _DownloadChunkError(ConnectionError):
+    def __init__(self, offset: int, cause: Exception):
+        reason = (f"等待分块超过 {_ARCHIVE_CHUNK_TIMEOUT_SECONDS:g} 秒"
+                  if isinstance(cause, TimeoutError) else str(cause) or type(cause).__name__)
+        super().__init__(f"Telegram 分块传输失败: offset={offset}; {reason}")
+        self.offset = offset
+
+
+def _retryable_download_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError, OSError, EOFError)):
+        return True
+    try:
+        from telethon.errors import ServerError, TimedOutError
+    except ImportError:
+        return False
+    return isinstance(error, (ServerError, TimedOutError))
 
 
 class TelethonTelegramAdapter:
@@ -172,7 +221,8 @@ class TelethonTelegramAdapter:
                  download_transfer_timeout_seconds: int = 3600, stop_event: Event | None = None,
                  on_event: Callable[[dict], None] | None = None,
                  exclude_forwarded_posts: bool = False, download_workers: int = 4,
-                 download_file_concurrency: int = 2, source_kind: str = "channel", topic_id: int = 0):
+                 download_file_concurrency: int = 2, source_kind: str = "channel", topic_id: int = 0,
+                 download_engine: str = "telethon"):
         if not api_id or not api_hash:
             raise ValueError("Telegram 适配器需要 api_id 和 api_hash")
         if type(download_workers) is not int or not 1 <= download_workers <= 8:
@@ -192,6 +242,9 @@ class TelethonTelegramAdapter:
         self.download_transfer_timeout_seconds = download_transfer_timeout_seconds
         self.download_workers = download_workers
         self.download_file_concurrency = download_file_concurrency
+        if not isinstance(download_engine, str) or download_engine not in {"telethon", "tdlib"}:
+            raise ValueError("Telegram 下载引擎必须为 telethon 或 tdlib")
+        self.download_engine = download_engine
         self.stop_event = stop_event
         self.on_event = on_event
         self.exclude_forwarded_posts = exclude_forwarded_posts
@@ -201,7 +254,7 @@ class TelethonTelegramAdapter:
         self.source_kind = "forum" if topic_id else source_kind
         self.topic_id = topic_id
 
-    def _client(self):
+    def _client(self, *, session=None):
         from telethon.sync import TelegramClient
         backend = telegram_crypto_backend()
         logging.info("Telegram 下载解密组件: %s; 同时下载文件=%d, 单文件分块=%d, 媒体请求上限=%d",
@@ -231,7 +284,10 @@ class TelethonTelegramAdapter:
 
             client_type = Dc2TelegramClient
         options = {"proxy": self.proxy} if self.proxy else {}
-        client = client_type(self.session_path, self.api_id, self.api_hash, **options)
+        if session is not None:
+            options["receive_updates"] = False
+        client = client_type(self.session_path if session is None else session,
+                             self.api_id, self.api_hash, **options)
         if self.dc2_server:
             session = client.session
             if session.dc_id in (0, 2) and session.auth_key is None:
@@ -246,10 +302,30 @@ class TelethonTelegramAdapter:
                          self.proxy["proxy_type"], self.proxy["addr"], self.proxy["port"])
         return client
 
+    def _check_proxy(self) -> None:
+        if self.proxy and self.proxy["addr"] in {"127.0.0.1", "localhost", "::1"}:
+            try:
+                with socket.create_connection((self.proxy["addr"], self.proxy["port"]), timeout=1):
+                    pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"本机 API 代理 {self.proxy['addr']}:{self.proxy['port']} 未监听；"
+                    "请启动代理服务，或在设置中改为代理软件实际监听的端口，然后重试") from exc
+
+    def _new_download_client(self, original):
+        from telethon.sessions import MemorySession
+
+        session = MemorySession()
+        session.set_dc(original.session.dc_id, original.session.server_address, original.session.port)
+        session.auth_key = original.session.auth_key
+        # Each recovery owns its transport. Never disconnect a sender shared by other files/photos.
+        return self._client(session=session)
+
     def login(self) -> None:
         Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
         client = self._client()
         try:
+            self._check_proxy()
             try:
                 client.start()
             except (ConnectionError, OSError) as exc:
@@ -278,6 +354,7 @@ class TelethonTelegramAdapter:
 
         async def scan():
             check_stop()
+            await asyncio.to_thread(self._check_proxy)
             try:
                 await resolve(client.connect())
             except (ConnectionError, OSError) as exc:
@@ -595,6 +672,7 @@ class TelethonTelegramAdapter:
 
     async def _download_preview(self, client, media, message_id: int, timeout: float,
                                  directory: Path | None = None, thumb: int = -1) -> str:
+        started = time.monotonic()
         # Telethon 1.45 accepts size-type strings, but _get_thumb does not
         # accept PhotoSizeProgressive instances even though it can download them.
         # Resolve by type against this media's sizes instead of passing the object.
@@ -677,6 +755,8 @@ class TelethonTelegramAdapter:
                 else:
                     shutil.copyfile(source, target)
             saved = True
+            logging.info("Telegram 图片下载完成: 图片消息=%s, 尺寸=%s, 字节=%d, 耗时=%.2fs",
+                         message_id, thumb, target.stat().st_size, time.monotonic() - started)
             return str(target)
         finally:
             # Failed or timed-out thumbnail writes must never become image_paths.
@@ -821,11 +901,16 @@ class TelethonTelegramAdapter:
     async def _download_archive_async(self, client, message, name: str,
                                       transfer: _TransferEvents | None = None,
                                       scheduler: DownloadScheduler | None = None) -> Path:
+        if self.download_engine == "tdlib":
+            from .tdlib_download import download_archive
+            return await download_archive(self, client, message, name, transfer)
         scheduler = scheduler or DownloadScheduler(self.download_file_concurrency)
         staging = self.download_dir / ".telegram-api-downloads" / uuid4().hex
         source = staging / name
         received = 0
         parallel = False
+        checkpoint = None
+        invalid_content = False
         trace = DownloadTrace(message=message, filename=name, client=client,
                               workers=self.download_workers,
                               file_concurrency=self.download_file_concurrency,
@@ -834,9 +919,35 @@ class TelethonTelegramAdapter:
             staging.mkdir(parents=True, exist_ok=True)
             if self.stop_event and self.stop_event.is_set():
                 raise DownloadCancelled("已请求停止 Telegram API 下载")
+            size = getattr(message.file, "size", None)
+            chunked = (type(size) is int and size > 0
+                       and source.suffix.lower() in {".zip", ".rar"}
+                       and callable(getattr(client, "iter_download", None)))
+            parallel = chunked and self.download_workers > 1 and size >= _ARCHIVE_PARALLEL_MIN_BYTES
+            if chunked:
+                peer = getattr(message, "peer_id", None)
+                checkpoint = DownloadCheckpoint(
+                    self.download_dir, session=self.session_path,
+                    peer=str(peer) if peer is not None else (transfer.data["chat"] if transfer else ""),
+                    message_id=message.id, document_id=getattr(getattr(message, "document", None), "id", None),
+                    filename=name, size=size, chunk_size=_ARCHIVE_REQUEST_BYTES)
+                checkpoint.acquire()
+                source = checkpoint.source
+                restoring = asyncio.create_task(asyncio.to_thread(checkpoint.restore))
+                try:
+                    received = await asyncio.shield(restoring)
+                except asyncio.CancelledError:
+                    await restoring
+                    raise
+                if transfer is not None:
+                    transfer.data.update(resumable=True, resumed_bytes=received)
+                if received:
+                    logging.info("Telegram API 恢复分块断点: 消息=%d, 已校验=%d/%d 字节, 分块=%d",
+                                 message.id, received, size, len(checkpoint.completed))
             started = last_progress = last_report = time.monotonic()
             first_byte_at = None
-            received = 0
+            resumed_bytes = received
+            trace.resumed_bytes = received
 
             def on_progress(current: int, total: int | None) -> None:
                 nonlocal last_progress, last_report, received, first_byte_at
@@ -846,7 +957,7 @@ class TelethonTelegramAdapter:
                     logging.info("Telegram API 首字节: 消息=%d, 等待=%.2f 秒", message.id, now - started)
                 received = current
                 last_progress = now
-                trace.progress(current)
+                trace.progress(current - resumed_bytes)
                 if transfer is not None:
                     callback_at = time.monotonic()
                     transfer.progress(current, total)
@@ -856,103 +967,191 @@ class TelethonTelegramAdapter:
                                  message.id, current, total if total is not None else "?")
                     last_report = now
 
-            size = getattr(message.file, "size", None)
-            parallel = (self.download_workers > 1 and type(size) is int
-                        and size >= _ARCHIVE_PARALLEL_MIN_BYTES
-                        and source.suffix.lower() in {".zip", ".rar"}
-                        and callable(getattr(client, "iter_download", None)))
-
             async def parallel_download():
                 request_size = _ARCHIVE_REQUEST_BYTES
                 chunks = (size + request_size - 1) // request_size
-                worker_count = min(self.download_workers, chunks)
+                worker_count = min(self.download_workers if parallel else 1, chunks)
+                download_client = client
+                private_client = None
+                recoveries = 0
+                can_reconnect = getattr(getattr(client, "session", None), "auth_key", None) is not None
                 logging.info("Telegram API 单文件分块并发: 消息=%d, 工人=%d, 请求块=%d 字节",
                              message.id, worker_count, request_size)
                 # 同一事件循环内 seek/write 之间没有 await，无需线程或多个会话。
                 # 不预分配文件；进度按成功写入的字节求和，不能使用最高 offset。
-                with source.open("wb", buffering=0) as output:
+                with source.open("r+b" if source.exists() else "w+b", buffering=0) as output:
                     async def worker(index):
                         first = index * chunks // worker_count
                         last = (index + 1) * chunks // worker_count
                         position = first * request_size
                         end = min(size, last * request_size)
-                        iterator = client.iter_download(
-                            message, offset=position, limit=last - first, request_size=request_size)
-                        failed = False
-                        try:
-                            stream = iterator.__aiter__()
-                            while position < end:
-                                queued_at = time.monotonic()
-                                trace.request_state(index, position, "queue")
-                                async with scheduler.requests:
-                                    request_at = time.monotonic()
-                                    trace.request_state(index, position, "fetch")
+                        retries = 0
+                        while position < end:
+                            if self.stop_event and self.stop_event.is_set():
+                                raise DownloadCancelled("已请求停止 Telegram API 下载")
+                            if position // request_size in checkpoint.completed:
+                                position = min(end, position + request_size)
+                                continue
+                            boundary = position // request_size + 1
+                            while boundary < last and boundary not in checkpoint.completed:
+                                boundary += 1
+                            gap_end = min(end, boundary * request_size)
+                            iterator = download_client.iter_download(
+                                message, offset=position,
+                                limit=(gap_end - position + request_size - 1) // request_size,
+                                request_size=request_size)
+                            failed, retry_error = False, None
+                            try:
+                                stream = iterator.__aiter__()
+                                while position < gap_end:
+                                    queued_at = time.monotonic()
+                                    trace.request_state(index, position, "queue")
+                                    async with scheduler.requests:
+                                        request_at = time.monotonic()
+                                        trace.request_state(index, position, "fetch")
+                                        try:
+                                            chunk = await asyncio.wait_for(
+                                                anext(stream), timeout=_ARCHIVE_CHUNK_TIMEOUT_SECONDS)
+                                        except StopAsyncIteration as exc:
+                                            raise RuntimeError(
+                                                f"Telegram API 分块提前结束: offset={position}, 区间终点={gap_end}") from exc
+                                        except Exception as exc:
+                                            if _retryable_download_error(exc):
+                                                retry_error = exc
+                                            raise
+                                        fetched_at = time.monotonic()
+                                    if self.stop_event and self.stop_event.is_set():
+                                        raise DownloadCancelled("已请求停止 Telegram API 下载")
+                                    expected = min(request_size, gap_end - position)
+                                    if (not isinstance(chunk, (bytes, bytearray, memoryview))
+                                            or len(chunk) != expected):
+                                        raise RuntimeError(f"Telegram API 分块长度不一致: offset={position}, "
+                                                           f"预期={expected} 字节")
+                                    trace.request_state(index, position, "write")
+                                    write_at = time.monotonic()
+                                    output.seek(position)
+                                    written = output.write(chunk)
+                                    if written != expected:
+                                        raise RuntimeError("Telegram API 分块文件写入不完整")
+                                    checkpoint.record(position // request_size, chunk)
+                                    checkpoint.flush(output)
+                                    trace.chunk(worker=index, offset=position, size=written,
+                                                queue_s=request_at - queued_at,
+                                                fetch_s=fetched_at - request_at,
+                                                write_s=time.monotonic() - write_at,
+                                                sender=getattr(stream, "_sender", None))
+                                    position += written
+                                    retries = 0
+                                    on_progress(received + written, size)
+                            except BaseException as exc:
+                                failed = True
+                                trace.request_failed(index, exc)
+                                if retry_error is None:
+                                    raise
+                                if can_reconnect or retries >= _ARCHIVE_CHUNK_RETRIES:
+                                    raise _DownloadChunkError(position, retry_error) from retry_error
+                            finally:
+                                close = getattr(iterator, "close", None) or getattr(iterator, "aclose", None)
+                                if close is not None:
                                     try:
-                                        chunk = await anext(stream)
-                                    except StopAsyncIteration:
-                                        break
-                                    fetched_at = time.monotonic()
+                                        result = close()
+                                        if inspect.isawaitable(result):
+                                            closing = asyncio.ensure_future(result)
+                                            try:
+                                                await asyncio.shield(closing)
+                                            except asyncio.CancelledError:
+                                                await closing
+                                                raise
+                                    except Exception as exc:
+                                        if not failed:
+                                            raise
+                                        logging.warning("Telegram API 下载迭代器收尾失败: %s", type(exc).__name__)
+                            if retry_error is not None:
+                                retries += 1
+                                logging.warning("Telegram API 分块重试: 消息=%d, offset=%d, 次数=%d/%d, 原因=%s",
+                                                message.id, position, retries, _ARCHIVE_CHUNK_RETRIES,
+                                                type(retry_error).__name__)
+                                trace.event("chunk_retry", worker=index, offset=position, attempt=retries,
+                                            error_type=type(retry_error).__name__)
+                                if transfer is not None:
+                                    transfer.emit("downloading", speed=0, eta=None, download_phase="retrying",
+                                                  download_note=f"分块等待失败，正在重试 {retries}/{_ARCHIVE_CHUNK_RETRIES}")
+                                await asyncio.sleep(_ARCHIVE_RETRY_DELAY_SECONDS * 2 ** (retries - 1))
+
+                    async def run_workers():
+                        workers = [asyncio.create_task(worker(index)) for index in range(worker_count)]
+                        group = asyncio.gather(*workers)
+                        try:
+                            try:
+                                # Drain every writer before reconnecting or committing the checkpoint.
+                                await asyncio.shield(group)
+                            finally:
+                                for job in workers:
+                                    if not job.done():
+                                        job.cancel()
+                                cleanup = asyncio.gather(group, *workers, return_exceptions=True)
+                                try:
+                                    await asyncio.shield(cleanup)
+                                except asyncio.CancelledError:
+                                    await cleanup
+                                    raise
+                        finally:
+                            checkpoint.flush(output, force=True)
+
+                    async def close_private():
+                        nonlocal private_client
+                        if private_client is not None:
+                            closing_client, private_client = private_client, None
+                            result = closing_client.disconnect()
+                            if inspect.isawaitable(result):
+                                closing = asyncio.ensure_future(result)
+                                try:
+                                    await asyncio.shield(closing)
+                                except asyncio.CancelledError:
+                                    await closing
+                                    raise
+
+                    try:
+                        while True:
+                            try:
+                                await run_workers()
+                                break
+                            except _DownloadChunkError as exc:
+                                if not can_reconnect:
+                                    raise RuntimeError(
+                                        f"{exc}；分块重试 {_ARCHIVE_CHUNK_RETRIES} 次仍失败") from exc
+                                if recoveries >= _ARCHIVE_CONNECTION_RECOVERIES:
+                                    raise RuntimeError(
+                                        f"{exc}；已重建连接 {recoveries}/{_ARCHIVE_CONNECTION_RECOVERIES} 次，"
+                                        "请检查代理节点，已完成分块会保留") from exc
+                                await close_private()
+                                recoveries += 1
+                                worker_count = max(1, worker_count // 2)
+                                note = (f"正在重建下载连接 {recoveries}/{_ARCHIVE_CONNECTION_RECOVERIES}，"
+                                        f"并发降至 {worker_count}，保留已下载分块")
+                                logging.warning("Telegram API %s: 消息=%d, offset=%d",
+                                                note, message.id, exc.offset)
+                                trace.event("connection_recovery", attempt=recoveries,
+                                            workers=worker_count, offset=exc.offset)
+                                if transfer is not None:
+                                    transfer.emit("downloading", speed=0, eta=None,
+                                                  download_phase="retrying", download_note=note)
                                 if self.stop_event and self.stop_event.is_set():
                                     raise DownloadCancelled("已请求停止 Telegram API 下载")
-                                expected = min(request_size, end - position)
-                                if (not isinstance(chunk, (bytes, bytearray, memoryview))
-                                        or len(chunk) != expected):
-                                    raise RuntimeError(f"Telegram API 分块长度不一致: offset={position}, "
-                                                       f"预期={expected} 字节")
-                                trace.request_state(index, position, "write")
-                                write_at = time.monotonic()
-                                output.seek(position)
-                                written = output.write(chunk)
-                                if written != expected:
-                                    raise RuntimeError("Telegram API 分块文件写入不完整")
-                                trace.chunk(worker=index, offset=position, size=written,
-                                            queue_s=request_at - queued_at,
-                                            fetch_s=fetched_at - request_at,
-                                            write_s=time.monotonic() - write_at,
-                                            sender=getattr(stream, "_sender", None))
-                                position += written
-                                on_progress(received + written, size)
-                                if position == end:
-                                    break
-                            if position != end:
-                                raise RuntimeError(f"Telegram API 分块提前结束: offset={position}, "
-                                                   f"区间终点={end}")
-                        except BaseException as exc:
-                            failed = True
-                            trace.request_failed(index, exc)
-                            raise
-                        finally:
-                            close = getattr(iterator, "close", None) or getattr(iterator, "aclose", None)
-                            if close is not None:
+                                await asyncio.to_thread(self._check_proxy)
+                                private_client = self._new_download_client(client)
                                 try:
-                                    result = close()
+                                    result = private_client.connect()
                                     if inspect.isawaitable(result):
-                                        closing = asyncio.ensure_future(result)
-                                        try:
-                                            await asyncio.shield(closing)
-                                        except asyncio.CancelledError:
-                                            await closing
-                                            raise
-                                except Exception as exc:
-                                    if not failed:
-                                        raise
-                                    logging.warning("Telegram API 下载迭代器收尾失败: %s", type(exc).__name__)
-
-                    workers = [asyncio.create_task(worker(index)) for index in range(worker_count)]
-                    group = asyncio.gather(*workers)
-                    try:
-                        # 由 finally 统一取消，避免父任务取消时重复打断 worker 的 close。
-                        await asyncio.shield(group)
+                                        await asyncio.wait_for(result, _ARCHIVE_CONNECT_TIMEOUT_SECONDS)
+                                except (TimeoutError, ConnectionError, OSError) as connection_error:
+                                    raise RuntimeError(
+                                        "Telegram 下载连接重建失败，请检查代理节点；已完成分块会保留"
+                                    ) from connection_error
+                                download_client = private_client
                     finally:
-                        for job in workers:
-                            if not job.done():
-                                job.cancel()
-                        cleanup = asyncio.gather(group, *workers, return_exceptions=True)
-                        try:
-                            await asyncio.shield(cleanup)
-                        except asyncio.CancelledError:
-                            await cleanup
-                            raise
+                        await close_private()
+                    output.truncate(size)
                 if received != size:
                     raise RuntimeError("Telegram API 分块总长度与消息元数据不一致")
                 return str(source)
@@ -961,7 +1160,7 @@ class TelethonTelegramAdapter:
                 nonlocal last_report
 
                 async def transfer():
-                    if parallel:
+                    if chunked:
                         return await parallel_download()
                     async with scheduler.requests:
                         result = client.download_media(message, file=str(source), progress_callback=on_progress)
@@ -1003,7 +1202,7 @@ class TelethonTelegramAdapter:
             if self.stop_event and self.stop_event.is_set():
                 raise DownloadCancelled("已请求停止 Telegram API 下载")
             if transfer is not None:
-                transfer.start()
+                transfer.start(received)
             trace.begin(parallel, _ARCHIVE_REQUEST_BYTES)
             logging.info("Telegram API 开始下载: 消息=%d, 文件=%s, 预期=%s 字节",
                          message.id, name, getattr(message.file, "size", "?"))
@@ -1018,15 +1217,21 @@ class TelethonTelegramAdapter:
                 transfer.emit("validating", received=source.stat().st_size)
             size = getattr(message.file, "size", None)
             if not source.stat().st_size or (size is not None and source.stat().st_size != size):
+                invalid_content = True
                 raise RuntimeError("Telegram API 下载文件大小与消息元数据不一致")
             def validate():
-                if source.suffix.lower() == ".zip":
-                    with zipfile.ZipFile(source) as archive:
-                        bad = archive.testzip()
-                        if bad:
-                            raise RuntimeError(f"ZIP 内容校验失败: {bad}")
-                else:
-                    validate_rar(source, self.archive_test_executable_path, self.archive_test_timeout_seconds)
+                nonlocal invalid_content
+                try:
+                    if source.suffix.lower() == ".zip":
+                        with zipfile.ZipFile(source) as archive:
+                            bad = archive.testzip()
+                            if bad:
+                                raise RuntimeError(f"ZIP 内容校验失败: {bad}")
+                    else:
+                        validate_rar(source, self.archive_test_executable_path, self.archive_test_timeout_seconds)
+                except Exception:
+                    invalid_content = True
+                    raise
 
             # CRC/RAR tests must not block concurrent message and preview requests.
             trace.validating()
@@ -1045,11 +1250,16 @@ class TelethonTelegramAdapter:
                 index += 1
             trace.saving()
             source.replace(target)
+            if checkpoint is not None:
+                try:
+                    checkpoint.discard()
+                except OSError:
+                    logging.warning("文件已保存，旧断点记录暂未清理: 消息=%d", message.id)
             logging.info("Telegram API 附件已校验保存: 消息=%d, 文件=%s, 字节=%d",
                          message.id, target, target.stat().st_size)
             elapsed = max(0.001, transferred_at - started)
             logging.info("Telegram API 下载统计: 消息=%d, 传输耗时=%.2f 秒, 平均=%.2f MiB/s, 分块=%s",
-                         message.id, elapsed, target.stat().st_size / elapsed / 1024 / 1024,
+                         message.id, elapsed, (target.stat().st_size - resumed_bytes) / elapsed / 1024 / 1024,
                          self.download_workers if parallel else 1)
             if transfer is not None:
                 transfer.emit("completed", local_path=str(target.resolve()), received=target.stat().st_size,
@@ -1060,17 +1270,25 @@ class TelethonTelegramAdapter:
             trace.finish("cancelled" if isinstance(exc, (DownloadCancelled, asyncio.CancelledError, KeyboardInterrupt))
                          else "failed", exc)
             recovery = None
-            detail = f"消息 {message.id} 的 {name} 下载失败: {exc}"
+            reason = str(exc) or type(exc).__name__
+            detail = f"消息 {message.id} 的 {name} 下载失败: {reason}"
             if source.is_file():
                 size = source.stat().st_size
-                if not size:
+                resumable = checkpoint is not None and checkpoint.lease is not None and not invalid_content
+                if resumable and checkpoint.received:
+                    recovery = source
+                    detail = (f"消息 {message.id} 的 {name} 下载中断，已接收 {received} 字节；"
+                              f"分块断点已保留，重试时继续下载: {source}; 原因: {reason}")
+                elif not size:
                     try:
                         source.unlink()
                     except OSError:
                         recovery = source
                         logging.exception("零字节 API 暂存文件清理失败: %s", source)
-                    detail = f"消息 {message.id} 的 {name} 下载失败，未收到文件字节: {exc}"
+                    detail = f"消息 {message.id} 的 {name} 下载失败，未收到文件字节: {reason}"
                 else:
+                    if checkpoint is not None and checkpoint.lease is not None:
+                        checkpoint.discard()
                     recovery = self.download_dir / ".unverified" / uuid4().hex / name
                     try:
                         recovery.parent.mkdir(parents=True, exist_ok=True)
@@ -1078,17 +1296,20 @@ class TelethonTelegramAdapter:
                     except OSError:
                         recovery = source
                         logging.exception("API 下载隔离失败，保留原暂存文件: %s", source)
-                    actual_received = received if parallel else size
+                    actual_received = received if chunked else size
                     detail = (f"消息 {message.id} 的 {name} 未通过下载/校验，已接收 {actual_received} 字节，"
-                              f"文件保留待检查: {recovery}; 原因: {exc}")
+                              f"文件保留待检查: {recovery}; 原因: {reason}")
                 if transfer is not None:
-                    transfer.data["received"] = received if parallel else size
+                    transfer.data["received"] = received if chunked else size
+                    transfer.data["resumable"] = resumable and bool(checkpoint.received)
             if transfer is not None:
                 transfer.fail(exc, recovery)
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt)):
                 raise
             raise RuntimeError(detail) from exc
         finally:
+            if checkpoint is not None:
+                checkpoint.release()
             if staging.is_dir() and not any(staging.iterdir()):
                 staging.rmdir()
 
@@ -1103,6 +1324,7 @@ class TelethonTelegramAdapter:
         Path(self.session_path).parent.mkdir(parents=True, exist_ok=True)
         client = self._client()
         try:
+            self._check_proxy()
             try:
                 client.connect()
             except (ConnectionError, OSError) as exc:
@@ -1253,7 +1475,7 @@ class TelethonTelegramAdapter:
             return {"full_cover_path": path, "full_cover_message_id": message_id,
                     "full_status": "ready", "full_error": "", "full_quality": quality}
         return {"cover_path": path, "cover_message_id": message_id,
-                "cover_quality": quality, "cover_status": "ready"}
+                "cover_quality": quality, "cover_status": "ready", "cover_error": ""}
 
     def list_archives(self, channel: str, *, before_id: int = 0, limit: int = 12,
                       preview_dir: Path, known_covers: dict[int, dict] | None = None,
@@ -1300,17 +1522,11 @@ class TelethonTelegramAdapter:
 
         try:
             report()
+            self._check_proxy()
             try:
                 client.connect()
             except (ConnectionError, OSError) as exc:
-                if self.proxy and self.proxy["addr"] in {"127.0.0.1", "localhost", "::1"}:
-                    try:
-                        with socket.create_connection((self.proxy["addr"], self.proxy["port"]), timeout=1):
-                            pass
-                    except OSError:
-                        raise RuntimeError(
-                            f"本机 API 代理 {self.proxy['addr']}:{self.proxy['port']} 未监听；"
-                            "请启动桌面代理后重试读取频道") from exc
+                self._check_proxy()
                 raise RuntimeError("Telegram API 无法连接，请检查网络或配置的代理") from exc
             if not client.is_user_authorized():
                 raise RuntimeError("Telegram API 尚未登录，请先在设置中完成账号授权")
@@ -1331,6 +1547,7 @@ class TelethonTelegramAdapter:
                             raise
                         except Exception as exc:
                             row["cover_status"] = "failed"
+                            row["cover_error"] = f"{type(exc).__name__}: {exc}"
                             logging.warning("频道消息 %s 的封面获取失败，保留消息元数据: %s: %s",
                                             message.id, type(exc).__name__, exc)
                         pending_rows.append(row)
@@ -1509,6 +1726,7 @@ class TelethonTelegramAdapter:
                         for result in results:
                             if isinstance(result, BaseException):
                                 raise result
+                        publish()
                 finally:
                     for task in tasks:
                         if not task.done():

@@ -29,6 +29,7 @@
   actionLabels["channel-topics-scan"] = "获取群组话题";
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
+  plainFields.push("telegram_download_engine");
   plainFields.push("data_server_url", "data_server_workspace", "data_server_backend", "data_server_db_host",
     "data_server_db_name", "data_server_db_user", "data_server_db_tls", "data_server_db_ca");
   numberFields.push("data_server_interval_seconds", "data_server_db_port");
@@ -42,6 +43,8 @@
     configDirty: false, formRevision: 0, pending: false, logs: null, workbenchOK: false,
     lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null,
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
+    catalogMode: "grid", resourceId: null, resourceReturnFocus: null, channelViews: new Map(),
+    restoredScope: "", restoreCatalogScroll: null, sidebarTopics: new Map(),
     previewReturnFocus: null, previewZoom: 1, previewMessageId: null, previewRequested: new Set(), previewErrors: new Map(),
     channels: null, joinedChannels: null, joinedScanRequested: false,
     expandedTopics: new Set(), topicScanRequested: "",
@@ -59,9 +62,35 @@
   let catalogTaskIndex = null;
   let pollTimer = null;
   let noticeTimer = null;
+  let tdlibPollTimer = null;
+  let tdlibAuthState = "";
+  let tdlibAuthPending = false;
+  let tdlibLoginPending = false;
+  let tdlibSavingConfig = false;
+  let tdlibActionError = "";
+  let tdlibStatusError = "";
+  let tdlibStatus = { available: true, state: "loading" };
 
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
   const icon = (name) => `<i data-lucide="${name}" aria-hidden="true"></i>`;
+  if (!$("telegram_download_engine")) {
+    $("download_workers").closest("label").insertAdjacentHTML("beforebegin",
+      '<label>Telegram 下载引擎<select id="telegram_download_engine"><option value="telethon">Telethon</option><option value="tdlib">TDLib</option></select></label>' +
+      '<div id="tdlib-controls" class="wide browser-info-field" hidden><span>TDLib</span><output id="tdlib-status" role="status">尚未读取</output><button id="tdlib-login" type="button"><i data-lucide="log-in"></i>登录 TDLib</button></div>');
+  }
+  if (!$("tdlib-dialog")) {
+    document.body.insertAdjacentHTML("beforeend",
+      '<dialog id="tdlib-dialog" class="channel-editor-dialog tdlib-dialog" aria-labelledby="tdlib-title"><form id="tdlib-auth-form" autocomplete="off">' +
+      '<div class="channel-editor-head"><h2 id="tdlib-title">TDLib 登录</h2><button id="tdlib-close" type="button" class="icon-button" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>' +
+      '<p id="tdlib-auth-status" role="status">请选择登录方式</p><div id="tdlib-login-methods" class="inline-actions"><button id="tdlib-qr-login" type="button"><i data-lucide="qr-code"></i>二维码登录</button><button id="tdlib-phone-login" type="button"><i data-lucide="smartphone"></i>手机号登录</button></div>' +
+      '<img id="tdlib-qr-image" class="tdlib-qr-image" alt="Telegram 登录二维码" width="240" height="240" hidden>' +
+      '<label id="tdlib-auth-field" hidden><span id="tdlib-auth-label">手机号</span><input id="tdlib-auth-value" type="text" maxlength="512" autocomplete="off" spellcheck="false"></label>' +
+      '<p id="tdlib-auth-error" class="error-note" role="alert" hidden></p><div class="form-actions"><button id="tdlib-auth-submit" type="submit" class="primary" hidden><i data-lucide="check"></i>确认</button></div></form></dialog>');
+  }
+  if (!$("tdlib-save-config")) {
+    $("tdlib-auth-submit").insertAdjacentHTML("beforebegin",
+      '<button id="tdlib-save-config" type="button" class="primary" hidden><i data-lucide="save"></i>保存配置并继续</button>');
+  }
   if (!$("channel-topic-bar")) {
     $("channel-messages-section").querySelector(".channel-toolbar").insertAdjacentHTML("beforebegin",
       '<div id="channel-topic-bar" class="channel-topic-bar" hidden><label for="channel-topic-select">话题分区</label><select id="channel-topic-select" aria-label="选择话题"></select><button id="refresh-channel-topics" type="button" class="icon-button" title="刷新话题列表" aria-label="刷新话题列表"><i data-lucide="refresh-cw"></i></button><span id="channel-topic-status" role="status"></span></div>');
@@ -84,6 +113,14 @@
     label.append(select);
     $("channel-search").closest(".search-field").after(label);
   }
+  if (!$("channel-catalog-pane")) $("channel-selected-count").after($("channel-scan-status"));
+  $("channel-download-selected").innerHTML = `${icon("arrow-down-to-line")}仅下载`;
+  $("channel-download-upload-selected").innerHTML = `${icon("cloud-upload")}下载并上传`;
+  const channelManagement = $("channel-messages-section").querySelector(".channel-switcher > [data-view='channels']");
+  channelManagement.className = "icon-button";
+  channelManagement.title = "管理来源频道";
+  channelManagement.setAttribute("aria-label", "管理来源频道");
+  channelManagement.innerHTML = icon("settings-2");
   if (!$("delete-cloud-task")) {
     const button = document.createElement("button");
     button.id = "delete-cloud-task";
@@ -300,20 +337,70 @@
     if (active) {
       const validating = task.download_status === "validating";
       output += `<div class="track ${validating ? "amber " : ""}${!known || validating ? "indeterminate" : ""}" role="progressbar" aria-label="${validating ? "正在校验，校验进度未知" : known ? "下载进度" : "下载进度未知"}"${known && !validating ? ` aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.floor(percent)}"` : ""}><span${known && !validating ? ` style="width:${percent}%"` : ""}></span></div>`;
-      output += `<div class="task-meta"><span>${validating ? "正在校验文件" : finite(task.speed) ? `${escape(bytes(task.speed))}/s` : "速度未知"}</span><span>${validating ? "等待校验结果" : escape(duration(task.eta))}</span></div>`;
+      const current = finite(task.speed) && task.speed > 0 ? `${bytes(task.speed)}/s` : "测速中";
+      const phase = task.download_phase === "retrying" ? task.download_note || "正在重试分块"
+        : task.download_phase === "preparing" ? task.download_note || "正在读取文件信息"
+        : task.download_phase === "waiting" ? "等待 Telegram 数据" : current;
+      const average = finite(task.average_speed) && task.average_speed > 0 ? ` · 平均 ${bytes(task.average_speed)}/s` : "";
+      output += `<div class="task-meta"><span>${validating ? "正在校验文件" : escape(phase + average)}</span><span>${validating ? "等待校验结果" : escape(duration(task.eta))}</span></div>`;
+      if (task.resumed_bytes > 0) output += `<div class="task-meta"><span>${escape(`已恢复 ${bytes(task.resumed_bytes)} 的下载断点`)}</span></div>`;
     } else {
       output += `<div class="task-meta"><span>${escape(task.download_status === "completed" ? validationName(task) : statusInfo(task)[0])}</span><span>${escape(task.images?.length ? `${task.images.length} 张图片` : "暂无图片")}</span></div>`;
     }
+    if (task.download_engine === "tdlib") output += '<div class="task-meta"><span>TDLib</span></div>';
     return output;
+  }
+
+  const imageLoads = new WeakMap();
+
+  function cancelImageLoad(img) {
+    imageLoads.get(img)?.();
+    imageLoads.delete(img);
+  }
+
+  function loadImageWithRetry(img, url, { current, loaded, failed }) {
+    cancelImageLoad(img);
+    let timer = null;
+    let attempts = 0;
+    let cancelled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      img.onload = null;
+      img.onerror = null;
+    };
+    imageLoads.set(img, () => { cancelled = true; cleanup(); });
+    const active = () => !cancelled && current();
+    const retry = () => {
+      cleanup();
+      if (!active()) return;
+      if (attempts >= 2) { failed(); return; }
+      attempts++;
+      timer = setTimeout(start, attempts * 500);
+    };
+    const start = () => {
+      if (!active()) return;
+      img.onload = () => {
+        cleanup();
+        if (active()) loaded();
+      };
+      img.onerror = retry;
+      const source = new URL(url);
+      if (attempts && source.origin === location.origin) source.searchParams.set("_retry", `${Date.now()}-${attempts}`);
+      img.src = source.href;
+      // Lazy task thumbnails start their timeout only once the browser requests them.
+      if (img.loading !== "lazy") timer = setTimeout(retry, 20000);
+    };
+    queueMicrotask(start);
   }
 
   function imageSlot(element, image, large = false) {
     const url = safeURL(image?.url);
     const broken = url && state.brokenImages.has(url);
-    const key = JSON.stringify([url, image?.name, broken, large, image?.pending]);
+    const key = JSON.stringify([url, image?.name, broken, large, image?.pending, image?.eager]);
     if (element.dataset.imageKey === key) return;
     element.dataset.imageKey = key;
     element.classList.add("image-slot");
+    element.querySelectorAll("img").forEach(cancelImageLoad);
     element.replaceChildren();
     if (!url || broken) {
       const fallback = document.createElement("span");
@@ -328,16 +415,19 @@
     const img = document.createElement("img");
     img.alt = String(image.name || "素材展示图");
     img.referrerPolicy = "no-referrer";
-    img.loading = large ? "eager" : "lazy";
+    img.loading = large || image?.eager ? "eager" : "lazy";
     img.decoding = "async";
-    img.addEventListener("error", () => {
-      state.brokenImages.add(url);
-      imageSlot(element, image, large);
-      setError("images", "部分素材图片加载失败，已显示文件图标。", "images");
-    }, { once: true });
-    img.src = url;
-    element.dataset.imageState = "image";
+    element.dataset.imageState = "loading";
     element.append(img);
+    loadImageWithRetry(img, url, {
+      current: () => img.isConnected && element.dataset.imageKey === key,
+      loaded: () => { element.dataset.imageState = "image"; },
+      failed: () => {
+        state.brokenImages.add(url);
+        imageSlot(element, image, large);
+        setError("images", "部分图片读取失败，可重试或点开图片重新获取。", "images");
+      }
+    });
   }
 
   function createRow(id) {
@@ -382,6 +472,7 @@
     const retry = row.querySelector(".row-retry");
     retry.hidden = !canRetry(task);
     retry.disabled = isBusy();
+    html(retry, `${icon("rotate-cw")}${task.resumable ? "继续下载" : "重新下载"}`);
     const link = row.querySelector(".row-link");
     link.hidden = task.remote_device || task.upload_status !== "link_pending";
     link.disabled = isBusy();
@@ -510,7 +601,7 @@
     text("selected-name", taskName(task)); text("selected-filename", task.filename || "文件名未提供");
     text("detail-chat", channelLabel(task.chat)); text("detail-message", task.message_id ?? "未提供");
     const imageSources = {preceding_album: "前置图集（自动关联）", preceding_photo: "前置单图（自动关联）",
-      document_thumbnail: "附件缩略图", zip: "ZIP 内图片"};
+      document_thumbnail: "附件缩略图", zip: "ZIP 内图片", channel_cover: "频道已缓存封面"};
     text("detail-image-source", images.length ? imageSources[task.image_source] || "来源未记录" : "暂无图片");
     text("detail-image-messages", Array.isArray(task.image_message_ids) && task.image_message_ids.length ? task.image_message_ids.join(", ") : "无");
     text("detail-size", bytes(task.size)); text("detail-download", statusInfo(task)[0]);
@@ -530,6 +621,7 @@
     if (share) $("share-link").href = share; else $("share-link").removeAttribute("href");
     $("open-task").hidden = !task.local_path; $("open-task").disabled = state.pending || !state.workbenchOK;
     $("retry-task").hidden = !canRetry(task); $("retry-task").disabled = isBusy();
+    html($("retry-task"), `${icon("rotate-cw")}${task.resumable ? "继续下载" : "重新下载"}`);
     $("retry-link").hidden = task.remote_device || task.upload_status !== "link_pending"; $("retry-link").disabled = isBusy();
     $("delete-cloud-task").hidden = !canDeleteCloud(task); $("delete-cloud-task").disabled = isBusy();
     $("delete-cloud-task").querySelector("span").textContent = deleteCloudLabel(task);
@@ -641,7 +733,9 @@
     if (!canReadChannel()) return [];
     const query = $("channel-search").value.trim().toLocaleLowerCase();
     const filter = $("channel-transfer-filter").value;
-    return (state.catalog?.messages || []).filter((message) => {
+    const format = $("channel-format").value;
+    const rows = (state.catalog?.messages || []).filter((message) => {
+      if (format !== "all" && !String(message.filename).toLowerCase().endsWith(`.${format}`)) return false;
       if (query && ![message.filename, message.text, message.message_id]
         .some((value) => String(value ?? "").toLocaleLowerCase().includes(query))) return false;
       const transfer = catalogTransfer(message);
@@ -649,6 +743,35 @@
         || filter === "downloaded" && Boolean(transfer.downloaded)
         || filter === "transferred" && Boolean(transfer.uploaded);
     });
+    const sort = $("channel-sort").value;
+    return rows.sort((a, b) => sort === "name" ? String(a.filename).localeCompare(String(b.filename))
+      : sort === "size" ? (a.size ?? Infinity) - (b.size ?? Infinity) || b.message_id - a.message_id
+      : b.message_id - a.message_id);
+  }
+
+  function resourceName(message) {
+    return String(message.filename || "").replace(/^@[\w]+\s+/, "").replace(/\.(rar|zip)$/i, "");
+  }
+
+  function rememberChannelView() {
+    if (!state.catalog?.channel) return;
+    state.channelViews.set(state.catalog.channel, {
+      query: $("channel-search").value, filter: $("channel-transfer-filter").value,
+      format: $("channel-format").value, sort: $("channel-sort").value,
+      selected: new Set(state.catalogSelection), scroll: $("channel-catalog-pane").scrollTop
+    });
+  }
+
+  function restoreChannelView(scope) {
+    if (state.restoredScope === scope) return;
+    state.restoredScope = scope;
+    const saved = state.channelViews.get(scope);
+    $("channel-search").value = saved?.query || "";
+    $("channel-transfer-filter").value = saved?.filter || "all";
+    $("channel-format").value = saved?.format || "all";
+    $("channel-sort").value = saved?.sort || "latest";
+    state.catalogSelection = new Set(saved?.selected || []);
+    state.restoreCatalogScroll = saved?.scroll || 0;
   }
 
   function locallyDownloadableMessage(message) {
@@ -717,35 +840,11 @@
     return active;
   }
 
-  const prefetchedPictures = new Set();
-  let prefetchTimer = null;
-  let prefetchKey = "";
-  const canPrefetchPictures = () => state.view === "messages" && !document.hidden
-    && state.data?.running && state.data.channel_requests_open && !state.data.stop_requested
-    && ["channel-scan", "channel-download"].includes(state.data.action)
-    && !state.pending && !state.previewRequested.size && !$("channel-preview-dialog").open;
-
-  function schedulePicturePrefetch() {
-    const candidates = canPrefetchPictures() ? visibleChannelMessages().filter((m) => m.cover_url).slice(0, 3) : [];
-    const candidate = candidates.find((m) => !m.full_cover_url && m.full_status !== "loading"
-      && !prefetchedPictures.has(`${state.catalog?.channel}:${m.message_id}`));
-    const key = candidate ? `${state.catalog?.channel}:${candidate.message_id}` : "";
-    if (prefetchTimer && key === prefetchKey) return;
-    clearTimeout(prefetchTimer);
-    prefetchTimer = null;
-    prefetchKey = key;
-    if (!candidate) return;
-    prefetchTimer = setTimeout(async () => {
-      prefetchTimer = null;
-      prefetchKey = "";
-      if (!canPrefetchPictures()) return;
-      prefetchedPictures.add(key);
-      try { await post("/api/channel-cover", { id: candidate.message_id, prefetch: true }); } catch (_) { /* Click remains available for retry. */ }
-    }, 1500);
-  }
-
   function renderCatalog() {
     if (state.view !== "messages") return;
+    $("channel-messages-section").dataset.mode = state.catalogMode;
+    $("channel-grid-mode").setAttribute("aria-pressed", String(state.catalogMode === "grid"));
+    $("channel-list-mode").setAttribute("aria-pressed", String(state.catalogMode === "list"));
     const rows = visibleChannelMessages();
     const canAct = canLoadChannelMedia();
     const canScan = !isBusy() && canReadChannel();
@@ -759,11 +858,27 @@
     text("channel-selected-count", state.catalogSelection.size ? `已选择 ${state.catalogSelection.size} 条` : "未选择");
     const selectable = rows.filter(downloadableMessage);
     $("channel-select-all").checked = selectable.length > 0 && selectable.every((message) => state.catalogSelection.has(message.message_id));
+    $("channel-select-all").indeterminate = !$("channel-select-all").checked && selectable.some((message) => state.catalogSelection.has(message.message_id));
     $("channel-select-all").disabled = !canSelect || !selectable.length;
     $("channel-download-selected").disabled = !canAct || !selected.length;
+    $("channel-download-upload-selected").disabled = !canAct || !selected.length;
     $("channel-load-older").hidden = !state.catalog?.has_more || !state.catalog?.oldest_scanned_id;
     $("channel-load-older").disabled = !canScan;
     const transfers = (state.catalog?.messages || []).map(catalogTransfer);
+    const counts = { all: transfers.length, new: transfers.filter((item) => !item.downloaded && !item.uploaded).length,
+      downloaded: transfers.filter((item) => item.downloaded).length, transferred: transfers.filter((item) => item.uploaded).length };
+    html($("channel-status-tabs"), Object.entries({ all: "全部资源", new: "未下载", downloaded: "已下载", transferred: "已转存" }).map(([key, label]) =>
+      `<button type="button" data-catalog-filter="${key}" aria-pressed="${$("channel-transfer-filter").value === key}">${label}<span>${counts[key]}</span></button>`).join(""));
+    text("channel-visible-count", `${rows.length} 个资源`);
+    text("channel-sort-label", ({ latest: "按发布时间排列", size: "按文件大小排列", name: "按名称排列" })[$("channel-sort").value]);
+    text("channel-selected-count", selected.length ? `已选择 ${selected.length} 个资源` : "未选择资源");
+    const selectedSize = selected.reduce((sum, message) => sum + (message.size || 0), 0);
+    text("channel-selected-size", selected.length ? `合计 ${bytes(selectedSize)}${selected.some((message) => !message.size) ? " · 部分大小未知" : ""}` : "当前频道");
+    $("channel-clear-selection").hidden = !selected.length;
+    const tasks = [...state.tasks.values()].filter((task) => !task.remote_device);
+    const activeDownloads = tasks.filter((task) => ["downloading", "validating"].includes(task.download_status)).length;
+    const queuedDownloads = tasks.filter((task) => task.download_status === "queued").length;
+    text("channel-queue-status", activeDownloads || queuedDownloads ? `下载中 ${activeDownloads} · 等待 ${queuedDownloads}` : "下载队列空闲");
     text("channel-result-count", state.catalog ? `${rows.length} / ${state.catalog.messages.length} 条压缩包消息 · 已下载 ${transfers.filter((item) => item.downloaded).length} · 已转存 ${transfers.filter((item) => item.uploaded).length}` : "等待频道消息");
     const showEmpty = !rows.length;
     $("channel-empty").hidden = !showEmpty;
@@ -796,33 +911,116 @@
       checkbox.setAttribute("aria-label", `选择 ${message.filename}`);
       checkbox.checked = state.catalogSelection.has(id);
       checkbox.disabled = !canSelect || !downloadableMessage(message);
+      row.classList.toggle("selected", state.catalogSelection.has(id));
+      row.classList.toggle("focused", state.resourceId === id);
       const cover = row.querySelector(".channel-message-cover");
       const pending = loading && message.cover_status === "pending" && !message.cover_url;
-      cover.disabled = !message.cover_url && !(message.cover_status === "failed" && canAct);
-      cover.title = message.cover_url ? "放大图片" : pending ? "封面加载中" : message.cover_status === "failed" ? "重新加载图片" : "暂无配图";
+      const recoverable = ["failed", "cancelled"].includes(message.cover_status);
+      cover.disabled = !message.cover_url && !(recoverable && canAct);
+      cover.title = message.cover_url ? "放大图片" : pending ? "封面加载中" : recoverable ? `重新加载图片：${redact(message.cover_error || "图片未加载")}` : "暂无配图";
       cover.setAttribute("aria-label", `${message.filename}：${cover.title}`);
-      imageSlot(cover, { url: message.cover_url || "", name: message.filename, pending });
+      imageSlot(cover, { url: message.cover_url || "", name: message.filename, pending, eager: true });
       const transfer = catalogTransfer(message);
       const task = transfer.task;
-      const share = externalURL(transfer.uploaded?.share_url);
       const downloadLabel = (transfer.downloaded || transfer.uploaded) && locallyDownloadableMessage(message)
-        ? "下载到本机" : "下载";
-      const source = externalURL(message.source_url);
-      const caption = String(message.text || "").trim().slice(0, 280);
+        ? "下载到本机" : "仅下载";
+      const format = /\.zip$/i.test(message.filename) ? "ZIP" : "RAR";
       html(row.querySelector(".channel-message-body"), `
-          <div class="channel-message-head"><h2>${escape(message.filename)}</h2><div class="channel-message-badges">${catalogBadges(message)}</div></div>
-          <div class="channel-message-meta"><span>消息 #${id}</span><span>${escape(bytes(message.size))}</span><time>${escape(updated(message.date))}</time>${message.series ? `<span class="cover-quality">${escape(seriesLabel(message))}</span>` : ""}${message.cover_url ? `<span class="cover-quality">${message.cover_quality === "full" ? "高清图" : message.cover_quality === "preview" ? "预览图" : "缩略图"}</span>` : ""}</div>
-          ${caption ? `<p class="channel-caption">${escape(caption)}</p>` : ""}
-          <div class="channel-message-actions">
-            <button type="button" data-channel-action="download" ${!canAct || !locallyDownloadableMessage(message) ? "disabled" : ""}>${icon("arrow-down-to-line")}${downloadLabel}</button>
-            ${share ? `<a class="button" href="${escape(share)}" target="_blank" rel="noopener noreferrer">${icon("cloud")}查看夸克</a>` : ""}
-            ${source ? `<a class="button" href="${escape(source)}" target="_blank" rel="noopener noreferrer">${icon("external-link")}原消息</a>` : ""}
-            ${task ? `<button type="button" class="text-button" data-channel-action="task">${icon("list-checks")}任务记录</button>` : ""}
+          <div class="channel-message-copy">
+            <div class="channel-message-head"><h2><button type="button" data-channel-action="inspect" title="${escape(message.filename)}">${escape(resourceName(message))}</button></h2></div>
+            <div class="channel-message-meta"><b class="resource-file-format">${format}</b><span>${escape(bytes(message.size))}</span><span class="resource-message-id" title="文件消息 ID">#${id}</span></div>
+            ${message.series ? `<span class="resource-series" title="${escape(seriesLabel(message))}">${escape(seriesLabel(message))}</span>` : ""}
           </div>
+          <div class="channel-message-operation">
+            <div class="channel-message-badges">${catalogBadges(message)}</div>
+            <div class="channel-message-actions">
+              <button type="button" class="icon-button" data-channel-action="download" title="${downloadLabel}" aria-label="${downloadLabel}" ${!canAct || !locallyDownloadableMessage(message) ? "disabled" : ""}>${icon("arrow-down-to-line")}</button>
+              <button type="button" class="icon-button" data-channel-action="download-upload" title="下载并上传" aria-label="下载并上传" ${!canAct || !locallyDownloadableMessage(message) ? "disabled" : ""}>${icon("cloud-upload")}</button>
+            </div>
+          </div>
+          ${task && ["downloading", "validating", "queued"].includes(task.download_status) ? `<div class="resource-transfer-progress" title="${escape(statusInfo(task)[0])}" role="progressbar" aria-label="下载进度" ${task.size > 0 ? `aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.floor(Math.min(100, (task.received || 0) / task.size * 100))}"` : ""}><span style="width:${task.size > 0 ? Math.min(100, (task.received || 0) / task.size * 100) : 0}%"></span></div>` : ""}
       `);
     });
+    renderResourceInspector();
     renderChannelPreview();
-    schedulePicturePrefetch();
+    if (state.restoreCatalogScroll !== null) {
+      $("channel-catalog-pane").scrollTop = state.restoreCatalogScroll;
+      state.restoreCatalogScroll = null;
+    }
+  }
+
+  function openResourceInspector(message, trigger) {
+    state.resourceId = message.message_id;
+    state.resourceReturnFocus = trigger;
+    renderCatalog();
+    $("resource-close").focus({ preventScroll: true });
+  }
+
+  function closeResourceInspector(focus = true) {
+    state.resourceId = null;
+    $("resource-inspector").hidden = true;
+    $("channel-messages-section").classList.remove("with-resource");
+    for (const row of state.catalogRows.values()) row.classList.remove("focused");
+    if (focus && state.resourceReturnFocus?.isConnected) state.resourceReturnFocus.focus({ preventScroll: true });
+    state.resourceReturnFocus = null;
+  }
+
+  function renderResourceInspector() {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.resourceId);
+    if (!message) { closeResourceInspector(false); return; }
+    $("resource-inspector").hidden = false;
+    $("channel-messages-section").classList.add("with-resource");
+    const transfer = catalogTransfer(message);
+    const full = safeURL(message.full_cover_url);
+    imageSlot($("resource-picture"), { url: full && !state.brokenImages.has(full) ? full : message.cover_url,
+      name: message.filename, pending: message.cover_status === "pending" }, true);
+    const canPreview = Boolean(message.cover_url || message.full_cover_url) || canLoadChannelMedia()
+      && ["failed", "cancelled"].includes(message.cover_status);
+    $("resource-picture").disabled = $("resource-zoom").disabled = !canPreview;
+    text("resource-picture-status", message.full_cover_url ? "已缓存大图" : message.cover_url ? "预览图片" : message.cover_status === "pending" ? "图片加载中" : message.cover_error || "暂无配图");
+    text("resource-title", resourceName(message));
+    html($("resource-badges"), catalogBadges(message));
+    text("resource-filename", message.filename);
+    text("resource-size", bytes(message.size));
+    text("resource-format", /\.zip$/i.test(message.filename) ? "ZIP 压缩包" : "RAR 压缩包");
+    $("resource-series").hidden = !message.series;
+    text("resource-series", seriesLabel(message));
+    text("resource-channel", sourceTitle());
+    text("resource-mid", `#${message.message_id}`);
+    const photoId = message.cover_message_id || message.full_cover_message_id;
+    text("resource-photo-id", photoId ? `#${photoId}` : "未记录");
+    text("resource-association", !photoId ? "未记录" : photoId === message.message_id ? "附件缩略图" : "相邻消息匹配 · 待核对");
+    text("resource-date", updated(message.date));
+    const link = externalURL(message.source_url);
+    $("resource-source").hidden = !link;
+    if (link) $("resource-source").href = link; else $("resource-source").removeAttribute("href");
+    text("resource-caption", message.text || "");
+    $("resource-caption-section").hidden = !message.text;
+    text("resource-local", transfer.task && !transfer.task.remote_device && transfer.task.local_path || state.config?.inbox_dir || "尚未配置");
+    text("resource-cloud", transfer.uploaded?.upload_target || state.data?.upload_target || "尚未配置");
+    const share = externalURL(transfer.uploaded?.share_url);
+    $("resource-cloud-link").hidden = !share;
+    if (share) $("resource-cloud-link").href = share; else $("resource-cloud-link").removeAttribute("href");
+    $("resource-task").hidden = !transfer.task;
+    $("resource-download").disabled = $("resource-download-upload").disabled = !canLoadChannelMedia() || !locallyDownloadableMessage(message);
+    $("resource-download").querySelector("span").textContent = (transfer.downloaded || transfer.uploaded) && locallyDownloadableMessage(message) ? "下载到本机" : "仅下载";
+  }
+
+  function renderSidebarSources() {
+    const query = $("sidebar-source-search").value.trim().toLocaleLowerCase();
+    const rows = savedChannels().filter((row) => !query || [row.name, row.title, row.username, row.key,
+      ...(row.topics || []).map((topic) => topic.title)].some((value) => String(value || "").toLocaleLowerCase().includes(query)));
+    const busy = isBusy();
+    html($("sidebar-source-list"), rows.map((row) => {
+      const active = selectedChannel()?.key === row.key;
+      const expanded = Boolean(query || (state.sidebarTopics.get(row.key) ?? active));
+      return `<div class="sidebar-source-group"><div class="sidebar-source-row ${active ? "active" : ""}">
+        <button type="button" data-source-select="${escape(row.key)}" title="${escape(row.name)}" ${busy ? "disabled" : ""} ${active ? 'aria-current="true"' : ""}><span class="channel-avatar">${avatarMarkup(row)}</span><span class="sidebar-source-copy"><strong>${escape(row.name)}</strong><small>${escape(channelSubtitle(row))}</small></span></button>
+        ${row.forum ? `<button type="button" class="icon-button" data-source-expand="${escape(row.key)}" title="展开或收起话题" aria-label="${escape(row.name)}的话题" aria-expanded="${expanded}">${icon(expanded ? "chevron-down" : "chevron-right")}</button>` : ""}</div>
+        ${row.forum && expanded ? `<div class="sidebar-topic-list">${(row.topics || []).map((topic) => `<button type="button" data-source-select="${escape(row.key)}" data-source-topic="${topic.topic_id}" ${busy ? "disabled" : ""} ${active && selectedTopic()?.topic_id === topic.topic_id ? 'aria-current="true"' : ""} title="${escape(topic.title)}">${icon("hash")}<span>${escape(topic.title)}</span></button>`).join("") || `<button type="button" data-source-scan="${escape(row.key)}" ${busy ? "disabled" : ""}>${icon("refresh-cw")}获取话题</button>`}</div>` : ""}</div>`;
+    }).join(""));
+    $("sidebar-source-empty").hidden = Boolean(rows.length);
+    text("sidebar-source-empty", savedChannels().length ? "没有匹配的频道" : "暂无已保存频道");
   }
 
   function renderChannelSwitcher() {
@@ -962,8 +1160,9 @@
     text("channel-preview-title", message.filename);
     const image = $("channel-preview-image");
     image.alt = `频道消息 ${message.message_id} 的封面`;
-    const url = safeURL(message.full_cover_url || message.cover_url);
-    if (url) image.src = url; else image.removeAttribute("src");
+    cancelImageLoad(image);
+    image.removeAttribute("src");
+    delete image.dataset.sourceUrl;
     updatePreviewZoom();
     $("channel-preview-dialog").showModal();
     $("channel-preview-close").focus();
@@ -975,37 +1174,64 @@
     if (!$("channel-preview-dialog").open) return;
     const message = state.catalog?.messages.find((row) => row.message_id === state.previewMessageId);
     if (!message) return;
-    const full = safeURL(message.full_cover_url);
-    if (full && $("channel-preview-image").src !== full) $("channel-preview-image").src = full;
-    const loading = !full && (message.full_status === "loading" || state.previewRequested.has(message.message_id));
+    const candidate = safeURL(message.full_cover_url);
+    const full = state.brokenImages.has(candidate) ? "" : candidate;
+    const cover = safeURL(message.cover_url);
+    const source = full || (state.brokenImages.has(cover) ? "" : cover);
+    const image = $("channel-preview-image");
+    image.hidden = !source;
+    if (source && image.dataset.sourceUrl !== source) {
+      image.dataset.sourceUrl = source;
+      const revision = state.channelRevision;
+      loadImageWithRetry(image, source, {
+        current: () => $("channel-preview-dialog").open && revision === state.channelRevision
+          && state.previewMessageId === message.message_id && image.dataset.sourceUrl === source,
+        loaded: () => {
+          if (full) {
+            state.previewErrors.delete(message.message_id);
+            renderChannelPreview();
+          }
+        },
+        failed: () => {
+          state.brokenImages.add(source);
+          state.previewErrors.set(message.message_id, "图片缓存读取失败，可重新获取；已有预览图会保留");
+          renderChannelPreview();
+        }
+      });
+    }
+    const loading = message.full_status === "loading" || state.previewRequested.has(message.message_id);
     const error = state.previewErrors.get(message.message_id) || message.full_error;
-    const failed = !full && !loading && (Boolean(error) || ["failed", "cancelled"].includes(message.full_status));
-    text("channel-preview-status-text", full
-      ? message.full_quality === "document_thumbnail" ? "附件预览图" : message.full_quality === "large" ? "清晰大图（非最大尺寸）" : "最大尺寸图"
-      : loading ? "正在加载高清图" : failed ? `高清图未加载：${redact(error || "请重试")}` : "预览图");
+    const failed = !loading && (Boolean(error) || !full && ["failed", "cancelled"].includes(message.full_status)
+      || candidate && state.brokenImages.has(candidate) || !source && state.brokenImages.has(cover));
+    text("channel-preview-status-text", loading ? "正在加载高清图" : failed ? `高清图未加载：${redact(error || "请重试")}`
+      : full ? message.full_quality === "document_thumbnail" ? "附件预览图" : message.full_quality === "large" ? "清晰大图（非最大尺寸）" : "最大尺寸图" : "预览图");
     html($("channel-preview-status-icon"), icon(loading ? "loader-circle" : failed ? "circle-alert" : full ? "image" : "eye"));
     $("channel-preview-status-icon").querySelector(".lucide")?.classList.toggle("loading-spinner", loading);
     $("channel-preview-retry").hidden = !failed;
     $("channel-preview-retry").disabled = !canLoadChannelMedia();
+    $("channel-preview-original").disabled = loading || !canLoadChannelMedia();
     $("channel-preview-status").dataset.stage = loading ? "loading" : failed ? "failed" : "ready";
   }
 
   async function loadChannelFullImage(id, original = false) {
     if (!canLoadChannelMedia() || state.previewRequested.has(id)) return;
+    const revision = state.channelRevision;
+    const message = state.catalog?.messages.find((row) => row.message_id === id);
+    const refresh = [message?.full_cover_url, message?.cover_url].some((url) => state.brokenImages.has(safeURL(url)));
     state.previewErrors.delete(id);
     state.previewRequested.add(id);
     renderChannelPreview();
     try {
-      const result = await post("/api/channel-cover", { id, original });
-      if (result.url && state.previewMessageId === id && $("channel-preview-dialog").open) {
-        $("channel-preview-image").src = safeURL(result.url);
-      }
-      await refreshAll();
+      await post("/api/channel-cover", { id, original, ...(refresh ? { refresh: true } : {}) });
+      if (revision !== state.channelRevision) return;
+      await Promise.all([refreshCatalog(), refreshWorkbench()]);
     } catch (error) {
-      state.previewErrors.set(id, error.message);
+      if (revision === state.channelRevision) state.previewErrors.set(id, error.message);
     } finally {
-      state.previewRequested.delete(id);
-      renderChannelPreview();
+      if (revision === state.channelRevision) {
+        state.previewRequested.delete(id);
+        renderChannelPreview();
+      }
     }
   }
 
@@ -1014,6 +1240,12 @@
     const source = state.config?.source_channel_url;
     const subtitle = ({ messages: sourceTitle() || "已保存频道", download: source ? sourceTitle() || channelLabel(source) : "尚未配置来源频道", upload: data?.upload_target || "上传目标尚未读取", library: "已下载或已上传的素材", history: "任务状态与运行日志", channels: `${savedChannels().length} 个已保存频道`, settings: "本地配置" })[state.view];
     text("page-subtitle", state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
+    text("page-title", state.view === "messages" ? sourceTitle() || "频道消息" : views[state.view]);
+    $("page-channel-avatar").hidden = state.view !== "messages";
+    if (state.view === "messages") {
+      html($("page-channel-avatar"), avatarMarkup(selectedChannel()));
+      text("page-subtitle", selectedChannel() ? channelSubtitle(selectedChannel()) : "已保存频道");
+    }
     text("download-source", source ? sourceTitle() || channelLabel(source) : state.configLoaded ? "尚未配置来源频道" : "来源配置尚未读取");
     text("upload-target", data?.upload_target || "未配置");
     const runningLabel = actionLabels[data?.action] || "执行任务";
@@ -1025,6 +1257,8 @@
     $("connection").setAttribute("aria-label", connectionLabel);
     $("download").hidden = state.view !== "download";
     $("download").disabled = isBusy() || !state.configLoaded || Boolean(source && !canReadChannel());
+    $("download-upload").hidden = state.view !== "download";
+    $("download-upload").disabled = $("download").disabled;
     $("scan-channel").hidden = state.view !== "messages";
     $("scan-channel").disabled = isBusy() || !canReadChannel();
     const scanning = state.scanRequested || data?.running && data.action === "channel-scan";
@@ -1150,6 +1384,7 @@
 
   function render() {
     renderHeader();
+    renderSidebarSources();
     if (taskViews.has(state.view)) { renderMetrics(); renderList(); }
     if (state.view === "channels") renderChannels();
     renderNaming();
@@ -1242,15 +1477,12 @@
     if (!views[view]) view = "download";
     state.scroll[state.view] = window.scrollY;
     state.view = view;
-    if (view !== "messages") {
-      clearTimeout(prefetchTimer);
-      prefetchTimer = null;
-      prefetchKey = "";
-    }
     closeChannelPicker(false);
     closeInspector();
+    if (view !== "messages") closeResourceInspector(false);
     if (push) { const url = new URL(location.href); url.searchParams.set("view", view); history.pushState({}, "", url); }
     document.title = `${views[view]} · 素材工作台`;
+    document.body.dataset.view = view;
     text("breadcrumb", views[view]); text("page-title", views[view]);
     for (const link of document.querySelectorAll(".nav-item")) {
       link.classList.toggle("active", link.dataset.view === view);
@@ -1348,6 +1580,7 @@
           state.catalogRows.clear();
         }
         state.catalog = data;
+        restoreChannelView(data.channel);
         setError("catalog", "");
       } catch (error) { setError("catalog", error.message, "catalog"); }
       render();
@@ -1415,14 +1648,22 @@
     try { await logsRequest; } finally { logsRequest = null; }
   }
 
+  async function refreshPage() {
+    const channels = refreshChannels();
+    await Promise.all([refreshWorkbench(), Promise.all([channels, configRequest]).then(() => {
+      if (state.view === "messages") return refreshCatalog();
+    })]);
+  }
+
   async function refreshAll() {
-    await Promise.all([refreshWorkbench(), refreshLogs(), refreshChannels(), refreshJoinedChannels()]);
-    if (state.view === "messages") await refreshCatalog();
+    await Promise.all([refreshPage(), refreshLogs(), refreshJoinedChannels()]);
   }
 
   async function poll() {
     clearTimeout(pollTimer);
-    await refreshAll();
+    void refreshLogs();
+    void refreshJoinedChannels();
+    await refreshPage();
     pollTimer = setTimeout(poll, document.hidden ? 10000 : state.data?.running && state.data.channel_requests_open ? 1000 : 2000);
   }
 
@@ -1461,12 +1702,121 @@
     $("quark-cli-login").hidden = !quarkCLI;
     $("quark-cli-check").hidden = !quarkCLI;
     $("quark-login").hidden = !quark;
+    const tdlib = $("telegram_download_engine").value === "tdlib";
+    $("telegram_download_engine").closest("label").hidden = state.config?.telegram_download_engine === undefined;
+    $("tdlib-controls").hidden = !tdlib;
+    $("download_workers").closest("label").hidden = tdlib;
+    $("download-crypto-info").parentElement.hidden = tdlib;
+    if (tdlib) void refreshTdlibStatus();
     text("api-status", `API ID ${state.apiIdConfigured ? "已保存" : "未配置"} · API Hash ${state.apiConfigured ? "已保存" : "未配置"}`);
     renderHeader();
   }
 
   function showBrowser(config) {
     text("browser-info", redact(config.browser_profile_error || [config.browser_version ? `版本 ${config.browser_version}` : "版本未提供", config.browser_profile_status, config.browser_profile_dir].filter(Boolean).join(" | ")));
+  }
+
+  function tdlibLoginBlocker() {
+    if (tdlibSavingConfig) return "正在保存配置";
+    if (!state.configLoaded) return "设置尚未读取完成，请稍后重试";
+    if (isBusy()) return "请在当前任务结束后登录 TDLib";
+    if (state.configDirty) return "设置有未保存的修改，请先保存配置";
+    return "";
+  }
+
+  function renderTdlibStatus(status) {
+    tdlibStatus = status;
+    const labels = { loading: "正在读取登录状态", idle: "尚未登录", initializing: "初始化中", phone: "等待手机号", qr_pending: "正在获取二维码",
+      qr: "等待扫码确认", code: "等待验证码", password: "等待两步验证密码", email: "等待邮箱",
+      email_code: "等待邮箱验证码", ready: "已登录", closing: "关闭中", closed: "已关闭",
+      unsupported: "需要额外验证" };
+    text("tdlib-status", !status.available ? status.error || "未安装 TDLib" :
+      `${status.version ? status.version + " · " : ""}${labels[status.state] || "尚未登录"}`);
+    if (!$("tdlib-dialog").open) return;
+    const previous = tdlibAuthState;
+    tdlibAuthState = status.state || "";
+    tdlibAuthPending = status.auth_pending === true;
+    const blocker = tdlibLoginBlocker();
+    const error = tdlibActionError || blocker || status.error || tdlibStatusError;
+    text("tdlib-auth-status", tdlibSavingConfig ? "正在保存配置" : blocker ? "暂时无法登录" :
+      tdlibLoginPending ? "正在连接 TDLib" : status.state === "qr" ? "等待手机 Telegram 扫码确认" :
+      status.state === "password" ? `两步验证${status.hint ? " · " + status.hint : ""}` :
+      labels[status.state] || "请选择登录方式");
+    $("tdlib-auth-error").hidden = !error || tdlibSavingConfig;
+    text("tdlib-auth-error", error);
+    $("tdlib-save-config").hidden = !state.configDirty || tdlibSavingConfig || isBusy();
+    $("tdlib-qr-login").disabled = $("tdlib-phone-login").disabled = !!blocker || tdlibLoginPending || !status.available;
+    $("tdlib-login-methods").hidden = !!blocker || !["idle", "closed", "phone"].includes(status.state)
+      && !(status.state === "qr_pending" && status.error);
+    const fields = { phone: ["手机号（含国际区号）", "tel"], code: ["登录验证码", "text"],
+      password: ["两步验证密码", "password"], email: ["邮箱地址", "email"], email_code: ["邮箱验证码", "text"] };
+    const field = !blocker && fields[status.state];
+    $("tdlib-auth-field").hidden = !field;
+    $("tdlib-auth-submit").hidden = !field;
+    $("tdlib-auth-submit").disabled = tdlibAuthPending;
+    $("tdlib-auth-value").required = !!field;
+    if (field) {
+      text("tdlib-auth-label", field[0]);
+      $("tdlib-auth-value").type = field[1];
+      if (previous !== status.state) { $("tdlib-auth-value").value = ""; $("tdlib-auth-value").focus(); }
+    }
+    const image = $("tdlib-qr-image");
+    image.hidden = !!blocker || status.state !== "qr";
+    if (!blocker && status.qr_url && image.getAttribute("src") !== status.qr_url) image.src = status.qr_url;
+    if (blocker || status.state !== "qr") image.removeAttribute("src");
+    if (status.authorized && !blocker) { $("tdlib-dialog").close(); notice("TDLib 登录成功"); }
+  }
+
+  async function refreshTdlibStatus() {
+    try {
+      const status = await request("/api/tdlib/status");
+      tdlibStatusError = "";
+      renderTdlibStatus(status);
+    } catch (error) {
+      text("tdlib-status", error.message);
+      if ($("tdlib-dialog").open) {
+        tdlibStatusError = error.message;
+        renderTdlibStatus(tdlibStatus);
+      }
+    }
+    clearTimeout(tdlibPollTimer);
+    if ($("tdlib-dialog").open) tdlibPollTimer = setTimeout(refreshTdlibStatus, 1500);
+  }
+
+  async function beginTdlibLogin(method) {
+    if (tdlibLoginPending || tdlibLoginBlocker()) { renderTdlibStatus(tdlibStatus); return; }
+    tdlibActionError = "";
+    tdlibLoginPending = true;
+    renderTdlibStatus(tdlibStatus);
+    try {
+      renderTdlibStatus(await post("/api/tdlib/login", { method }));
+      await refreshTdlibStatus();
+    } catch (error) {
+      tdlibActionError = error.message;
+    } finally { tdlibLoginPending = false; renderTdlibStatus(tdlibStatus); }
+  }
+
+  async function saveTdlibConfig() {
+    if (isBusy() || !state.configLoaded || tdlibSavingConfig) return;
+    $("tdlib-dialog").close();
+    if (!validate()) return;
+    tdlibSavingConfig = true;
+    tdlibActionError = "";
+    state.pending = true;
+    render();
+    $("tdlib-dialog").showModal();
+    renderTdlibStatus(tdlibStatus);
+    try {
+      if (!await saveConfig()) throw new Error("配置已保存，但重新读取失败，请检查本地服务后重试");
+      setError("action", "");
+    } catch (error) {
+      tdlibActionError = error.message;
+    } finally {
+      state.pending = false;
+      tdlibSavingConfig = false;
+      render();
+      await refreshTdlibStatus();
+    }
   }
 
   async function refreshBrowserInfo() {
@@ -1643,12 +1993,16 @@
     finally { state.pending = false; await refreshAll(); render(); }
   }
 
-  async function configuredAction(path, purpose, success) {
+  async function configuredAction(path, purpose, success, payload = {}) {
     if (isBusy() || !state.configLoaded) return;
+    if (path === "/api/download" && !state.configDirty) {
+      await mutation(async () => { await post(path, payload); notice(success); });
+      return;
+    }
     if (!validate(purpose)) return;
     await mutation(async () => {
       if (!await saveConfig()) return;
-      await post(path);
+      await post(path, payload);
       if (purpose === "browser") state.browserRefreshPending = true;
       notice(success);
     });
@@ -1670,7 +2024,7 @@
 
   async function retryTask(task) {
     if (!task || isBusy() || !canRetry(task)) return;
-    await mutation(async () => { await post("/api/retry", { id: task.id }); notice("已请求重新下载"); });
+    await mutation(async () => { await post("/api/retry", { id: task.id, auto_upload_after_download: false }); notice(task.resumable ? "已请求继续下载" : "已请求重新下载"); });
   }
 
   async function deleteCloudTask(task) {
@@ -1721,6 +2075,10 @@
   }
 
   function clearChannelView() {
+    rememberChannelView();
+    closeResourceInspector(false);
+    state.restoredScope = "";
+    if ($("channel-preview-dialog").open) $("channel-preview-dialog").close();
     state.channelRevision++;
     state.catalogSelection.clear();
     state.previewErrors.clear();
@@ -1730,6 +2088,8 @@
     state.catalogRows.clear();
     $("channel-search").value = "";
     $("channel-transfer-filter").value = "all";
+    $("channel-format").value = "all";
+    $("channel-sort").value = "latest";
   }
 
   async function scanTopics(key) {
@@ -1811,13 +2171,13 @@
     });
   }
 
-  async function downloadChannelMessages(ids) {
+  async function downloadChannelMessages(ids, autoUpload = false) {
     if (!canLoadChannelMedia() || !ids.length) return;
     if (ids.length > 20) { setError("action", "每次最多下载 20 条消息，请减少选择。"); return; }
     if (state.configDirty) { setError("action", "请先保存设置，再下载频道文件。"); return; }
     await mutation(async () => {
-      await post("/api/channel-download", { ids });
-      notice(`已提交 ${ids.length} 条下载任务`);
+      await post("/api/channel-download", { ids, auto_upload_after_download: autoUpload });
+      notice(`已提交 ${ids.length} 条${autoUpload ? "下载并上传" : "仅下载"}任务`);
     });
   }
 
@@ -1894,6 +2254,7 @@
         state.brokenImages.clear(); setError("images", "");
         $("preview-strip").dataset.gallery = "";
         renderList();
+        renderCatalog();
       }, "joined-channels": refreshJoinedChannels };
       void actions[retry.dataset.retry]?.(); return;
     }
@@ -1925,11 +2286,12 @@
     const message = state.catalog?.messages.find((item) => item.message_id === Number(button.closest("[data-message-id]")?.dataset.messageId));
     if (!message) return;
     if (button.dataset.channelAction === "preview") openChannelPreview(message, button);
-    if (button.dataset.channelAction === "download" && locallyDownloadableMessage(message)) {
+    if (button.dataset.channelAction === "inspect") openResourceInspector(message, button);
+    if (["download", "download-upload"].includes(button.dataset.channelAction) && locallyDownloadableMessage(message)) {
       const ids = message.series
         ? (state.catalog?.messages || []).filter((item) => item.series_key === message.series_key && locallyDownloadableMessage(item)).map((item) => item.message_id)
         : [message.message_id];
-      void downloadChannelMessages(ids);
+      void downloadChannelMessages(ids, button.dataset.channelAction === "download-upload");
     }
     if (button.dataset.channelAction === "task") {
       const task = catalogTransfer(message).task;
@@ -1941,7 +2303,9 @@
     if (event.target === $("channel-preview-dialog")) $("channel-preview-dialog").close();
   });
   $("channel-preview-dialog").addEventListener("close", () => {
+    cancelImageLoad($("channel-preview-image"));
     $("channel-preview-image").removeAttribute("src");
+    delete $("channel-preview-image").dataset.sourceUrl;
     if (state.previewReturnFocus?.isConnected) state.previewReturnFocus.focus({ preventScroll: true });
     state.previewReturnFocus = null;
     state.previewMessageId = null;
@@ -1951,10 +2315,6 @@
   });
   $("channel-preview-retry").addEventListener("click", () => {
     if (state.previewMessageId) void loadChannelFullImage(state.previewMessageId);
-  });
-  $("channel-preview-image").addEventListener("error", () => {
-    if ($("channel-preview-dialog").open) $("channel-preview-dialog").close();
-    setError("images", "频道封面加载失败，请重新读取频道后再试。");
   });
   $("channel-zoom-in").addEventListener("click", () => {
     state.previewZoom = Math.min(3, state.previewZoom + .5); updatePreviewZoom();
@@ -1977,14 +2337,78 @@
   });
   $("channel-search").addEventListener("input", renderCatalog);
   $("channel-transfer-filter").addEventListener("change", renderCatalog);
-  $("channel-download-selected").addEventListener("click", () => {
+  $("channel-format").addEventListener("change", renderCatalog);
+  $("channel-sort").addEventListener("change", renderCatalog);
+  $("channel-status-tabs").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-catalog-filter]");
+    if (!button) return;
+    $("channel-transfer-filter").value = button.dataset.catalogFilter;
+    renderCatalog();
+  });
+  for (const mode of ["grid", "list"]) $("channel-" + mode + "-mode").addEventListener("click", () => {
+    state.catalogMode = mode;
+    try { localStorage.setItem("catalog-mode", mode); } catch { /* Storage may be disabled. */ }
+    renderCatalog();
+  });
+  try { state.catalogMode = localStorage.getItem("catalog-mode") === "list" ? "list" : "grid"; } catch { /* Use the default view. */ }
+  $("channel-clear-selection").addEventListener("click", () => { state.catalogSelection.clear(); renderCatalog(); });
+  $("sidebar-source-search").addEventListener("input", renderSidebarSources);
+  $("sidebar-source-list").addEventListener("click", (event) => {
+    const expand = event.target.closest("[data-source-expand]");
+    if (expand) {
+      state.sidebarTopics.set(expand.dataset.sourceExpand, expand.getAttribute("aria-expanded") !== "true");
+      renderSidebarSources();
+    }
+    const scan = event.target.closest("[data-source-scan]");
+    if (scan) void scanTopics(scan.dataset.sourceScan);
+    const select = event.target.closest("[data-source-select]");
+    if (select) {
+      const key = select.dataset.sourceSelect;
+      const topic = Number(select.dataset.sourceTopic) || 0;
+      if (selectedChannel()?.key === key && (!topic || selectedTopic()?.topic_id === topic)) setView("messages");
+      else void (async () => {
+        await selectChannel(key, topic);
+        if (selectedChannel()?.key === key && (!topic || selectedTopic()?.topic_id === topic)) setView("messages");
+      })();
+    }
+  });
+  $("resource-close").addEventListener("click", () => closeResourceInspector());
+  for (const id of ["resource-picture", "resource-zoom"]) $(id).addEventListener("click", (event) => {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.resourceId);
+    if (message) openChannelPreview(message, event.currentTarget);
+  });
+  $("resource-copy-id").addEventListener("click", () => { if (state.resourceId) void copy(String(state.resourceId), "消息 ID"); });
+  $("resource-task").addEventListener("click", () => {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.resourceId);
+    const task = message && catalogTransfer(message).task;
+    if (task) { state.active = String(task.id); setView("download"); }
+  });
+  for (const [id, upload] of [["resource-download", false], ["resource-download-upload", true]]) $(id).addEventListener("click", () => {
+    const message = state.catalog?.messages.find((row) => row.message_id === state.resourceId);
+    if (!message || !locallyDownloadableMessage(message)) return;
+    const ids = message.series ? (state.catalog?.messages || []).filter((row) => row.series_key === message.series_key && locallyDownloadableMessage(row)).map((row) => row.message_id) : [message.message_id];
+    void downloadChannelMessages(ids, upload);
+  });
+  document.addEventListener("keydown", (event) => {
+    if ($("resource-inspector").hidden || $("channel-preview-dialog").open) return;
+    if (event.key === "Escape") { event.preventDefault(); closeResourceInspector(); }
+    if (event.key === "Tab" && matchMedia("(max-width: 1100px)").matches && $("resource-inspector").contains(document.activeElement)) {
+      const controls = [...$("resource-inspector").querySelectorAll("button:not(:disabled), a[href]")].filter((el) => el.getClientRects().length);
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+  });
+  function downloadSelectedChannelMessages(autoUpload) {
     const selected = (state.catalog?.messages || []).filter((message) => state.catalogSelection.has(message.message_id) && downloadableMessage(message));
     const selectedSeries = new Set(selected.filter((message) => message.series).map((message) => message.series_key));
     const members = (state.catalog?.messages || []).filter((message) => message.series && selectedSeries.has(message.series_key) && downloadableMessage(message));
     const ids = [...new Map([...selected, ...members].map((message) => [message.message_id, message])).values()]
       .map((message) => message.message_id);
-    void downloadChannelMessages(ids);
-  });
+    void downloadChannelMessages(ids, autoUpload);
+  }
+  $("channel-download-selected").addEventListener("click", () => downloadSelectedChannelMessages(false));
+  $("channel-download-upload-selected").addEventListener("click", () => downloadSelectedChannelMessages(true));
   $("channel-load-older").addEventListener("click", () => void scanChannel(true));
   $("channel-empty-action").addEventListener("click", () => void scanChannel());
   $("select-all").addEventListener("change", () => {
@@ -2016,7 +2440,10 @@
   $("refresh").addEventListener("click", () => void refreshAll());
   $("refresh-logs").addEventListener("click", () => void refreshLogs());
   $("reload-config").addEventListener("click", () => { if (!state.configLoaded) void loadConfig(); });
-  $("download").addEventListener("click", () => void configuredAction("/api/download", "download", "已请求扫描并下载"));
+  $("download").addEventListener("click", () => void configuredAction(
+    "/api/download", "download", "已请求扫描并下载", { auto_upload_after_download: false }));
+  $("download-upload").addEventListener("click", () => void configuredAction(
+    "/api/download", "download", "已请求扫描下载并上传", { auto_upload_after_download: true }));
   $("scan-channel").addEventListener("click", () => void scanChannel());
   $("channel-select").addEventListener("click", () => state.pickerOpen ? closeChannelPicker() : openChannelPicker());
   $("channel-topic-select").addEventListener("change", (event) => {
@@ -2109,6 +2536,40 @@
     state.configDirty = true; state.formRevision++; text("config-dirty", "未保存更改");
   });
   $("upload_provider").addEventListener("change", markRequired);
+  $("telegram_download_engine").addEventListener("change", markRequired);
+  $("tdlib-login").addEventListener("click", () => {
+    tdlibActionError = "";
+    tdlibStatusError = "";
+    $("tdlib-dialog").showModal();
+    renderTdlibStatus({ ...tdlibStatus, state: "loading", authorized: false, auth_pending: false, error: "" });
+    void refreshTdlibStatus();
+  });
+  $("tdlib-save-config").addEventListener("click", () => void saveTdlibConfig());
+  $("tdlib-close").addEventListener("click", () => $("tdlib-dialog").close());
+  $("tdlib-dialog").addEventListener("close", () => {
+    clearTimeout(tdlibPollTimer);
+    $("tdlib-auth-value").value = "";
+    $("tdlib-qr-image").removeAttribute("src");
+  });
+  $("tdlib-qr-login").addEventListener("click", () => void beginTdlibLogin("qr"));
+  $("tdlib-phone-login").addEventListener("click", () => void beginTdlibLogin("phone"));
+  $("tdlib-auth-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!$("tdlib-auth-value").value || $("tdlib-auth-submit").disabled || tdlibLoginBlocker()) return;
+    tdlibActionError = "";
+    const value = $("tdlib-auth-value").value;
+    $("tdlib-auth-value").value = "";
+    $("tdlib-auth-submit").disabled = true;
+    void (async () => {
+      try {
+        renderTdlibStatus(await post("/api/tdlib/auth", { field: tdlibAuthState, value }));
+        await refreshTdlibStatus();
+      } catch (error) {
+        tdlibActionError = error.message;
+        renderTdlibStatus(tdlibStatus);
+      } finally { $("tdlib-auth-submit").disabled = tdlibAuthPending; }
+    })();
+  });
   $("data_server_enabled").addEventListener("change", markRequired);
   $("data_server_backend").addEventListener("change", () => {
     const backend = $("data_server_backend").value;

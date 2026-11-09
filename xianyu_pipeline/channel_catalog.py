@@ -8,7 +8,7 @@ import threading
 from pathlib import Path
 
 from .models import utc_now
-from .workbench import channel_key, image_type
+from .workbench import channel_key, image_type, image_version
 from .telegram_sources import split_scope, source_scope
 
 
@@ -69,14 +69,41 @@ class ChannelCatalog:
             value = row.get("full_cover_path") if full else row.get("cover_path")
             if full and not value and row.get("cover_quality") == "full":
                 value = row.get("cover_path")
-            if not isinstance(value, str) or not value:
-                return None
-            path = Path(value).resolve()
-            if path.is_relative_to(self.preview_root.resolve()) and image_type(path):
-                return path
+            for candidate in (value, row.get("full_cover_path") if not full else None):
+                if not isinstance(candidate, str) or not candidate:
+                    continue
+                path = Path(candidate).resolve()
+                if path.is_relative_to(self.preview_root.resolve()) and image_type(path):
+                    return path
         except (OSError, ValueError):
             pass
         return None
+
+    def recover_interrupted(self, channel: str | None = None) -> int:
+        """Call only at startup or after the channel's media worker has stopped."""
+        with self.lock:
+            sources = ([self._path(channel_key(channel)), self.path] if channel else
+                       [*self.catalog_root.glob("*.json"), self.path])
+            recovered = 0
+            for path in sources:
+                current = self._read(path)
+                if current is None or channel and current["channel"] != channel_key(channel):
+                    continue
+                changed = False
+                for row in current["messages"]:
+                    for prefix in ("cover", "full"):
+                        if row.get(f"{prefix}_status") not in {"pending", "loading"}:
+                            continue
+                        cached_cover = prefix == "cover" and self._cover(row)
+                        row[f"{prefix}_status"] = "ready" if cached_cover else "cancelled"
+                        row[f"{prefix}_error"] = "" if cached_cover else "上次图片加载已中断，可重新加载"
+                        recovered += 1
+                        changed = True
+                if changed:
+                    temporary = path.with_suffix(".json.tmp")
+                    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+                    temporary.replace(path)
+            return recovered
 
     def covers(self, channel: str) -> dict[int, dict]:
         with self.lock:
@@ -94,8 +121,12 @@ class ChannelCatalog:
             for row in rows:
                 cover = self._cover(row)
                 full = self._cover(row, full=True)
-                row["cover_url"] = (f"/api/channel-preview/{row['message_id']}?v={cover.name}&source={current['channel']}" if cover else "")
-                row["full_cover_url"] = (f"/api/channel-full-preview/{row['message_id']}?v={full.name}&source={current['channel']}" if full else "")
+                row["cover_url"] = (f"/api/channel-preview/{row['message_id']}?v={image_version(cover)}&source={current['channel']}" if cover else "")
+                row["full_cover_url"] = (f"/api/channel-full-preview/{row['message_id']}?v={image_version(full)}&source={current['channel']}" if full else "")
+                for prefix, asset in (("cover", cover), ("full", full)):
+                    if not asset and row.get(f"{prefix}_status") == "ready":
+                        row[f"{prefix}_status"] = "failed"
+                        row[f"{prefix}_error"] = "本地图片缓存已失效，可重新加载"
                 row.pop("cover_path", None)
                 row.pop("full_cover_path", None)
             return {**{key: value for key, value in current.items() if key != "messages"},
@@ -151,7 +182,7 @@ class ChannelCatalog:
                 for field, value in previous.items():
                     if field.startswith("full_") and field not in row:
                         row[field] = value
-                if not row.get("cover_path") and previous.get("cover_path"):
+                if not row.get("cover_path") and previous.get("cover_path") and self._cover(previous):
                     row["cover_path"] = previous["cover_path"]
                     row["cover_message_id"] = previous.get("cover_message_id", 0)
                     row["cover_quality"] = previous.get("cover_quality", "")

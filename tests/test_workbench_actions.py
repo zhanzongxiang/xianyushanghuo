@@ -22,6 +22,55 @@ OTHER_TARGET = "https://pan.quark.cn/list?folder=B"
 SHARE = "https://pan.quark.cn/s/Fixture"
 
 
+def test_tdlib_status_does_not_start_native_client(app, monkeypatch):
+    from xianyu_pipeline import tdlib_client
+    calls = []
+    monkeypatch.setattr(tdlib_client, "runtime_status", lambda: {"available": True, "version": "fixture"})
+    monkeypatch.setattr(tdlib_client, "client_for_config",
+                        lambda config, *, create: calls.append(create))
+    status, result = app.get("/api/tdlib/status")
+    assert status == 200 and result["state"] == "idle" and not result["authorized"]
+    assert calls == [False]
+
+
+def test_tdlib_login_and_auth_use_current_config_without_starting_download(app, monkeypatch):
+    from xianyu_pipeline import tdlib_client
+    calls = []
+    monkeypatch.setattr(tdlib_client, "runtime_status", lambda: {"available": True})
+    client = SimpleNamespace(
+        login=lambda method: calls.append(("login", method)) or {"state": "qr_pending"},
+        submit=lambda field, value: calls.append(("auth", field, value)) or {"state": "password", "auth_pending": True})
+
+    def service(config, **options):
+        calls.append(("config", config.telegram_api_id, config.telegram_session))
+        return client
+
+    monkeypatch.setattr(tdlib_client, "client_for_config", service)
+    assert app.post("/api/tdlib/login", {"method": "qr"}) == (200, {"state": "qr_pending"})
+    status, result = app.post("/api/tdlib/auth", {"field": "code", "value": "PRIVATE-CODE"})
+    assert status == 200 and result["auth_pending"] and "PRIVATE" not in json.dumps(result)
+    assert ("login", "qr") in calls and ("auth", "code", "PRIVATE-CODE") in calls
+    assert not app.workers and not app.state.running
+    app.state.running = True
+    assert app.post("/api/tdlib/login")[0] == 409
+
+
+@pytest.mark.parametrize("engine", [[], {}, None, True, "browser"])
+def test_tdlib_invalid_engine_returns_400_and_preserves_configuration(app, engine):
+    before = app.config_path.read_bytes()
+    assert app.post("/api/config", {"telegram_download_engine": engine})[0] == 400
+    assert app.config_path.read_bytes() == before
+
+
+def test_tdlib_login_rejects_invalid_method_before_constructing_client(app, monkeypatch):
+    from xianyu_pipeline import tdlib_client
+    monkeypatch.setattr(tdlib_client, "runtime_status", lambda: {"available": True})
+    monkeypatch.setattr(tdlib_client, "client_for_config",
+                        lambda *args, **kw: pytest.fail("Invalid input started a TDLib client"))
+    for method in ([], {}, None, 1, "bad"):
+        assert app.post("/api/tdlib/login", {"method": method})[0] == 400
+
+
 @pytest.fixture
 def app(tmp_path, monkeypatch):
     executable = tmp_path / "chrome.exe"
@@ -192,6 +241,132 @@ def test_auto_upload_only_new_completed_downloads(app, monkeypatch, enabled, nam
         assert app.store.get(identity)["upload_status"] == "link_pending"
     elif expected:
         assert app.store.get(identity)["share_url"] == SHARE
+
+
+@pytest.mark.parametrize("default_upload", [False, True])
+@pytest.mark.parametrize("requested_upload", [False, True])
+def test_download_button_overrides_default_without_saving_config(
+        app, monkeypatch, default_upload, requested_upload):
+    values = json.loads(app.config_path.read_text(encoding="utf-8"))
+    values["auto_upload_after_download"] = default_upload
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+    identity = app.task("button.zip")
+    original_config = app.config_path.read_bytes()
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def fetch_messages(self, *args):
+            self.on_event({"chat": "fixture_channel", "message_id": 123, "filename": "button.zip",
+                           "local_path": app.store.get(identity)["local_path"], "download_status": "completed"})
+            return []
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/download", {"auto_upload_after_download": requested_upload})[0] == 200
+    app.run()
+    assert not app.state.error
+    assert len(app.calls) == int(requested_upload)
+    assert app.store.get(identity)["download_status"] == "completed"
+    assert app.store.get(identity)["upload_status"] == ("completed" if requested_upload else "waiting")
+    assert app.config_path.read_bytes() == original_config
+
+
+@pytest.mark.parametrize("entry_action", ["channel-scan", "channel-cover", "channel-download"])
+@pytest.mark.parametrize("default_upload", [False, True])
+def test_mixed_channel_queue_only_uploads_explicitly_requested_files(
+        app, monkeypatch, entry_action, default_upload):
+    values = json.loads(app.config_path.read_text(encoding="utf-8"))
+    values["auto_upload_after_download"] = default_upload
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+    page = catalog_page([100, 99, 98], 95)
+    queued = []
+    historical = app.task("historical.zip")
+    active = False
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            if options.get("on_page"):
+                options["on_page"](page)
+            if not active:
+                return page
+            if entry_action != "channel-download":
+                assert app.post("/api/channel-download", {
+                    "ids": [100], "auto_upload_after_download": False})[0] == 200
+            assert app.post("/api/channel-download", {
+                "ids": [99], "auto_upload_after_download": True})[0] == 200
+            while (job := options["take_request"]()) is not None:
+                if job["kind"] == "download":
+                    queued.append((job["message_id"], job["auto_upload_after_download"]))
+                    source = self.download_dir / job["filename"]
+                    with zipfile.ZipFile(source, "w") as archive:
+                        archive.writestr("model.stl", "fixture model")
+                    self.on_event({"chat": "fixture_channel", "message_id": job["message_id"],
+                                   "filename": job["filename"], "local_path": str(source),
+                                   "download_status": "completed"})
+                options["on_request_done"](job, {}, "")
+            assert options["close_requests"]()
+            return page
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    active = True
+    arguments = ({"ids": [100], "auto_upload_after_download": False} if entry_action == "channel-download"
+                 else {"id": 98} if entry_action == "channel-cover" else {})
+    assert app.post(f"/api/{entry_action}", arguments)[0] == 200
+    app.run()
+    assert not app.state.error
+    assert queued == [(100, False), (99, True)]
+    assert [call[2] for call in app.calls] == ["asset-99.zip"]
+    tasks = {task["message_id"]: task for task in app.store.snapshot()["tasks"]}
+    assert tasks[100]["download_status"] == "completed" and tasks[100]["upload_status"] == "waiting"
+    assert tasks[99]["upload_status"] == "completed"
+    assert app.store.get(historical)["upload_status"] == "waiting"
+
+    # A later scan cannot reuse the previous worker's automatic-upload intents.
+    active = False
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    assert len(app.calls) == 1
+
+
+@pytest.mark.parametrize("path", ["/api/download", "/api/retry", "/api/channel-download"])
+@pytest.mark.parametrize("invalid", ["true", 1, None, []])
+def test_download_upload_mode_requires_a_boolean_before_start(app, path, invalid):
+    assert app.post(path, {"auto_upload_after_download": invalid})[0] == 400
+    assert not app.workers and not app.state.running
+
+
+@pytest.mark.parametrize("provider", ["local", "quark_api", "quark_cli", "quark_browser"])
+def test_download_upload_checks_cloud_settings_but_only_download_does_not(app, provider):
+    values = json.loads(app.config_path.read_text(encoding="utf-8"))
+    values.update(upload_provider=provider, quark_cookie="", browser_executable_path="",
+                  quark_cli_script_path="", quark_cli_node_command="node", quark_cli_mode="wsl")
+    app.config_path.write_text(json.dumps(values), encoding="utf-8")
+    assert app.post("/api/download", {"auto_upload_after_download": True})[0] == 400
+    assert not app.workers and not app.state.running
+    assert app.post("/api/download", {"auto_upload_after_download": False})[0] == 200
+
+
+def test_auto_upload_batch_error_finishes_tasks_and_keeps_downloaded_files(app, monkeypatch):
+    identity = app.task("keep.zip")
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def fetch_messages(self, *args):
+            self.on_event({"chat": "fixture_channel", "message_id": 123, "filename": "keep.zip",
+                           "local_path": app.store.get(identity)["local_path"], "download_status": "completed"})
+            return []
+
+    def reject_batch(*args):
+        raise ValueError("fixture duplicate upload names")
+
+    assert api_settings(app)[0] == 200
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    monkeypatch.setattr(web_ui, "validate_upload_batch_names", reject_batch)
+    assert app.post("/api/download", {"auto_upload_after_download": True})[0] == 200
+    app.run()
+    assert app.state.error == "fixture duplicate upload names"
+    assert not app.state.running and not app.state.channel_requests_open
+    task = app.store.get(identity)
+    assert task["download_status"] == "completed" and Path(task["local_path"]).is_file()
 
 
 def test_upload_binding_is_durable_before_cloud_side_effect(app):
@@ -1199,6 +1374,41 @@ def test_catalog_scan_accepts_file_and_full_image_jobs_without_a_second_worker(a
     assert rows[1]["full_cover_url"] and rows[1]["full_status"] == "ready"
     assert app.post("/api/channel-cover", {"id": 99})[0] == 200
     assert not app.workers, "Cached full images do not start a new API job"
+
+
+def test_channel_download_reuses_cached_cover_before_api_download_starts(app, monkeypatch):
+    app.acquire()
+    inspected = []
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def list_archives(self, channel, **options):
+            cover = options["preview_dir"] / "cached.png"
+            cover.parent.mkdir(parents=True, exist_ok=True)
+            cover.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+            page = catalog_page([100], 95)
+            page["messages"][0].update(cover_path=str(cover), cover_status="ready",
+                                       cover_quality="preview", cover_message_id=99)
+            options["on_page"](page)
+            assert app.post("/api/channel-download", {"ids": [100]})[0] == 200
+            row, = app.get("/api/workbench")[1]["tasks"]
+            assert row["images"] and row["image_message_ids"] == [99]
+            assert row["image_source"] == "channel_cover"
+            job = options["take_request"]()
+            self.on_event({"chat": "fixture_channel", "message_id": 100,
+                           "filename": "asset-100.zip", "download_status": "queued",
+                           "image_paths": [], "image_message_ids": [], "image_source": ""})
+            cover.unlink()
+            stored = app.store.get(row["id"])
+            assert app.store.preview(row["id"], 0)[0].is_file()
+            assert stored["image_message_ids"] == [99]
+            inspected.append(True)
+            options["on_request_done"](job, {}, "fixture stopped")
+            return page
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    assert app.post("/api/channel-scan")[0] == 200
+    app.run()
+    assert inspected and not app.state.error
 
 
 def test_stop_rejects_new_jobs_and_cancels_queued_file_and_full_image(app, monkeypatch):

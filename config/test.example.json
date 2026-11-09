@@ -34,6 +34,7 @@
   "download_transfer_timeout_seconds": 3600,
   "download_workers": 4,
   "download_file_concurrency": 2,
+  "telegram_download_engine": "telethon",
   "archive_test_executable_path": "",
   "archive_test_timeout_seconds": 600,
   "telegram_api_id": 0,

@@ -35,6 +35,15 @@ def test_progress_survives_refresh_and_recovers_after_restart(config):
     assert task_key("https://t.me/free_3d_models_download/", 123, "asset.zip") == identity
 
 
+def test_download_engine_survives_restart_and_can_change_on_new_attempt(config):
+    store = TransferStore(config)
+    identity = store.event(event(download_status="downloading", download_engine="tdlib", received=40))
+    restored = TransferStore(config)
+    assert restored.get(identity)["download_engine"] == "tdlib"
+    restored.event(event(download_status="queued", download_engine="telethon"))
+    assert restored.get(identity)["download_engine"] == "telethon"
+
+
 @pytest.mark.parametrize("download,upload,expected", [
     ("completed", "waiting", True), ("failed", "completed", True), ("failed", "deleted", True),
     ("failed", "failed", False), ("queued", "waiting", False), ("failed", "local", False),
@@ -104,6 +113,24 @@ def test_completed_download_not_lost_when_later_task_fails(config):
     assert store.get(done)["download_status"] == "completed"
     assert store.get(pending)["download_status"] == "interrupted"
     assert store.get(done)["validation"] == "passed"
+
+
+def test_cached_channel_cover_is_owned_by_task_and_not_cleared_by_empty_events(config):
+    store = TransferStore(config)
+    source = config.output_dir / "catalog.png"
+    source.write_bytes(PNG)
+    identity = store.event(event(download_status="queued"))
+    store.cache_preview(identity, source, 122)
+    copied, mime = store.preview(identity, 0)
+    assert copied.is_relative_to(config.inbox_dir) and mime == "image/png"
+    source.unlink()
+    for status in ("queued", "downloading", "failed"):
+        store.event(event(download_status=status, image_paths=[], image_source="",
+                          image_message_ids=[], image_group_id=""))
+        assert store.preview(identity, 0)[0].read_bytes() == PNG
+        assert store.get(identity)["image_message_ids"] == [122]
+    restored = TransferStore(config)
+    assert restored.preview(identity, 0)[0].read_bytes() == PNG
 
 
 def test_interrupted_upload_requires_link_check_not_duplicate_upload(config):

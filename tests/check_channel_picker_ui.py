@@ -269,11 +269,9 @@ def check_task_scoping(page, fixture: Fixture, label: str, unique: str) -> None:
                              channel_requests_open=True, stop_requested=False)
     refresh(page, fixture)
     before = len(fixture.posts)
-    deadline = time.monotonic() + 6
-    while not any(path == "/api/channel-cover" for path, _ in fixture.posts[before:]):
-        assert time.monotonic() < deadline, "Active scan did not prefetch a preview"
-        page.wait_for_timeout(50)
-    assert fixture.posts[-1] == ("/api/channel-cover", {"id": 42, "prefetch": True})
+    page.wait_for_timeout(2200)
+    assert not any(path == "/api/channel-cover" for path, _ in fixture.posts[before:]), (
+        "Scanning medium previews must not automatically download full images")
     assert fixture.workbench["task_id"] == "fixture-reused-scan"
     page.locator("#stop").click()
     page.locator("#stop").wait_for(state="hidden")

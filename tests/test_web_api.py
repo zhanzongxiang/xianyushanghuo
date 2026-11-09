@@ -8,6 +8,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from http.client import HTTPConnection
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -432,3 +433,54 @@ def test_workbench_static_assets_are_served_locally(ui_server):
         with urlopen(url + path) as response:
             assert response.headers["Content-Type"].startswith(mime)
             assert len(response.read()) > 100
+
+
+def test_channel_images_cache_by_file_version_and_revalidate_legacy_urls(ui_server):
+    from xianyu_pipeline.channel_catalog import ChannelCatalog
+
+    url, config = ui_server
+    catalog = ChannelCatalog(config.parent / "output")
+    image = catalog.preview_root / "fixture.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"\xff\xd8\xfforiginal")
+    channel = "free_3d_models_download"
+    catalog.merge(channel, {"messages": [{"message_id": 42, "cover_path": str(image),
+                                         "cover_quality": "preview", "filename": "fixture.rar"}],
+                            "oldest_scanned_id": 42, "has_more": False})
+
+    def get(path, headers=None):
+        connection = HTTPConnection(url.removeprefix("http://"), timeout=5)
+        try:
+            connection.request("GET", path, headers=headers or {})
+            response = connection.getresponse()
+            return response.status, dict(response.getheaders()), response.read()
+        finally:
+            connection.close()
+
+    asset_url = catalog.snapshot(channel)["messages"][0]["cover_url"]
+    status, headers, body = get(asset_url)
+    assert status == 200 and body == image.read_bytes()
+    assert headers["Cache-Control"] == "private, max-age=86400, immutable"
+    etag, modified = headers["ETag"], headers["Last-Modified"]
+    for conditional in ({"If-None-Match": etag}, {"If-None-Match": f'"old", {etag[2:]}'},
+                        {"If-None-Match": "*"}, {"If-Modified-Since": modified}):
+        status, response_headers, body = get(asset_url, conditional)
+        assert status == 304 and body == b""
+        assert response_headers["ETag"] == etag
+        assert "Content-Length" not in response_headers
+    assert get(asset_url, {"If-None-Match": '"wrong"', "If-Modified-Since": modified})[0] == 200
+    assert get(asset_url, {"If-Modified-Since": "invalid"})[0] == 200
+
+    for legacy in ("/api/channel-preview/42", f"/api/channel-preview/42?v=fixture.jpg&source={channel}",
+                   asset_url.split("&source=")[0]):
+        assert get(legacy)[1]["Cache-Control"] == "private, no-cache"
+
+    image.write_bytes(b"\xff\xd8\xffreplacement-image")
+    new_url = catalog.snapshot(channel)["messages"][0]["cover_url"]
+    assert new_url != asset_url
+    status, headers, body = get(new_url, {"If-None-Match": etag})
+    assert status == 200 and body == image.read_bytes() and headers["ETag"] != etag
+    assert get(asset_url)[1]["Cache-Control"] == "private, no-cache"
+    assert get("/static/workbench.js")[1]["Cache-Control"] == "private, no-cache"
+    image.unlink()
+    assert get(new_url, {"If-None-Match": headers["ETag"]})[0] == 404

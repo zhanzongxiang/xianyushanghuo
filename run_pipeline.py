@@ -30,12 +30,27 @@ def main() -> None:
     parser.add_argument("--web-port", type=int, default=8765, help="本地界面端口")
     parser.add_argument("--no-open-browser", action="store_true", help="启动界面服务但不自动打开浏览器")
     parser.add_argument("--download-check", action="store_true", help="检查下载解密加速组件，不连接 Telegram")
+    parser.add_argument("--tdlib-check", action="store_true", help="检查 TDLib 原生组件，不连接 Telegram")
     parser.add_argument("--analyze-downloads", type=Path, metavar="LOG_DIR",
                         help="分析下载诊断日志目录，不连接 Telegram")
     args = parser.parse_args()
 
     if args.download_check:
         print(json.dumps(check_download_acceleration(), ensure_ascii=False))
+        return
+
+    if args.tdlib_check:
+        from xianyu_pipeline.tdlib_client import _get_hub, runtime_status
+        result = runtime_status()
+        if not result["available"]:
+            raise SystemExit(result["error"])
+        native = _get_hub().native
+        response = json.loads(native.td_execute(json.dumps({
+            "@type": "getOption", "name": "version"}).encode()))
+        if response.get("@type") != "optionValueString":
+            raise SystemExit("TDLib 原生版本自检失败")
+        result.update(native_version=response.get("value", ""), self_test="passed")
+        print(json.dumps(result, ensure_ascii=False))
         return
 
     if args.analyze_downloads is not None:
@@ -117,6 +132,7 @@ def main() -> None:
             download_transfer_timeout_seconds=config.download_transfer_timeout_seconds,
             download_workers=config.download_workers,
             download_file_concurrency=config.download_file_concurrency,
+            download_engine=config.telegram_download_engine,
         )
     else:
         telegram = LocalTelegramAdapter(config.inbox_dir)

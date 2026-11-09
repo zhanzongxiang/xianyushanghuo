@@ -529,7 +529,8 @@ def check(executable: Path | None = None) -> None:
                 try:
                     result_dir = ROOT / "outputs"
                     unique = uuid4().hex[:8]
-                    for label, width, height in (("desktop", 1360, 880), ("mobile", 390, 844)):
+                    for label, width, height in (("wide", 1920, 1080), ("desktop", 1360, 880),
+                                                 ("mobile", 390, 844)):
                         page = browser.new_page(viewport={"width": width, "height": height}, device_scale_factor=1)
                         errors = []
                         page.on("pageerror", lambda error: errors.append(str(error)))

@@ -151,3 +151,78 @@ def test_catalog_isolated_per_channel_and_migrates_legacy_active_file(tmp_path):
     assert [item["message_id"] for item in catalog.snapshot("other_channel")["messages"]] == [9]
     assert (output / ".channel-catalog" / "legacy_channel.json").is_file()
     assert (output / ".channel-catalog" / "other_channel.json").is_file()
+
+
+def test_restart_recovers_interrupted_images_without_changing_history(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    for source in ("example_channel", "other_channel", "-1001234567890~42"):
+        catalog.merge(source, {"messages": [{**row(10), "chat": source.split("~")[0],
+                                             "cover_status": "pending", "full_status": "loading"}],
+                               "oldest_scanned_id": 8, "has_more": True})
+    before = catalog.snapshot("example_channel")
+    recovered = ChannelCatalog(tmp_path)
+    assert recovered.recover_interrupted() == 6
+    assert recovered.recover_interrupted() == 0
+    for source in ("example_channel", "other_channel", "-1001234567890~42"):
+        listing = recovered.snapshot(source)
+        assert listing["oldest_scanned_id"] == 8 and listing["has_more"]
+        assert listing["messages"][0]["cover_status"] == "cancelled"
+        assert listing["messages"][0]["full_status"] == "cancelled"
+        assert listing["messages"][0]["full_error"]
+    assert recovered.snapshot("example_channel")["scanned_at"] == before["scanned_at"]
+
+
+def test_finished_worker_recovers_only_its_own_channel_and_keeps_valid_cover(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    cover = catalog.preview_root / "cover.jpg"
+    cover.parent.mkdir(parents=True)
+    cover.write_bytes(b"\xff\xd8\xffimage")
+    for source in ("example_channel", "other_channel"):
+        catalog.merge(source, {"messages": [{**row(10, str(cover)), "cover_status": "pending", "full_status": "loading"}],
+                               "oldest_scanned_id": 10, "has_more": False})
+    assert catalog.recover_interrupted("https://t.me/example_channel") == 2
+    row_after = catalog.snapshot("example_channel")["messages"][0]
+    assert row_after["cover_status"] == "ready" and row_after["cover_url"]
+    assert row_after["full_status"] == "cancelled"
+    assert catalog.snapshot("other_channel")["messages"][0]["full_status"] == "loading"
+    assert cover.read_bytes() == b"\xff\xd8\xffimage"
+
+
+def test_missing_cached_images_are_retryable_and_not_reused_on_rescan(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    image = catalog.preview_root / "deleted.jpg"
+    catalog.merge("example_channel", {"messages": [{**row(10, str(image)), "cover_status": "ready",
+                        "full_cover_path": str(image), "full_status": "ready"}],
+                        "oldest_scanned_id": 10, "has_more": False})
+    listing = catalog.snapshot("example_channel")["messages"][0]
+    assert listing["cover_status"] == listing["full_status"] == "failed"
+    assert not listing["cover_url"] and not listing["full_cover_url"]
+    assert catalog.covers("example_channel") == {}
+    catalog.merge("example_channel", {"messages": [{**row(10), "cover_status": "pending"}],
+                                      "oldest_scanned_id": 10, "has_more": False})
+    assert catalog.snapshot("example_channel")["messages"][0]["cover_status"] == "pending"
+
+
+def test_existing_full_image_supplies_missing_medium_cache(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    full = catalog.preview_root / "full.jpg"
+    full.parent.mkdir(parents=True)
+    full.write_bytes(b"\xff\xd8\xffimage")
+    catalog.merge("example_channel", {"messages": [{**row(10), "cover_status": "ready",
+                        "cover_quality": "preview", "full_cover_path": str(full), "full_status": "ready"}],
+                        "oldest_scanned_id": 10, "has_more": False})
+    assert catalog.preview("example_channel", 10)[0] == full
+    assert catalog.snapshot("example_channel")["messages"][0]["cover_url"]
+
+
+def test_recovery_preserves_terminal_errors_and_legacy_cache(tmp_path):
+    legacy = tmp_path / "channel-catalog.json"
+    data = {"channel": "example_channel", "messages": [
+        {**row(10), "full_status": "failed", "full_error": "proxy unavailable"},
+        {**row(9), "full_status": "loading"}], "oldest_scanned_id": 9, "has_more": False}
+    legacy.write_text(json.dumps(data), encoding="utf-8")
+    catalog = ChannelCatalog(tmp_path)
+    assert catalog.recover_interrupted() == 1
+    listing = catalog.snapshot("example_channel")["messages"]
+    assert listing[0]["full_error"] == "proxy unavailable"
+    assert listing[1]["full_status"] == "cancelled"

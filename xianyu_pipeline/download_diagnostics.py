@@ -97,6 +97,7 @@ class DownloadTrace:
         self.started = time.monotonic()
         self.cpu_started = time.process_time()
         self.received = 0
+        self.resumed_bytes = 0
         self.first_byte_s = None
         self.last_progress = self.started
         self.last_sample = self.started
@@ -206,6 +207,7 @@ class DownloadTrace:
         self.event(
             "finish", **self.metadata, status=status, stage=self.stage,
             received=self.received, first_byte_s=self.first_byte_s,
+            resumed_bytes=self.resumed_bytes,
             transfer_s=transfer_s, total_s=now - self.started,
             average_bps=self.received / transfer_s,
             validation_s=(self.save_at or now) - self.validation_at if self.validation_at else 0,
@@ -264,13 +266,17 @@ def analyze_files(files: list[tuple[str, bytes]]) -> dict:
                     continue
                 entry = downloads.setdefault(identity, {"download_id": identity, "samples": [],
                                                          "senders": set(), "summary": {},
-                                                         "started": False})
+                                                         "recoveries": [], "started": False})
                 if kind == "chunk":
                     sample = row.get("fetch_s")
                     if isinstance(sample, (int, float)) and math.isfinite(sample) and sample >= 0:
                         entry["samples"].append(sample)
                     if isinstance(row.get("sender"), str):
                         entry["senders"].add(row["sender"])
+                elif kind == "connection_recovery":
+                    entry["recoveries"].append({"attempt": row.get("attempt"),
+                                                "workers": row.get("workers"),
+                                                "offset": row.get("offset")})
                 elif kind in {"progress", "heartbeat"} and entry["summary"].get("event") != "finish":
                     received, elapsed = row.get("received"), row.get("elapsed_s")
                     if received is not None and elapsed is not None and elapsed > 0:
@@ -291,12 +297,17 @@ def analyze_files(files: list[tuple[str, bytes]]) -> dict:
             continue
         row["status"] = row.get("status", "unfinished")
         row["download_id"] = entry["download_id"]
+        row["connection_recoveries"] = entry["recoveries"]
         row.setdefault("observed_senders", len(entry["senders"]))
         samples = sorted(entry["samples"])
         row["recorded_chunks"] = len(samples)
         row["fetch_p50_s"] = samples[(len(samples) - 1) // 2] if samples else None
         row["fetch_p95_s"] = samples[max(0, math.ceil(len(samples) * .95) - 1)] if samples else None
         findings = []
+        if entry["recoveries"]:
+            findings.append(
+                f"该文件触发下载连接恢复 {len(entry['recoveries'])} 次，"
+                f"最后一次并发降至 {entry['recoveries'][-1]['workers']}；已完成分块保留。")
         if row.get("crypto_backend") == "Python":
             findings.append("观察到 Python 解密后端；建议启用 cryptg 后用同一文件复测。")
         if row.get("workers", 1) > 1 and row.get("observed_senders") == 1:
@@ -315,7 +326,9 @@ def analyze_files(files: list[tuple[str, bytes]]) -> dict:
             findings.append("事件循环出现至少 0.5 秒延迟；需结合进程 CPU、写盘和进度回调判断本地阻塞。")
         if row.get("validation_s", 0) >= max(5, row.get("transfer_s", 0) * .25):
             findings.append("完整性校验耗时较长；该阶段已与传输耗时分开统计。")
-        if not samples and row.get("received", 0) > 0 and row.get("workers") == 1:
+        if row.get("engine") == "tdlib":
+            findings.append("TDLib 管理连接与分块，当前记录为原生文件进度，不包含内部逐块耗时或连接数。")
+        elif not samples and row.get("received", 0) > 0 and row.get("workers") == 1:
             findings.append("顺序下载由 Telethon 内部处理分块和写盘，本次没有可拆分的逐块耗时。")
         if row["status"] == "unfinished":
             findings.append("没有结束记录：可能仍在下载、程序中断或日志已轮转，不能据此判断下载失败。")
@@ -342,6 +355,7 @@ def render_report(report: dict) -> str:
         lines.extend([
             f"文件: {row.get('filename', '?')}  消息: {row.get('message_id', '?')}",
             f"诊断 ID: {row['download_id']}  状态: {row['status']}",
+            f"下载引擎: {row.get('engine', 'telethon')}",
             f"传输: {row.get('transfer_s', 0):.2f} 秒  "
             f"平均: {row.get('average_bps', 0) / 1024 / 1024:.3f} MiB/s  "
             f"接收: {row.get('received', 0)} 字节",

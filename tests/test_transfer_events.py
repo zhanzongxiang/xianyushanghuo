@@ -415,8 +415,8 @@ def test_browser_uses_real_cdp_bytes_and_validates_before_completed(tmp_path, mo
     assert events[0]["download_status"] == "queued"
     progress = next(event for event in events if event["download_status"] == "downloading" and event["received"] > 0)
     assert progress["received"] == len(zip_bytes()) // 2
-    assert progress["speed"] == progress["received"] / 0.25
-    assert progress["eta"] == (len(zip_bytes()) - progress["received"]) / progress["speed"]
+    assert progress["speed"] == 0
+    assert progress["eta"] is None
     assert events[-2]["download_status"] == "validating"
     assert_terminal(events[-1], "completed")
     assert Path(events[-1]["local_path"]) == result[0].attachment_paths[0].resolve()

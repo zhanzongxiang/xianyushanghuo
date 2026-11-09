@@ -57,6 +57,7 @@ class PipelineConfig:
     download_transfer_timeout_seconds: int = 3600
     download_workers: int = 4
     download_file_concurrency: int = 2
+    telegram_download_engine: str = "telethon"
     archive_test_executable_path: str = ""
     archive_test_timeout_seconds: int = 600
     telegram_message_selector: str = ""
@@ -148,6 +149,8 @@ class PipelineConfig:
             raise ValueError("download_workers 必须为 1 到 8 的整数")
         if type(self.download_file_concurrency) is not int or not 1 <= self.download_file_concurrency <= 2:
             raise ValueError("download_file_concurrency 必须为 1 到 2 的整数")
+        if not isinstance(self.telegram_download_engine, str) or self.telegram_download_engine not in {"telethon", "tdlib"}:
+            raise ValueError("Telegram 下载引擎必须为 telethon 或 tdlib")
         if type(self.quark_api_file_concurrency) is not int or not 1 <= self.quark_api_file_concurrency <= 3:
             raise ValueError("quark_api_file_concurrency 必须为 1 到 3 的整数")
         if type(self.quark_api_timeout_seconds) is not int or not 10 <= self.quark_api_timeout_seconds <= 600:

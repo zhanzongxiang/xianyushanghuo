@@ -51,8 +51,9 @@ def listing_client(tmp_path, monkeypatch, count=16):
     return adapter, client
 
 
-def test_messages_publish_before_covers_and_downloads_have_bounded_concurrency(tmp_path, monkeypatch):
-    adapter, client = listing_client(tmp_path, monkeypatch)
+@pytest.mark.parametrize("count", [16, 100])
+def test_messages_publish_before_covers_and_downloads_have_bounded_concurrency(tmp_path, monkeypatch, count):
+    adapter, client = listing_client(tmp_path, monkeypatch, count=count)
     active = peak = completed = 0
     metadata_pages = []
     progress = []
@@ -78,18 +79,45 @@ def test_messages_publish_before_covers_and_downloads_have_bounded_concurrency(t
         catalog.merge("example_channel", page, older=True)
 
     monkeypatch.setattr(adapter, "_download_preview", picture)
-    result = adapter.list_archives("example_channel", limit=16,
+    result = adapter.list_archives("example_channel", limit=count,
                                    preview_dir=catalog.preview_root / "example_channel",
                                    on_page=publish, on_progress=progress.append)
     assert metadata_pages and len(metadata_pages[0]["messages"]) <= 10
-    assert len(result["messages"]) == 16
-    assert peak == 4 and active == 0 and completed == 16
+    assert len(result["messages"]) == count
+    assert peak == 4 and active == 0 and completed == count
     assert client.lookups == 1, "preceding groups in scanned history must not be fetched again"
     assert not client.connected
     assert progress[-1]["stage"] == "completed"
-    assert progress[-1]["processed"] == progress[-1]["ready"] == 16
+    assert progress[-1]["processed"] == progress[-1]["ready"] == count
     assert catalog.snapshot("example_channel")["oldest_scanned_id"] == result["oldest_scanned_id"]
     assert all(row["cover_url"] for row in catalog.snapshot("example_channel")["messages"])
+
+
+def test_ready_cover_is_published_while_other_covers_are_still_waiting(tmp_path, monkeypatch):
+    adapter, _ = listing_client(tmp_path, monkeypatch, count=3)
+    scanned, visible = asyncio.Event(), asyncio.Event()
+
+    def progress(event):
+        if event["stage"] == "covers":
+            scanned.set()
+
+    def publish(page):
+        if any(row["cover_status"] == "ready" for row in page["messages"]):
+            visible.set()
+
+    async def picture(client, media, message_id, timeout, directory, thumb=-1):
+        await scanned.wait()
+        if message_id != 995:
+            await asyncio.wait_for(visible.wait(), timeout=2)
+        path = directory / f"{message_id}.jpg"
+        path.write_bytes(b"\xff\xd8\xfffixture")
+        return str(path)
+
+    monkeypatch.setattr(adapter, "_download_preview", picture)
+    result = adapter.list_archives("example_channel", limit=3, preview_dir=tmp_path / "previews",
+                                  on_page=publish, on_progress=progress)
+    assert visible.is_set()
+    assert all(row["cover_status"] == "ready" for row in result["messages"])
 
 
 def test_covers_reuse_valid_cache_and_skip_picture_lookups(tmp_path, monkeypatch):
@@ -147,7 +175,7 @@ def test_stopping_cancels_all_inflight_photos_and_keeps_metadata(tmp_path, monke
             active -= 1
 
     def progress(event):
-        if event["processed"] >= 3:
+        if event["found"] >= 16 and event["processed"] >= 3:
             adapter.stop_event.set()
 
     monkeypatch.setattr(adapter, "_download_preview", picture)

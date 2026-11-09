@@ -21,6 +21,7 @@ telegram-settings.json
 *.session-journal
 *.session-wal
 *.session-shm
+**/*-tdlib-*/
 *.log
 *.log.*
 *.lock

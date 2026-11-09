@@ -386,6 +386,24 @@ def test_channel_listing_explains_inactive_local_proxy(tmp_path, monkeypatch):
     assert client.disconnected
 
 
+def test_archive_download_rejects_inactive_proxy_before_connecting(tmp_path, monkeypatch):
+    adapter = TelethonTelegramAdapter(12345, "a" * 32, tmp_path / "account.session",
+                                      tmp_path / "inbox", proxy_url="socks5://127.0.0.1:7890")
+    disconnected = []
+    client = SimpleNamespace(
+        connect=lambda: pytest.fail("must check local proxy before retrying Telegram connections"),
+        disconnect=lambda: disconnected.append(True))
+    monkeypatch.setattr(adapter, "_client", lambda: client)
+
+    def refused(*args, **kwargs):
+        raise ConnectionRefusedError("fixture proxy is off")
+
+    monkeypatch.setattr(adapters.socket, "create_connection", refused)
+    with pytest.raises(RuntimeError, match="127.0.0.1:7890 未监听"):
+        adapter.fetch_messages("fixture_channel", [77])
+    assert disconnected == [True]
+
+
 @pytest.mark.parametrize("content,size", [(b"not a zip", 9), (b"partial", 100)])
 def test_api_does_not_publish_invalid_download(tmp_path, monkeypatch, content, size):
     item = SimpleNamespace(id=8, file=SimpleNamespace(name="broken.zip", size=size), message="")
@@ -648,7 +666,8 @@ def test_parallel_archive_offsets_tail_and_concurrency(tmp_path, large_zip, work
     counts = [row["received"] for row in progress]
     assert counts == sorted(counts) and counts[-1] == len(content)
     assert counts[1] == request
-    assert all(row["speed"] > 0 and row["eta"] is not None for row in progress[1:])
+    assert all(row["speed"] >= 0 for row in progress[1:])
+    assert all(row["eta"] is None for row in progress if row["speed"] == 0)
     assert [row["download_status"] for row in events[-2:]] == ["validating", "completed"]
     assert sum(row["download_status"] == "completed" for row in events) == 1
 
@@ -664,7 +683,10 @@ def test_parallel_selection_keeps_download_media_compatibility(tmp_path, large_z
         message.file.size = None
     saved = asyncio.run(adapter._download_archive_async(client, message, message.file.name, transfer))
     assert saved.read_bytes() == content
-    assert client.sequential_calls == 1 and client.calls == []
+    if fallback in {"single_worker", "small_file"}:
+        assert client.sequential_calls == 0 and client.max_active == 1
+    else:
+        assert client.sequential_calls == 1 and client.calls == []
 
 
 @pytest.mark.parametrize("problem", ["short", "long", "early_eof", "metadata_too_small", "metadata_too_large"])
@@ -704,7 +726,7 @@ def test_parallel_failure_cancels_workers_before_isolation_and_counts_real_bytes
                 ready.set()
             await ready.wait()
             if stream.offset == 0:
-                raise OSError("离线分块故障")
+                raise RuntimeError("离线分块故障")
             await blocked.wait()
 
         client = ChunkClient(large_zip, before_chunk=before)

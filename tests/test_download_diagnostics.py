@@ -185,6 +185,36 @@ def test_active_download_report_uses_latest_heartbeat_without_claiming_completio
     assert "0.400 MiB/s" in diagnostics.render_report(report)
 
 
+def test_tdlib_report_identifies_native_engine_without_inventing_chunk_details():
+    report = diagnostics.analyze_files(encoded(
+        {"event": "start", "download_id": "td", "engine": "tdlib", "workers": 1},
+        {"event": "finish", "download_id": "td", "engine": "tdlib", "workers": 1,
+         "status": "completed", "received": 1024, "transfer_s": 1, "average_bps": 1024},
+    ))
+    row, = report["downloads"]
+    assert any("TDLib 管理连接" in finding for finding in row["findings"])
+    assert not any("Telethon 内部" in finding for finding in row["findings"])
+    assert "下载引擎: tdlib" in diagnostics.render_report(report)
+
+
+def test_report_includes_per_file_connection_recovery_without_attributing_other_client_events():
+    report = diagnostics.analyze_files(encoded(
+        {"event": "start", "download_id": "recovering", "message_id": 77, "workers": 8},
+        {"event": "connection_recovery", "download_id": "recovering",
+         "attempt": 1, "workers": 4, "offset": 524288},
+        {"event": "connection_recovery", "download_id": "recovering",
+         "attempt": 2, "workers": 2, "offset": 1048576},
+        {"event": "transport", "kind": "reconnect"},
+        {"event": "start", "download_id": "other", "message_id": 78, "workers": 4},
+    ))
+    recovered, other = report["downloads"]
+    assert len(recovered["connection_recoveries"]) == 2
+    assert recovered["connection_recoveries"][-1]["offset"] == 1048576
+    assert other["connection_recoveries"] == []
+    assert "下载连接恢复 2 次，最后一次并发降至 2" in diagnostics.render_report(report)
+    assert report["transport_events"] == {"reconnect": 1}
+
+
 def test_export_includes_only_diagnostic_files_and_analysis(log_dir):
     (log_dir / "pipeline.log").write_text("PRIVATE_PIPELINE_LOG", encoding="utf-8")
     (log_dir / "account.session").write_text("PRIVATE_SESSION", encoding="utf-8")

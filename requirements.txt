@@ -1,5 +1,7 @@
 telethon>=1.45,<2
 cryptg>=0.5,<0.6
+tdjson==1.8.69
+qrcode[pil]>=8,<9
 python-socks[asyncio]>=2,<3
 playwright>=1.45,<2
 httpx>=0.28,<0.29

@@ -32,6 +32,12 @@ def task_key(chat: str, message_id: int, filename: str) -> str:
     return hashlib.sha256(f"{channel_key(chat)}:{message_id}:{filename}".encode()).hexdigest()[:24]
 
 
+def image_version(path: Path, metadata=None) -> str:
+    info = metadata if metadata is not None else path.stat()
+    value = f"{path.resolve()}:{info.st_mtime_ns}:{info.st_size}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
 def image_type(path: Path) -> str | None:
     if path.suffix.lower() not in IMAGE_TYPES or not path.is_file() or path.stat().st_size > 12 * 1024 * 1024:
         return None
@@ -91,6 +97,12 @@ class TransferStore:
             task.setdefault("image_message_ids", [])
             task.setdefault("image_group_id", "")
             task.setdefault("storage_root", str(config.inbox_dir.resolve()))
+            task.setdefault("resumable", False)
+            task.setdefault("resumed_bytes", 0)
+            task.setdefault("average_speed", 0)
+            task.setdefault("download_phase", "")
+            task.setdefault("download_note", "")
+            task.setdefault("download_engine", "telethon")
             if task.get("download_status") in ACTIVE_DOWNLOADS:
                 task.update(download_status="interrupted", error="上次运行中断，可重新下载", speed=0, eta=None)
             if task.get("upload_status") == "uploading":
@@ -144,6 +156,8 @@ class TransferStore:
                     "topic_id": 0, "source_kind": "channel",
                     "title": Path(filename).stem, "source_url": "", "size": 0, "received": 0,
                     "speed": 0, "eta": None, "download_status": "queued", "upload_status": "waiting",
+                    "resumable": False, "resumed_bytes": 0, "average_speed": 0,
+                    "download_phase": "", "download_note": "", "download_engine": "telethon",
                     "local_path": "", "image_paths": [], "share_url": "", "error": "",
                     "image_source": "", "image_message_ids": [], "image_group_id": "",
                     "storage_root": str(self.config.inbox_dir.resolve()),
@@ -162,14 +176,18 @@ class TransferStore:
                                   "naming_quality", "naming_untranslated",
                                   "remote_filename", "rename_target", "rename_pending_name"} - {
                 key for key in task if key.startswith(("upload_", "cloud_delete"))}
-            task.update({key: value for key, value in event.items() if key in allowed})
+            values = {key: value for key, value in event.items() if key in allowed}
+            if not values.get("image_paths") and task.get("image_paths"):
+                for key in ("image_paths", "image_source", "image_message_ids", "image_group_id"):
+                    values.pop(key, None)
+            task.update(values)
             if event.get("download_status") == "queued" or event.get("local_path"):
                 task["storage_root"] = str(self.config.inbox_dir.resolve())
             task["updated_at"] = utc_now()
             if event.get("download_status") == "queued":
                 task.update(error="", received=0, speed=0, eta=None, record_removed_at="")
             if event.get("download_status") == "completed":
-                task.update(validation="passed", speed=0, eta=None, error="")
+                task.update(validation="passed", speed=0, eta=None, error="", resumable=False)
             if event.get("download_status") in {"failed", "cancelled", "interrupted"}:
                 task.update(speed=0, eta=None)
             if (is_new or task["download_status"] != previous_status or time.monotonic() - self.last_flush >= 1
@@ -258,6 +276,23 @@ class TransferStore:
         if not mime:
             raise ValueError("展示图格式不支持或已丢失")
         return path, mime
+
+    def cache_preview(self, identity: str, source: Path, message_id: int = 0) -> None:
+        """Copy an already validated catalog cover into this task's owned directory."""
+        with self.lock:
+            task = self.get(identity)
+            root = Path(task["storage_root"]).resolve()
+            if any(Path(path).resolve().is_relative_to(root) and image_type(Path(path))
+                   for path in task.get("image_paths", [])):
+                return
+            if not image_type(source):
+                return
+            folder = root / ".previews" / identity
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"channel-cover{source.suffix.lower()}"
+            shutil.copyfile(source, target)
+            self.update(identity, image_paths=[str(target.resolve())], image_source="channel_cover",
+                        image_message_ids=[message_id] if message_id else [], image_group_id="")
 
     def enrich(self, identity: str) -> None:
         """Read bounded raster previews only; never extract archive paths verbatim."""
@@ -350,6 +385,8 @@ class TransferStore:
                 elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(row["updated_at"])).total_seconds()
                 if elapsed > 5:
                     row.update(speed=0, eta=None)
+                    if row.get("download_phase") != "retrying":
+                        row["download_phase"] = "waiting"
         with self.lock:
             rows.extend(copy.deepcopy([row for row in self.remote_tasks if not row.get("record_removed_at")]))
         disk = shutil.disk_usage(self.config.inbox_dir)

@@ -60,6 +60,66 @@ def test_proxy_failure_has_no_invented_telegram_result(monkeypatch):
     assert bench.check_proxy("")["reachable"] is None
 
 
+def test_benchmark_adapter_uses_application_proxy_routing(tmp_path):
+    config = PipelineConfig(telegram_api_id=123, telegram_api_hash="fixture",
+                            telegram_ghelper_profile=str(tmp_path / "Default"))
+    adapter = bench.make_adapter(config, tmp_path, "telethon")
+    assert adapter.proxy_mode == "auto"
+    assert adapter.ghelper_profile == config.telegram_ghelper_profile
+    assert adapter.proxy_url == config.telegram_api_proxy_url
+
+
+def test_automatic_proxy_report_contains_no_credentials(monkeypatch):
+    monkeypatch.setattr(bench, "check_telegram_proxy", lambda *args: {
+        "connected": True, "selected": "browser", "password": "private-password",
+        "routes": {"browser": {"connected": True, "elapsed_ms": 20, "secret": "private-token"},
+                   "local": {"connected": False, "elapsed_ms": 1}},
+    })
+    result = bench.check_app_proxy(PipelineConfig())
+    assert result["reachable"] and result["selected"] == "browser"
+    assert not result["routes"]["local"]["connected"]
+    assert "private-" not in json.dumps(result)
+
+
+def test_python_engine_preflight_does_not_require_local_proxy_or_tdl(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "check_app_proxy", lambda config: {
+        "reachable": True, "selected": "browser"})
+    monkeypatch.setattr(bench, "memory_session", lambda path: SimpleNamespace(auth_key=True))
+    monkeypatch.setattr(bench, "tdl_version", lambda path: pytest.fail("Unselected tdl was checked"))
+    monkeypatch.setattr(bench, "check_proxy", lambda url: pytest.fail("Unused local proxy was checked"))
+    result = bench.preflight(PipelineConfig(), tmp_path / "missing.exe", ["telethon", "tdlib"])
+    assert result["ready_for_network_test"]
+    assert not result["tdl"]["required"] and not result["tdl"]["installed"]
+    assert "tdl_proxy" not in result
+
+
+def test_tdl_preflight_requires_its_own_local_proxy(tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "check_app_proxy", lambda config: {
+        "reachable": True, "selected": "browser"})
+    monkeypatch.setattr(bench, "memory_session", lambda path: SimpleNamespace(auth_key=True))
+    monkeypatch.setattr(bench, "tdl_version", lambda path: bench.TDL_VERSION)
+    monkeypatch.setattr(bench, "check_proxy", lambda url: {"reachable": False})
+    result = bench.preflight(PipelineConfig(), tmp_path / "tdl.exe", ["telethon", "tdl"])
+    assert result["tdl"]["installed"] and result["tdl"]["required"]
+    assert not result["ready_for_network_test"]
+
+
+def test_check_forwards_selected_engines_without_requiring_tdl(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    selections = []
+
+    def preflight(config, executable, engines):
+        selections.append(engines)
+        return {"ready_for_network_test": True, "proxy": {"reachable": True},
+                "tdl": {"installed": False}, "session_key_present": True}
+
+    monkeypatch.setattr(bench, "preflight", preflight)
+    assert bench.main(["--config", str(config_path), "--check", "--engines", "telethon",
+                       "--output", str(tmp_path / "output")]) == 0
+    assert selections == [["telethon"]]
+
+
 def test_tdl_command_keeps_paths_as_arguments_and_session_isolated(tmp_path, monkeypatch):
     executable = tmp_path / "a path with spaces" / "tdl.exe"
     executable.parent.mkdir()

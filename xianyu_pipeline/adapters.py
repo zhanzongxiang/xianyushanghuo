@@ -28,6 +28,7 @@ from .browser_profiles import launch_browser_context
 from .download_scheduler import DownloadScheduler
 from .download_diagnostics import DownloadTrace
 from .download_resume import DownloadCheckpoint
+from .model_grouping import annotate_model_groups, model_group_info
 from .runtime import telegram_crypto_backend
 from .telegram_sources import message_topic_id, source_scope
 
@@ -239,6 +240,9 @@ class TelethonTelegramAdapter:
         self.archive_test_executable_path = archive_test_executable_path
         self.archive_test_timeout_seconds = archive_test_timeout_seconds
         self.proxy_mode, self.ghelper_profile = proxy_mode, ghelper_profile
+        self.proxy_url = proxy_url
+        if proxy_mode == "auto":
+            parse_telegram_api_proxy(proxy_url)
         self.proxy = parse_telegram_api_proxy(proxy_url) if proxy_mode == "manual" else None
         self.dc2_server = parse_telegram_dc2_server(dc2_server)
         self.download_start_timeout_seconds = download_start_timeout_seconds
@@ -288,7 +292,7 @@ class TelethonTelegramAdapter:
 
             client_type = Dc2TelegramClient
         options = {"proxy": self.proxy} if self.proxy else {}
-        if self.proxy_mode == "ghelper":
+        if self.proxy_mode in {"auto", "ghelper"}:
             options["timeout"] = 50
         if session is not None:
             options["receive_updates"] = False
@@ -309,7 +313,10 @@ class TelethonTelegramAdapter:
         return client
 
     def _prepare_proxy(self) -> None:
-        if self.proxy_mode == "ghelper":
+        if self.proxy_mode == "auto":
+            from .telegram_proxy import proxy_for_telegram
+            self.proxy = proxy_for_telegram(self.ghelper_profile, self.proxy_url)
+        elif self.proxy_mode == "ghelper":
             from .ghelper_proxy import proxy_for_ghelper
             self.proxy = proxy_for_ghelper(self.ghelper_profile)
 
@@ -661,6 +668,10 @@ class TelethonTelegramAdapter:
         base = stem[:match.start()].rstrip(" ._-" )
         return base.casefold(), base, int(match.group(1))
 
+    @staticmethod
+    def _model_group_info(filename: str) -> tuple[str, str, str, list[str]]:
+        return model_group_info(filename)
+
     @classmethod
     def _annotate_series(cls, rows: list[dict]) -> None:
         groups: dict[str, list[dict]] = {}
@@ -675,6 +686,7 @@ class TelethonTelegramAdapter:
             for item in members:
                 item["series"] = is_series
                 item["series_total"] = len(members) if is_series else 1
+        annotate_model_groups(rows)
 
     def _is_channel_post(self, message) -> bool:
         if (not self._in_topic(message)
@@ -1566,7 +1578,7 @@ class TelethonTelegramAdapter:
                       media_only: bool = False) -> dict:
         target = self.normalize_channel(channel)
         if (type(before_id) is not int or before_id < 0
-                or type(limit) is not int or not 1 <= limit <= 100
+                or type(limit) is not int or not 1 <= limit <= 1000
                 or type(self.scan_limit) is not int or not 1 <= self.scan_limit <= 1000):
             raise ValueError("频道消息扫描参数无效")
         # Large catalog pages need extra room for photos, captions, and other posts.

@@ -97,10 +97,11 @@ def check_forum(page, fixture: Fixture, origin: str, label: str, unique: str):
     page.locator(".nav-item[data-view='messages']").click()
     page.locator("#channel-topic-select").wait_for(state="visible")
     page.wait_for_function("document.getElementById('channel-topic-select').value === '40'")
-    assert "STL Files" in page.locator("#page-subtitle").inner_text()
+    assert "STL Files" in page.locator("#page-title").inner_text()
+    assert "@forum_models" in page.locator("#page-subtitle").inner_text()
     page.locator("#scan-channel").click()
     page.locator(".channel-message h2").wait_for(state="visible")
-    assert page.locator(".channel-message h2").inner_text() == "topic-40.rar"
+    assert page.locator(".channel-message h2 button").get_attribute("title") == "topic-40.rar"
     page.locator(".channel-message-cover").click()
     page.locator("#channel-preview-dialog").wait_for(state="visible")
     page.wait_for_function("document.getElementById('channel-preview-image').complete && document.getElementById('channel-preview-image').naturalWidth > 0")
@@ -110,9 +111,9 @@ def check_forum(page, fixture: Fixture, origin: str, label: str, unique: str):
     page.wait_for_function("document.querySelectorAll('.channel-message').length === 0")
     page.locator("#scan-channel").click()
     page.locator(".channel-message h2").wait_for(state="visible")
-    assert page.locator(".channel-message h2").inner_text() == "topic-70.rar"
+    assert page.locator(".channel-message h2 button").get_attribute("title") == "topic-70.rar"
     page.locator("#channel-topic-select").select_option("40")
-    page.wait_for_function("document.querySelector('.channel-message h2')?.textContent === 'topic-40.rar'")
+    page.locator(".channel-message h2 button[title='topic-40.rar']").wait_for(state="visible")
     page.locator("[data-channel-action='download']").click()
     page.wait_for_function("!document.getElementById('channel-topic-select').disabled")
     assert fixture.posts[-1] == ("/api/channel-download", {

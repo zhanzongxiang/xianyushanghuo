@@ -53,20 +53,22 @@ def check_download_modes(page, fixture: Fixture, origin: str, label: str, unique
     assert_no_overflow(page, f"{label}: download actions")
     if label == "desktop":
         original_viewport = page.viewport_size
-        for width, height in ((1920, 1080), (1024, 768)):
+        for width, height, columns in ((1920, 1080, 5), (1440, 1000, 4), (1024, 768, 2)):
             page.set_viewport_size({"width": width, "height": height})
             assert_no_overflow(page, f"{width}: channel layout")
             row = page.locator(".channel-message").first.bounding_box()
             section = page.locator("#channel-messages-section").bounding_box()
-            assert section["width"] >= width - 200, "Channel list leaves unused space on the right"
-            if width >= 1600:
-                next_row = page.locator(".channel-message").nth(1).bounding_box()
-                assert abs(row["y"] - next_row["y"]) <= 1, "Wide screens should show two resource columns"
-                assert row["x"] + row["width"] < next_row["x"]
-                assert abs(next_row["x"] + next_row["width"] - section["x"] - section["width"] + 30) <= 1
-            else:
-                assert abs(row["x"] + row["width"] - section["x"] - section["width"] + 30) <= 1
+            sidebar = page.locator(".sidebar").bounding_box()
+            assert abs(section["x"] - sidebar["x"] - sidebar["width"]) <= 1
+            assert abs(section["x"] + section["width"] - width) <= 1
+            grid = page.locator("#channel-message-list")
+            tracks = grid.evaluate("el => getComputedStyle(el).gridTemplateColumns")
+            assert len(tracks.split()) == columns, (width, tracks, columns)
+            next_row = page.locator(".channel-message").nth(1).bounding_box()
+            assert abs(row["y"] - next_row["y"]) <= 1, "Resource cards should share their grid row"
+            assert row["x"] + row["width"] < next_row["x"]
             operations = page.locator(".channel-message-actions").first.bounding_box()
+            assert operations["x"] >= row["x"]
             assert operations["x"] + operations["width"] <= row["x"] + row["width"] + 1
             page.screenshot(path=str(ARTIFACTS / f"channel-layout-{unique}-{width}.png"), full_page=True)
         page.set_viewport_size(original_viewport)

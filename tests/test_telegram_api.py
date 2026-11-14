@@ -17,6 +17,7 @@ from xianyu_pipeline.adapters import (TelethonTelegramAdapter, parse_telegram_ap
                                       parse_telegram_dc2_server)
 from xianyu_pipeline.archive_validation import ArchiveValidationError
 from xianyu_pipeline.config import PipelineConfig
+from xianyu_pipeline.model_grouping import model_group_info
 
 
 def fake_client(monkeypatch, messages, authorized=True, payloads=None):
@@ -153,6 +154,39 @@ def test_archive_series_metadata_groups_split_volumes():
     assert rows[0]["series_total"] == 2
     assert rows[1]["series_total"] == 2
     assert rows[2]["series"] is False
+
+
+def test_model_group_metadata_merges_scale_and_support_variants_only():
+    variants = [
+        model_group_info("1-9 scale Laufey CA3D.rar"),
+        model_group_info("1-6 Laufey CA3D_Pre - Supported.rar"),
+        model_group_info("1-6 Laufey CA3D.rar"),
+    ]
+    assert {item[0] for item in variants} == {"laufey ca3d"}
+    assert {item[1] for item in variants} == {"Laufey CA3D"}
+    assert variants[0][2] == "1:9"
+    assert variants[1][2].startswith("1:6")
+    assert "预支撑" in variants[1][2]
+    assert model_group_info("1-6 Other Character.rar")[0] != variants[0][0]
+    assert model_group_info("Heroes Infinite 04-2026 - Blood Tribes.part1.rar")[0] == (
+        model_group_info("Heroes Infinite 04-2026 - Blood Tribes.part2.rar")[0]
+    )
+
+
+def test_model_group_metadata_marks_all_members_and_preserves_variants():
+    from xianyu_pipeline.model_grouping import annotate_model_groups
+
+    rows = [
+        {"filename": "1-9 scale Laufey CA3D.rar"},
+        {"filename": "1-6 Laufey CA3D_Pre - Supported.rar"},
+        {"filename": "1-6 Laufey CA3D.rar"},
+        {"filename": "Other Character 1-6.rar"},
+    ]
+    annotate_model_groups(rows)
+    assert [row["model_group"] for row in rows] == [True, True, True, False]
+    assert {row["model_group_total"] for row in rows[:3]} == {3}
+    assert {row["model_group_name"] for row in rows[:3]} == {"Laufey CA3D"}
+    assert rows[3]["model_group_total"] == 1
 
 
 def test_api_scans_archive_names_and_validates_before_publishing(tmp_path, monkeypatch):
@@ -325,11 +359,13 @@ def test_channel_listing_paginates_and_fetches_only_cover(tmp_path, monkeypatch)
     assert not fallback["messages"][0].get("cover_path")
 
 
-def test_channel_listing_allows_100_archives_and_expands_raw_scan_window(tmp_path, monkeypatch):
+@pytest.mark.parametrize("limit", [1, 100, 1000])
+def test_channel_listing_expands_raw_scan_window_and_streams_large_pages(tmp_path, monkeypatch, limit):
     archive = lambda mid: SimpleNamespace(
         id=mid, file=SimpleNamespace(name=f"asset-{mid}.zip", size=123),
         message=f"caption {mid}", date=None, document=None)
-    items = [archive(mid) for mid in range(100, 0, -1)]
+    items = [archive(mid) for mid in range(limit * 2, 0, -1)]
+    seen, pages, progress = [], [], []
 
     class Client:
         def connect(self):
@@ -346,18 +382,42 @@ def test_channel_listing_allows_100_archives_and_expands_raw_scan_window(tmp_pat
 
         def iter_messages(self, target, **options):
             assert target == "free_3d_models_download"
-            assert options["limit"] == 1000
-            return iter(items)
+            assert options["limit"] == max(200, limit * 10)
+            for item in items:
+                if item.id < options.get("offset_id", limit * 2 + 1):
+                    seen.append(item.id)
+                    yield item
 
     sync = types.ModuleType("telethon.sync")
     sync.TelegramClient = lambda *args: Client()
     monkeypatch.setitem(sys.modules, "telethon.sync", sync)
     adapter = TelethonTelegramAdapter(12345, "a" * 32, tmp_path / "account.session",
                                       tmp_path / "inbox", scan_limit=200)
+    def publish(page):
+        pages.append((len(seen), [row["message_id"] for row in page["messages"]]))
+
     page = adapter.list_archives("https://t.me/free_3d_models_download",
-                                 preview_dir=tmp_path / "previews", limit=100)
-    assert len(page["messages"]) == 100
-    assert page["messages"][0]["message_id"] == 100
+                                 preview_dir=tmp_path / "previews", limit=limit,
+                                 on_page=publish, on_progress=progress.append)
+    assert len(page["messages"]) == limit
+    assert page["messages"][0]["message_id"] == limit * 2
+    assert page["has_more"]
+    assert page["oldest_scanned_id"] == limit + 1
+    assert {mid for _, ids in pages for mid in ids} == set(range(limit + 1, limit * 2 + 1))
+    if limit > 10:
+        assert pages[0][0] < limit, "Large batches must publish before scanning completes"
+    assert progress[-1]["stage"] == "completed" and progress[-1]["found"] == limit
+    older = adapter.list_archives("https://t.me/free_3d_models_download", before_id=page["oldest_scanned_id"],
+                                  preview_dir=tmp_path / "previews", limit=limit)
+    assert [row["message_id"] for row in older["messages"]] == list(range(limit, 0, -1))
+
+
+@pytest.mark.parametrize("limit", [0, 1001, 1.5, "1000", True])
+def test_channel_listing_rejects_invalid_batch_size_before_connecting(tmp_path, monkeypatch, limit):
+    adapter = TelethonTelegramAdapter(12345, "a" * 32, tmp_path / "session", tmp_path)
+    monkeypatch.setattr(adapter, "_client", lambda: pytest.fail("Invalid size started a Telegram client"))
+    with pytest.raises(ValueError, match="扫描参数无效"):
+        adapter.list_archives("https://t.me/free_3d_models_download", limit=limit, preview_dir=tmp_path)
 
 
 def test_channel_listing_explains_inactive_local_proxy(tmp_path, monkeypatch):

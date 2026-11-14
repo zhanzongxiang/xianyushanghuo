@@ -49,8 +49,7 @@ def _telegram_values(payload: dict) -> dict | None:
         from .ghelper_proxy import validate_settings
         mode = values.get("telegram_proxy_mode", "manual")
         validate_settings(mode, values.get("telegram_ghelper_profile", ""))
-        if mode == "manual":
-            parse_telegram_api_proxy(values["telegram_api_proxy_url"])
+        parse_telegram_api_proxy(values["telegram_api_proxy_url"])
         parse_telegram_dc2_server(values["telegram_api_dc2_server"])
     except (ValueError, TypeError):
         return None

@@ -30,7 +30,7 @@
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
   plainFields.push("telegram_download_engine");
-  plainFields.push("telegram_proxy_mode", "telegram_ghelper_profile");
+  plainFields.push("telegram_ghelper_profile");
   plainFields.push("quark_api_folder_path");
   plainFields.push("data_server_url", "data_server_workspace", "data_server_backend", "data_server_db_host",
     "data_server_db_name", "data_server_db_user", "data_server_db_tls", "data_server_db_ca");
@@ -117,6 +117,10 @@
     }
     label.append(select);
     $("channel-search").closest(".search-field").after(label);
+  }
+  if (!$("resource-model-group")) {
+    $("resource-series")?.insertAdjacentHTML("beforebegin",
+      '<p id="resource-model-group" class="resource-model-group" hidden></p>');
   }
   if (!$("channel-catalog-pane")) $("channel-selected-count").after($("channel-scan-status"));
   $("channel-download-selected").innerHTML = `${icon("arrow-down-to-line")}仅下载`;
@@ -795,6 +799,36 @@
     return `${message.series_name || "分卷系列"} · ${total} 个分卷`;
   }
 
+  function modelGroupLabel(message) {
+    if (!message?.model_group) return "";
+    const total = Number(message.model_group_total || 1);
+    return `${message.model_group_name || "模型组"} · ${total} 个版本`;
+  }
+
+  function relatedDownloadableMessages(message) {
+    if (!message) return [];
+    const rows = [];
+    const seen = new Set();
+    const add = (item) => {
+      if (!item || seen.has(item.message_id) || !locallyDownloadableMessage(item)) return;
+      seen.add(item.message_id);
+      rows.push(item);
+    };
+    const catalog = state.catalog?.messages || [];
+    if (message.model_group && message.model_group_key) {
+      for (const item of catalog) {
+        if (item.model_group && item.model_group_key === message.model_group_key) add(item);
+      }
+    }
+    if (message.series && message.series_key) {
+      for (const item of catalog) {
+        if (item.series && item.series_key === message.series_key) add(item);
+      }
+    }
+    add(message);
+    return rows;
+  }
+
   function renderChannelLoading() {
     const scan = canReadChannel() ? state.data?.channel_scan || {} : {};
     const active = Boolean(state.scanRequested || state.data?.running && state.data.action === "channel-scan");
@@ -860,7 +894,6 @@
       const message = state.catalog?.messages.find((item) => item.message_id === id);
       if (!message || !downloadableMessage(message)) state.catalogSelection.delete(id);
     }
-    text("channel-selected-count", state.catalogSelection.size ? `已选择 ${state.catalogSelection.size} 条` : "未选择");
     const selectable = rows.filter(downloadableMessage);
     $("channel-select-all").checked = selectable.length > 0 && selectable.every((message) => state.catalogSelection.has(message.message_id));
     $("channel-select-all").indeterminate = !$("channel-select-all").checked && selectable.some((message) => state.catalogSelection.has(message.message_id));
@@ -876,7 +909,12 @@
       `<button type="button" data-catalog-filter="${key}" aria-pressed="${$("channel-transfer-filter").value === key}">${label}<span>${counts[key]}</span></button>`).join(""));
     text("channel-visible-count", `${rows.length} 个资源`);
     text("channel-sort-label", ({ latest: "按发布时间排列", size: "按文件大小排列", name: "按名称排列" })[$("channel-sort").value]);
-    text("channel-selected-count", selected.length ? `已选择 ${selected.length} 个资源` : "未选择资源");
+    const selectedGroups = new Set(selected.map((message) =>
+      message.model_group && message.model_group_key ? `model:${message.model_group_key}`
+        : message.series && message.series_key ? `series:${message.series_key}` : `message:${message.message_id}`));
+    text("channel-selected-count", selected.length
+      ? `已选择 ${selectedGroups.size} 个模型组 · ${selected.length} 个文件`
+      : "未选择资源");
     const selectedSize = selected.reduce((sum, message) => sum + (message.size || 0), 0);
     text("channel-selected-size", selected.length ? `合计 ${bytes(selectedSize)}${selected.some((message) => !message.size) ? " · 部分大小未知" : ""}` : "当前频道");
     $("channel-clear-selection").hidden = !selected.length;
@@ -934,7 +972,9 @@
           <div class="channel-message-copy">
             <div class="channel-message-head"><h2><button type="button" data-channel-action="inspect" title="${escape(message.filename)}">${escape(resourceName(message))}</button></h2></div>
             <div class="channel-message-meta"><b class="resource-file-format">${format}</b><span>${escape(bytes(message.size))}</span><span class="resource-message-id" title="文件消息 ID">#${id}</span></div>
-            ${message.series ? `<span class="resource-series" title="${escape(seriesLabel(message))}">${escape(seriesLabel(message))}</span>` : ""}
+            ${message.model_group ? `<span class="resource-model-group" title="${escape(modelGroupLabel(message))}">${escape(modelGroupLabel(message))}</span>` : ""}
+            ${message.model_group && message.model_variant !== "标准版" ? `<span class="resource-variant">${escape(message.model_variant)}</span>` : ""}
+            ${!message.model_group && message.series ? `<span class="resource-series" title="${escape(seriesLabel(message))}">${escape(seriesLabel(message))}</span>` : ""}
           </div>
           <div class="channel-message-operation">
             <div class="channel-message-badges">${catalogBadges(message)}</div>
@@ -988,6 +1028,10 @@
     text("resource-filename", message.filename);
     text("resource-size", bytes(message.size));
     text("resource-format", /\.zip$/i.test(message.filename) ? "ZIP 压缩包" : "RAR 压缩包");
+    $("resource-series").hidden = !message.series;
+    const groupText = modelGroupLabel(message);
+    $("resource-model-group").hidden = !groupText;
+    text("resource-model-group", groupText);
     $("resource-series").hidden = !message.series;
     text("resource-series", seriesLabel(message));
     text("resource-channel", sourceTitle());
@@ -1725,9 +1769,6 @@
   }
 
   function markRequired() {
-    const ghelper = $("telegram_proxy_mode").value === "ghelper";
-    $("telegram-manual-proxy-field").hidden = ghelper;
-    $("ghelper-fields").hidden = !ghelper;
     const quark = $("upload_provider").value === "quark_browser";
     const quarkCLI = $("upload_provider").value === "quark_cli";
     const quarkAPI = $("upload_provider").value === "quark_api";
@@ -2085,7 +2126,7 @@
   }
 
   function values() {
-    const output = { telegram_access_mode: "api", telegram_run_mode: "once" };
+    const output = { telegram_access_mode: "api", telegram_run_mode: "once", telegram_proxy_mode: "auto" };
     for (const id of plainFields) output[id] = $(id).value.trim();
     for (const id of numberFields) if ($(id).value) output[id] = Number($(id).value);
     for (const id of booleanFields) output[id] = $(id).checked;
@@ -2307,11 +2348,15 @@
 
   async function downloadChannelMessages(ids, autoUpload = false) {
     if (!canLoadChannelMedia() || !ids.length) return;
-    if (ids.length > 20) { setError("action", "每次最多下载 20 条消息，请减少选择。"); return; }
     if (state.configDirty) { setError("action", "请先保存设置，再下载频道文件。"); return; }
+    if (ids.length > 40) { setError("action", "当前一次最多提交 40 个文件，请分批选择模型组。"); return; }
+    const batches = [];
+    for (let offset = 0; offset < ids.length; offset += 20) batches.push(ids.slice(offset, offset + 20));
     await mutation(async () => {
-      await post("/api/channel-download", { ids, auto_upload_after_download: autoUpload });
-      notice(`已提交 ${ids.length} 条${autoUpload ? "下载并上传" : "仅下载"}任务`);
+      for (const batch of batches) {
+        await post("/api/channel-download", { ids: batch, auto_upload_after_download: autoUpload });
+      }
+      notice(`已提交 ${ids.length} 个文件${autoUpload ? "下载并上传" : "仅下载"}任务`);
     });
   }
 
@@ -2422,9 +2467,7 @@
     if (button.dataset.channelAction === "preview") openChannelPreview(message, button);
     if (button.dataset.channelAction === "inspect") openResourceInspector(message, button);
     if (["download", "download-upload"].includes(button.dataset.channelAction) && locallyDownloadableMessage(message)) {
-      const ids = message.series
-        ? (state.catalog?.messages || []).filter((item) => item.series_key === message.series_key && locallyDownloadableMessage(item)).map((item) => item.message_id)
-        : [message.message_id];
+      const ids = relatedDownloadableMessages(message).map((item) => item.message_id);
       void downloadChannelMessages(ids, button.dataset.channelAction === "download-upload");
     }
     if (button.dataset.channelAction === "task") {
@@ -2478,7 +2521,11 @@
   $("channel-message-list").addEventListener("change", (event) => {
     if (!event.target.matches(".channel-checkbox")) return;
     const id = Number(event.target.closest("[data-message-id]").dataset.messageId);
-    if (event.target.checked) state.catalogSelection.add(id); else state.catalogSelection.delete(id);
+    const message = state.catalog?.messages.find((item) => item.message_id === id);
+    for (const item of relatedDownloadableMessages(message)) {
+      if (event.target.checked) state.catalogSelection.add(item.message_id);
+      else state.catalogSelection.delete(item.message_id);
+    }
     renderCatalog();
   });
   $("channel-select-all").addEventListener("change", () => {
@@ -2539,7 +2586,7 @@
   for (const [id, upload] of [["resource-download", false], ["resource-download-upload", true]]) $(id).addEventListener("click", () => {
     const message = state.catalog?.messages.find((row) => row.message_id === state.resourceId);
     if (!message || !locallyDownloadableMessage(message)) return;
-    const ids = message.series ? (state.catalog?.messages || []).filter((row) => row.series_key === message.series_key && locallyDownloadableMessage(row)).map((row) => row.message_id) : [message.message_id];
+    const ids = relatedDownloadableMessages(message).map((row) => row.message_id);
     void downloadChannelMessages(ids, upload);
   });
   document.addEventListener("keydown", (event) => {
@@ -2554,10 +2601,8 @@
   });
   function downloadSelectedChannelMessages(autoUpload) {
     const selected = (state.catalog?.messages || []).filter((message) => state.catalogSelection.has(message.message_id) && downloadableMessage(message));
-    const selectedSeries = new Set(selected.filter((message) => message.series).map((message) => message.series_key));
-    const members = (state.catalog?.messages || []).filter((message) => message.series && selectedSeries.has(message.series_key) && downloadableMessage(message));
-    const ids = [...new Map([...selected, ...members].map((message) => [message.message_id, message])).values()]
-      .map((message) => message.message_id);
+    const members = selected.flatMap(relatedDownloadableMessages);
+    const ids = [...new Map([...selected, ...members].map((message) => [message.message_id, message])).values()].map((message) => message.message_id);
     void downloadChannelMessages(ids, autoUpload);
   }
   $("channel-download-selected").addEventListener("click", () => downloadSelectedChannelMessages(false));
@@ -2689,28 +2734,28 @@
     state.configDirty = true; state.formRevision++; text("config-dirty", "未保存更改");
   });
   $("upload_provider").addEventListener("change", markRequired);
-  $("telegram_proxy_mode").addEventListener("change", () => {
-    ghelperCheckRevision++;
-    $("ghelper-check").disabled = false;
-    text("ghelper-status", "尚未检测");
-    markRequired();
-  });
-  $("telegram_ghelper_profile").addEventListener("input", () => {
-    ghelperCheckRevision++;
-    $("ghelper-check").disabled = false;
-    text("ghelper-status", "目录已修改，尚未检测");
-  });
+  for (const id of ["telegram_ghelper_profile", "telegram_api_proxy_url"]) {
+    $(id).addEventListener("input", () => {
+      ghelperCheckRevision++;
+      $("ghelper-check").disabled = false;
+      text("ghelper-status", "配置已修改，尚未检测");
+    });
+  }
   $("ghelper-check").addEventListener("click", async () => {
     if ($("ghelper-check").disabled) return;
     const revision = ++ghelperCheckRevision;
     $("ghelper-check").disabled = true;
-    text("ghelper-status", "正在读取 Ghelper 线路并连接 Telegram…");
+    text("ghelper-status", "正在检测浏览器和本地 Telegram 代理…");
     try {
       const result = await request("/api/telegram-proxy-check", { method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ telegram_ghelper_profile: $("telegram_ghelper_profile").value.trim() }) }, 60000);
-      if (revision === ghelperCheckRevision) text("ghelper-status",
-        `${result.message} · ${result.nodes} 条 HTTPS 线路 · ${result.elapsed_ms} ms`);
+        body: JSON.stringify({ telegram_ghelper_profile: $("telegram_ghelper_profile").value.trim(),
+          telegram_api_proxy_url: $("telegram_api_proxy_url").value.trim() }) }, 35000);
+      if (revision === ghelperCheckRevision) {
+        const routes = Object.entries(result.routes || {}).map(([key, route]) =>
+          `${key === "browser" ? "浏览器" : "本地"}：${route.connected ? `可用 ${route.elapsed_ms} ms` : route.message}`);
+        text("ghelper-status", [result.message, ...routes].join(" · "));
+      }
     } catch (error) {
       if (revision === ghelperCheckRevision) text("ghelper-status", error.message);
     } finally {

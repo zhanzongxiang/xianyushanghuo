@@ -14,6 +14,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy.exc import SQLAlchemyError
 
+from .channel_catalog import MESSAGE_CACHE_LIMIT
 from .data_protocol import DIGEST, FIELDS, MAX_ASSET, PROTOCOL_VERSION, encoded, validate_record
 from .data_server import image_mime
 from .models import utc_now
@@ -423,14 +424,11 @@ class ServerSync:
                         messages = {item["message_id"]: item for item in current["messages"]}
                         previous = messages.get(value["message_id"], {})
                         messages[value["message_id"]] = {**previous, **value}
-                        current["messages"] = sorted(messages.values(), key=lambda item: item["message_id"], reverse=True)[:300]
+                        current["messages"] = sorted(messages.values(), key=lambda item: item["message_id"], reverse=True)[:MESSAGE_CACHE_LIMIT]
                     else:
                         current.update(value)
-                    self.catalog.catalog_root.mkdir(parents=True, exist_ok=True)
                     path = self.catalog._path(chat)
-                    temporary = path.with_suffix(".json.tmp")
-                    temporary.write_text(encoded(current), encoding="utf-8")
-                    temporary.replace(path)
+                    self.catalog._write_catalog(path, current)
                 elif kind == "tasks":
                     # Foreign task records are view-only and never enter local execution state.
                     if value["device_id"] != self.journal.device_id or value["id"] not in self.transfers.tasks:

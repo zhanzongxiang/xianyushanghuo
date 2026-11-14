@@ -46,7 +46,7 @@ class PipelineConfig:
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
     telegram_api_proxy_url: str = ""
-    telegram_proxy_mode: str = "manual"
+    telegram_proxy_mode: str = "auto"
     telegram_ghelper_profile: str = ""
     telegram_api_dc2_server: str = ""
     telegram_session: str = "data/telegram.session"
@@ -108,6 +108,7 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         from .ghelper_proxy import validate_settings
         validate_settings(self.telegram_proxy_mode, self.telegram_ghelper_profile)
+        self.telegram_proxy_mode = "auto"
         from .data_protocol import validate_endpoint
         import re
         if type(self.source_topic_id) is not int or not 0 <= self.source_topic_id <= 2147483647:

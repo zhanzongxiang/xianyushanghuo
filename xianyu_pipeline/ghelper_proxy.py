@@ -42,8 +42,8 @@ class Route:
 
 
 def validate_settings(mode, profile):
-    if not isinstance(mode, str) or mode not in {"manual", "ghelper"}:
-        raise ValueError("Telegram 代理方式须为手动配置或 Ghelper")
+    if not isinstance(mode, str) or mode not in {"auto", "manual", "ghelper"}:
+        raise ValueError("Telegram 代理方式无效")
     if (not isinstance(profile, str) or len(profile) > 4096
             or re.search(r"[\x00-\x1f]", profile) or profile and not Path(profile).is_absolute()):
         raise ValueError("Ghelper 配置目录须为空或浏览器用户配置目录的绝对路径")
@@ -184,6 +184,20 @@ def _destination(host, port):
     return f"[{address}]:{port}" if address.version == 6 else f"{address}:{port}"
 
 
+async def probe_telegram(reader, writer):
+    nonce = secrets.token_bytes(16)
+    packet = struct.pack("<QQII", 0, int(time.time()) << 32, 20, 0xbe7e8ef1) + nonce
+    writer.write(b"\xef\x0a" + packet)
+    await writer.drain()
+    head = (await reader.readexactly(1))[0]
+    size = int.from_bytes(await reader.readexactly(3), "little") * 4 if head == 127 else head * 4
+    if not 40 <= size <= 4096:
+        raise GhelperProxyError("未返回有效 Telegram 协议响应")
+    data = await reader.readexactly(size)
+    if data[20:24] != struct.pack("<I", 0x05162463) or data[24:40] != nonce:
+        raise GhelperProxyError("Telegram 协议握手校验失败")
+
+
 class GhelperBridge:
     def __init__(self, profile):
         self.profile = Path(profile)
@@ -237,20 +251,20 @@ class GhelperBridge:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
 
-    async def _connect(self, authority):
+    async def _connect(self, authority, *, connect_timeout=CONNECT_TIMEOUT):
         route = await asyncio.to_thread(_profile_route, self.profile)
         context = ssl.create_default_context()
         context.set_alpn_protocols(["http/1.1"])
         for index, (host, port) in enumerate(route.endpoints):
             writer = None
             try:
-                async with asyncio.timeout(CONNECT_TIMEOUT):
+                async with asyncio.timeout(connect_timeout):
                     addresses = await self.loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
                     if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
                         raise GhelperProxyError("Ghelper 节点解析到了本地或私有地址")
                     # Preserve the original SNI; the hostname can contain account routing data.
                     reader, writer = await asyncio.open_connection(addresses[0][4][0], port,
-                        ssl=context, server_hostname=host, ssl_handshake_timeout=CONNECT_TIMEOUT,
+                        ssl=context, server_hostname=host, ssl_handshake_timeout=connect_timeout,
                         ssl_shutdown_timeout=1, limit=16384)
                     writer.write(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode("ascii"))
                     await writer.drain()
@@ -349,17 +363,7 @@ class GhelperBridge:
         started = time.monotonic()
         reader, writer = await self._connect("149.154.167.51:443")
         try:
-            nonce = secrets.token_bytes(16)
-            packet = struct.pack("<QQII", 0, int(time.time()) << 32, 20, 0xbe7e8ef1) + nonce
-            writer.write(b"\xef\x0a" + packet)
-            await writer.drain()
-            head = (await reader.readexactly(1))[0]
-            size = int.from_bytes(await reader.readexactly(3), "little") * 4 if head == 127 else head * 4
-            if not 40 <= size <= 4096:
-                raise GhelperProxyError("Ghelper 未返回有效 Telegram 协议响应")
-            data = await reader.readexactly(size)
-            if data[20:24] != struct.pack("<I", 0x05162463) or data[24:40] != nonce:
-                raise GhelperProxyError("Ghelper Telegram 协议握手校验失败")
+            await probe_telegram(reader, writer)
             return {"connected": True, "elapsed_ms": round((time.monotonic() - started) * 1000),
                     "message": "Ghelper 线路可用，Telegram 协议握手通过"}
         finally:

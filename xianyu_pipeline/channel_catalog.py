@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import json
 import logging
+import os
 import threading
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from .models import utc_now
+from .model_grouping import annotate_model_groups
 from .workbench import channel_key, image_type, image_version
 from .telegram_sources import split_scope, source_scope
+
+
+MESSAGE_CACHE_LIMIT = 1000
 
 
 class ChannelCatalog:
@@ -20,6 +28,73 @@ class ChannelCatalog:
         self.preview_root = output_dir / ".channel-previews"
         self.lock = threading.RLock()
         self.data = self._empty("")
+
+    @contextmanager
+    def _process_write_lock(self):
+        """Serialize catalog replacements across multiple application processes."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self.output_dir / ".channel-catalog.write.lock"
+        with lock_path.open("a+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                handle.write(b"\0")
+                handle.flush()
+                deadline = time.monotonic() + 15
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _write_catalog(self, path: Path, value: dict) -> None:
+        """Write JSON atomically, tolerating short Windows file-sharing conflicts."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._process_write_lock():
+            temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+            try:
+                with temporary.open("w", encoding="utf-8", newline="") as handle:
+                    json.dump(value, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                last_error = None
+                for delay in (0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.2, 2.0):
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        os.replace(temporary, path)
+                        last_error = None
+                        break
+                    except PermissionError as error:
+                        last_error = error
+                        if getattr(error, "winerror", None) not in {5, 32} and getattr(error, "errno", None) not in {13, 16}:
+                            raise
+                if last_error is not None:
+                    raise last_error
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    logging.warning("频道缓存临时文件清理失败: %s", temporary)
 
     @staticmethod
     def _empty(channel: str) -> dict:
@@ -101,9 +176,7 @@ class ChannelCatalog:
                         recovered += 1
                         changed = True
                 if changed:
-                    temporary = path.with_suffix(".json.tmp")
-                    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-                    temporary.replace(path)
+                    self._write_catalog(path, current)
             return recovered
 
     @staticmethod
@@ -134,6 +207,7 @@ class ChannelCatalog:
     def snapshot(self, channel: str, *, exclude_forwarded_posts: bool = False) -> dict:
         with self.lock:
             current = self._current(channel)
+            annotate_model_groups(current["messages"])
             rows = copy.deepcopy([row for row in current["messages"]
                                   if not exclude_forwarded_posts or not row.get("forwarded", False)])
             for row in rows:
@@ -222,12 +296,10 @@ class ChannelCatalog:
             cursor = (page["oldest_scanned_id"] if older or not current["oldest_scanned_id"]
                       else current["oldest_scanned_id"])
             self.data = {"channel": key, "chat": peer, "topic_id": topic_id,
-                         "messages": sorted(existing.values(), key=lambda row: row["message_id"], reverse=True)[:300],
+                         "messages": sorted(existing.values(), key=lambda row: row["message_id"], reverse=True)[:MESSAGE_CACHE_LIMIT],
                          "oldest_scanned_id": cursor,
                          "has_more": page["has_more"] if older or not current["oldest_scanned_id"] else current["has_more"],
                          "scanned_at": utc_now()}
-            self.catalog_root.mkdir(parents=True, exist_ok=True)
+            annotate_model_groups(self.data["messages"])
             target = self._path(key)
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(target)
+            self._write_catalog(target, self.data)

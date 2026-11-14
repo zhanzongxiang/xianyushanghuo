@@ -32,7 +32,7 @@
   "telegram_api_id": 0,
   "telegram_api_hash": "",
   "telegram_api_proxy_url": "",
-  "telegram_proxy_mode": "manual",
+  "telegram_proxy_mode": "auto",
   "telegram_ghelper_profile": "",
   "telegram_api_dc2_server": "",
   "telegram_session": "data/telegram.session",

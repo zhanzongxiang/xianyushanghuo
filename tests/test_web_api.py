@@ -289,7 +289,11 @@ def test_channel_catalog_requires_api_and_valid_cached_messages(ui_server):
         loaded = json.load(response)
     assert loaded["exclude_forwarded_posts"] is True
     assert loaded["channel_message_limit"] == 100
-    for invalid in (0, 101, 1.5, "100"):
+    for limit in (1, 101, 1000):
+        assert request(url, "/api/config", {**api, "channel_message_limit": limit})[0] == 200
+        with urlopen(url + "/api/config") as response:
+            assert json.load(response)["channel_message_limit"] == limit
+    for invalid in (0, 1001, 1.5, "100", True):
         assert request(url, "/api/config", {**api, "channel_message_limit": invalid})[0] == 400
     for payload in ({"older": True}, {"older": "true"}):
         assert request(url, "/api/channel-scan", payload)[0] == 400

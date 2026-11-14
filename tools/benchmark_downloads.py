@@ -26,6 +26,7 @@ from xianyu_pipeline.adapters import TelethonTelegramAdapter, _TransferEvents, p
 from xianyu_pipeline.archive_validation import validate_rar
 from xianyu_pipeline.config import PipelineConfig
 from xianyu_pipeline.runtime import configure_logging, telegram_crypto_backend
+from xianyu_pipeline.telegram_proxy import check_telegram_proxy, close_bridges
 
 TDL_VERSION = "0.20.4"
 DEFAULT_TDL = ROOT / ".cache/tools/tdl" / ("v" + TDL_VERSION) / "tdl.exe"
@@ -112,22 +113,34 @@ def tdl_version(executable: Path) -> str:
     return match[1]
 
 
-def preflight(config: PipelineConfig, executable: Path) -> dict:
-    if config.telegram_proxy_mode != "manual":
-        raise RuntimeError("The standalone tdl benchmark currently requires manual proxy mode; it cannot reuse the in-process Ghelper bridge.")
-    result = {"proxy": check_proxy(config.telegram_api_proxy_url), "tdl": {}, "session_key_present": False}
+def check_app_proxy(config: PipelineConfig) -> dict:
+    result = check_telegram_proxy(config.telegram_ghelper_profile, config.telegram_api_proxy_url)
+    return {"configured": True, "mode": "auto", "reachable": result["connected"],
+            "selected": result.get("selected", ""),
+            "routes": {key: {"connected": bool(value.get("connected")),
+                             "elapsed_ms": value.get("elapsed_ms")}
+                       for key, value in result.get("routes", {}).items()}}
+
+
+def preflight(config: PipelineConfig, executable: Path, engines=("telethon", "tdl")) -> dict:
+    needs_tdl = "tdl" in engines
+    result = {"proxy": check_app_proxy(config), "tdl": {"required": needs_tdl, "installed": False},
+              "session_key_present": False}
     try:
         result["session_key_present"] = bool(memory_session(Path(config.telegram_session)).auth_key)
     except (OSError, RuntimeError, sqlite3.Error):
         result["session_error"] = "Existing Telegram authorization is unavailable."
-    try:
-        result["tdl"] = {"installed": True, "version": tdl_version(executable)}
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        result["tdl"] = {"installed": False, "error_type": type(exc).__name__}
+    if needs_tdl:
+        result["tdl_proxy"] = check_proxy(config.telegram_api_proxy_url)
+        try:
+            result["tdl"].update(installed=True, version=tdl_version(executable))
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            result["tdl"].update(installed=False, error_type=type(exc).__name__)
     result["crypto_backend"] = telegram_crypto_backend()
-    result["tdl_login"] = "Separate authorization required; this check does not contact Telegram."
-    result["ready_for_network_test"] = (result["session_key_present"] and result["tdl"]["installed"]
-                                        and result["proxy"]["reachable"] is not False)
+    result["tdl_login"] = "Separate authorization and the configured local proxy are required for tdl."
+    result["ready_for_network_test"] = (
+        result["session_key_present"] and result["proxy"]["reachable"] is not False
+        and (not needs_tdl or result["tdl"]["installed"] and result["tdl_proxy"]["reachable"] is not False))
     return result
 
 
@@ -224,6 +237,7 @@ def make_adapter(config: PipelineConfig, directory: Path, engine: str):
     return TelethonTelegramAdapter(
         config.telegram_api_id, config.telegram_api_hash, config.telegram_session, directory,
         proxy_url=config.telegram_api_proxy_url, dc2_server=config.telegram_api_dc2_server,
+        proxy_mode=config.telegram_proxy_mode, ghelper_profile=config.telegram_ghelper_profile,
         download_workers=config.download_workers, download_file_concurrency=1, download_engine=engine,
         download_start_timeout_seconds=config.download_start_timeout_seconds,
         download_transfer_timeout_seconds=config.download_transfer_timeout_seconds,
@@ -278,6 +292,7 @@ async def benchmark(config: PipelineConfig, args, output: Path, report: dict) ->
         "Resumed or cached downloads are excluded from fresh-download speed comparison.",
         "tdl partial-file recovery is not claimed. Its --continue option tracks finished batch items.",
         "TDLib uses its existing profile and refuses an active profile lock; stop other TDLib tasks first.",
+        "Telethon and TDLib use the application's automatic routing; external tdl uses the configured local proxy.",
         "No uploads or material records are created. Trials run sequentially with one file at a time.",
     ]
     records = report.setdefault("runs", [])
@@ -337,7 +352,7 @@ def main(argv=None) -> int:
     parser.add_argument("--config", type=Path, default=ROOT / "config/test.local.json")
     parser.add_argument("--tdl", type=Path, default=DEFAULT_TDL)
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--check", action="store_true", help="Check installation, proxy TCP and existing session.")
+    mode.add_argument("--check", action="store_true", help="Check selected engines, Telegram proxy routes and existing session.")
     mode.add_argument("--login-tdl", action="store_true", help="Interactive QR authorization in this terminal.")
     mode.add_argument("--url", help="Telegram ZIP/RAR message link to benchmark.")
     parser.add_argument("--engines", nargs="+", choices=("telethon", "tdlib", "tdl"), default=["telethon", "tdl"])
@@ -349,7 +364,9 @@ def main(argv=None) -> int:
         parse_message_url(args.url)
     output = args.output.resolve() / (datetime.now().strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:8])
     output.mkdir(parents=True, exist_ok=False)
-    report = {"created_at": datetime.now(timezone.utc).isoformat(), "preflight": preflight(config, args.tdl)}
+    selected_engines = ["tdl"] if args.login_tdl else args.engines
+    report = {"created_at": datetime.now(timezone.utc).isoformat(),
+              "preflight": preflight(config, args.tdl, selected_engines)}
     report_path = output / "report.json"
     save_report(report_path, report)
     print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
@@ -357,15 +374,14 @@ def main(argv=None) -> int:
     checks = report["preflight"]
     if args.check:
         return 0 if checks["ready_for_network_test"] else 2
-    if checks["proxy"]["reachable"] is False:
-        return 2
     if args.login_tdl:
-        if not checks["tdl"]["installed"]:
+        if (not checks["tdl"]["installed"]
+                or checks.get("tdl_proxy", checks["proxy"])["reachable"] is False):
             return 2
         command = tdl_command(args.tdl, config.telegram_api_proxy_url, config.download_workers)
         print("Authorize the SAME account as the application. Credentials stay in the interactive terminal.", flush=True)
         return subprocess.call(command + ["login", "--type", "qr"], env=tdl_environment())
-    if not checks["session_key_present"] or ("tdl" in args.engines and not checks["tdl"]["installed"]):
+    if not checks["ready_for_network_test"]:
         return 2
     configure_logging(output / "logs")
     try:
@@ -378,6 +394,7 @@ def main(argv=None) -> int:
         print("Benchmark failed: " + type(exc).__name__, file=sys.stderr)
         return 1
     finally:
+        close_bridges()
         save_report(report_path, report)
     return 0 if report.get("runs") and all(row["status"] == "completed" for row in report["runs"]) else 1
 

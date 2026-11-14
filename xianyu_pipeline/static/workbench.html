@@ -116,7 +116,7 @@
             <button id="resource-picture" class="resource-picture" type="button" title="放大图片" aria-label="放大资源图片"></button>
             <div class="resource-picture-note"><span id="resource-picture-status"></span><button id="resource-zoom" class="icon-button" type="button" title="放大图片" aria-label="放大图片"><i data-lucide="expand"></i></button></div>
             <h3 id="resource-title"></h3><div id="resource-badges" class="channel-message-badges"></div>
-            <section class="resource-detail-section"><h4>原文件</h4><p id="resource-filename"></p><dl><dt>文件大小</dt><dd id="resource-size"></dd><dt>类型</dt><dd id="resource-format"></dd></dl><p id="resource-series" hidden></p></section>
+            <section class="resource-detail-section"><h4>原文件</h4><p id="resource-filename"></p><dl><dt>文件大小</dt><dd id="resource-size"></dd><dt>类型</dt><dd id="resource-format"></dd></dl><p id="resource-model-group" class="resource-model-group" hidden></p><p id="resource-series" class="resource-series" hidden></p></section>
             <section class="resource-detail-section"><h4>来源与关联</h4><dl><dt>来源</dt><dd id="resource-channel"></dd><dt>文件消息</dt><dd><button id="resource-copy-id" class="text-button" type="button" title="复制消息 ID"><span id="resource-mid"></span><i data-lucide="copy"></i></button></dd><dt>预览图消息</dt><dd id="resource-photo-id"></dd><dt>图片关联</dt><dd id="resource-association"></dd><dt>发布时间</dt><dd id="resource-date"></dd></dl><a id="resource-source" class="text-button" target="_blank" rel="noopener noreferrer"><i data-lucide="external-link"></i>查看 Telegram 原消息</a></section>
             <section id="resource-caption-section" class="resource-detail-section" hidden><h4>消息正文</h4><p id="resource-caption"></p></section>
             <section class="resource-detail-section"><h4>存储位置</h4><dl><dt>本地下载</dt><dd id="resource-local"></dd><dt>上传目标</dt><dd id="resource-cloud"></dd></dl><div class="resource-detail-links"><a id="resource-cloud-link" class="text-button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="cloud"></i>查看夸克</a><button id="resource-task" class="text-button" type="button" hidden><i data-lucide="list-checks"></i>任务记录</button></div></section>
@@ -239,14 +239,13 @@
               <label>来源频道<select id="source_channel_url"><option value="">不选择频道</option></select></label>
               <label id="source-topic-field" hidden>来源话题<select id="source_topic_id"><option value="0">请选择话题</option></select></label>
               <label>扫描下载数量<input id="recent_message_limit" type="number" min="1" max="100" step="1"></label>
-              <label>频道消息每轮读取数量<input id="channel_message_limit" type="number" min="1" max="100" step="1"></label>
+              <label>频道消息每轮读取数量<input id="channel_message_limit" type="number" min="1" max="1000" step="1"></label>
               <label class="toggle-field"><span>排除转发帖</span><input id="exclude_forwarded_posts" type="checkbox" role="switch"></label>
               <div id="api-fields" class="wide form-grid">
                 <label>Telegram API ID<input id="telegram_api_id" type="text" inputmode="numeric" autocomplete="off" placeholder="填写 API ID" spellcheck="false"></label>
                 <label>Telegram API Hash<input id="telegram_api_hash" type="password" autocomplete="new-password" placeholder="填写 API Hash" spellcheck="false"></label>
-                <label>Telegram 代理方式<select id="telegram_proxy_mode"><option value="manual">手动代理 / 直连</option><option value="ghelper">Ghelper 当前线路</option></select></label>
-                <label id="telegram-manual-proxy-field">Telegram 代理地址（可选）<input id="telegram_api_proxy_url" type="text" placeholder="socks5://127.0.0.1:7890" spellcheck="false"></label>
-                <div id="ghelper-fields" class="wide form-grid" hidden><label class="wide">Ghelper 浏览器用户配置目录（可选）<input id="telegram_ghelper_profile" type="text" placeholder="自动识别 Chrome / Edge / Quark 用户配置" spellcheck="false"></label><div class="wide browser-info-field"><button id="ghelper-check" type="button"><i data-lucide="network"></i>检测 Ghelper 线路</button><output id="ghelper-status" role="status">尚未检测</output></div></div>
+                <label id="telegram-manual-proxy-field">本地 Telegram 代理地址（可选）<input id="telegram_api_proxy_url" type="text" placeholder="留空检测 socks5://127.0.0.1:7890" spellcheck="false"></label>
+                <div id="ghelper-fields" class="wide form-grid"><label class="wide">Ghelper 浏览器用户配置目录（可选）<input id="telegram_ghelper_profile" type="text" placeholder="自动识别 Chrome / Edge / Quark 用户配置" spellcheck="false"></label><div class="wide browser-info-field"><button id="ghelper-check" type="button"><i data-lucide="network"></i>检测代理渠道</button><output id="ghelper-status" role="status">自动选路 · 浏览器优先 · 尚未检测</output></div></div>
                 <label>DC 2 节点<select id="telegram_api_dc2_server"><option value="">沿用会话 / Telethon 自动选择</option><option value="149.154.167.50:443">生产 149.154.167.50:443</option></select></label>
                 <output id="api-status" class="wide field-hint"></output>
               </div>

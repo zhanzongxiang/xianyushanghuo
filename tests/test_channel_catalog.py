@@ -1,9 +1,77 @@
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import xianyu_pipeline.channel_catalog as channel_catalog
 from xianyu_pipeline.channel_catalog import ChannelCatalog
+
+
+def test_catalog_write_retries_windows_sharing_conflict(tmp_path, monkeypatch):
+    catalog = ChannelCatalog(tmp_path)
+    real_replace = channel_catalog.os.replace
+    attempts = {"count": 0}
+
+    def replace(source, target):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            error = PermissionError(13, "permission denied")
+            error.winerror = 5
+            raise error
+        return real_replace(source, target)
+
+    monkeypatch.setattr(channel_catalog.os, "replace", replace)
+    catalog.merge("example_channel", {"messages": [row(10)], "oldest_scanned_id": 10, "has_more": False})
+    assert attempts["count"] == 3
+    assert ChannelCatalog(tmp_path).snapshot("example_channel")["messages"][0]["message_id"] == 10
+    assert not list((tmp_path / ".channel-catalog").glob("*.tmp"))
+
+
+def test_catalog_writers_use_valid_unique_atomic_files(tmp_path):
+    catalogs = [ChannelCatalog(tmp_path), ChannelCatalog(tmp_path)]
+
+    def write(index):
+        catalogs[index].merge("example_channel", {
+            "messages": [row(index + 10)],
+            "oldest_scanned_id": index + 10,
+            "has_more": False,
+        })
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(write, range(2)))
+    listing = ChannelCatalog(tmp_path).snapshot("example_channel")
+    assert {item["message_id"] for item in listing["messages"]} <= {10, 11}
+    assert json.loads((tmp_path / ".channel-catalog" / "example_channel.json").read_text(encoding="utf-8"))
+
+
+def test_full_thousand_message_page_survives_streaming_refresh_and_restart(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    for first in range(1, 1001, 100):
+        catalog.merge("example_channel", {
+            "messages": [row(mid) for mid in range(first, first + 100)],
+            "oldest_scanned_id": 1, "has_more": True,
+        })
+    catalog.merge("example_channel", {
+        "messages": [{**row(1000), "text": "refreshed"}],
+        "oldest_scanned_id": 1000, "has_more": False,
+    })
+    listing = ChannelCatalog(tmp_path).snapshot("example_channel")
+    assert [item["message_id"] for item in listing["messages"]] == list(range(1000, 0, -1))
+    assert listing["messages"][0]["text"] == "refreshed"
+    assert listing["oldest_scanned_id"] == 1 and listing["has_more"]
+    assert ChannelCatalog(tmp_path).snapshot("another_channel")["messages"] == []
+
+
+def test_catalog_retains_newest_thousand_without_losing_cursor(tmp_path):
+    catalog = ChannelCatalog(tmp_path)
+    catalog.merge("example_channel", {
+        "messages": [row(mid) for mid in range(1, 1006)],
+        "oldest_scanned_id": 1, "has_more": True,
+    })
+    listing = catalog.snapshot("example_channel")
+    assert [item["message_id"] for item in listing["messages"]] == list(range(1005, 5, -1))
+    assert listing["oldest_scanned_id"] == 1
 
 
 def row(message_id: int, cover_path: str = "") -> dict:

@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from xianyu_pipeline import ghelper_proxy as gp, tdlib_client
+from xianyu_pipeline import ghelper_proxy as gp, tdlib_client, telegram_proxy
 from xianyu_pipeline.adapters import TelethonTelegramAdapter
 from xianyu_pipeline.config import PipelineConfig
 from test_workbench_actions import app
@@ -255,6 +255,7 @@ def test_https_connect_validates_tls_sni_fallback_and_reloads_route(tmp_path, mo
 
 def test_status_does_not_start_bridge_or_tdlib(tmp_path, monkeypatch):
     monkeypatch.setattr(gp, "_bridges", {})
+    monkeypatch.setattr(telegram_proxy, "_bridges", {})
     monkeypatch.setattr(gp, "discover_route", lambda *args: pytest.fail("Status read started discovery"))
     assert gp.proxy_for_ghelper(create=False) is None
     assert tdlib_client.client_for_config(PipelineConfig(telegram_proxy_mode="ghelper"), create=False) is None
@@ -278,12 +279,13 @@ def test_telethon_uses_authenticated_bridge_and_keeps_manual_config(tmp_path, mo
 
 def test_proxy_check_does_not_change_config_or_start_task(app, monkeypatch):
     calls = []
-    monkeypatch.setattr(gp, "check_ghelper", lambda value: calls.append(value) or {"connected": True})
+    monkeypatch.setattr(telegram_proxy, "check_telegram_proxy",
+                        lambda profile, local: calls.append((profile, local)) or {"connected": True})
     before = app.config_path.read_bytes()
     app.state.running = True
     app.state.stop_event.set()
     assert app.post("/api/telegram-proxy-check", {"telegram_ghelper_profile": ""}) == (200, {"connected": True})
-    assert calls == [""] and not app.workers
+    assert calls == [("", "")] and not app.workers
     assert app.state.running and app.state.stop_event.is_set() and app.config_path.read_bytes() == before
     assert app.post("/api/telegram-proxy-check", {"destination": "example.com"})[0] == 400
 
@@ -293,9 +295,9 @@ def test_ghelper_mode_save_retains_manual_proxy_and_quark_settings(app):
     assert app.post("/api/config", {"telegram_proxy_mode": "ghelper", "telegram_ghelper_profile": "",
                                     "telegram_api_proxy_url": "socks5://127.0.0.1:7890"})[0] == 200
     config = PipelineConfig.from_json(app.config_path)
-    assert config.telegram_proxy_mode == "ghelper" and config.telegram_api_proxy_url.endswith(":7890")
+    assert config.telegram_proxy_mode == "auto" and config.telegram_api_proxy_url.endswith(":7890")
     assert config.quark_folder_url == before.quark_folder_url and config.upload_provider == before.upload_provider
-    assert app.get("/api/config")[1]["telegram_proxy_mode"] == "ghelper"
+    assert app.get("/api/config")[1]["telegram_proxy_mode"] == "auto"
     saved = app.config_path.read_bytes()
     assert app.post("/api/config", {"telegram_proxy_mode": "invalid"})[0] == 400
     assert app.config_path.read_bytes() == saved

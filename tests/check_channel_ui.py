@@ -17,7 +17,8 @@ from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "outputs" / "ui-redesign-v2" / "assets"
-BROWSER = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+BROWSER = Path(os.environ.get("BROWSER_TEST_PATH") or
+               r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 
 
 def check_loading(page, address: str, result_dir: Path, unique: str, label: str,
@@ -260,11 +261,18 @@ def check_transfers(page, address: str, result_dir: Path, unique: str, label: st
     assert row(0).locator("[data-channel-action='download']").is_disabled()
     assert "已下载" in badges(1) and "其他设备" in badges(1) and "已转存夸克" in badges(1)
     assert row(1).locator(".channel-checkbox").is_disabled()
-    assert "下载到本机" in row(1).locator("[data-channel-action='download']").inner_text()
-    assert row(1).get_by_role("link", name="查看夸克").get_attribute("href") == "https://pan.quark.cn/s/fixture"
+    local_download = row(1).get_by_role("button", name="下载到本机", exact=True)
+    assert local_download.is_enabled()
+    assert local_download.get_attribute("title") == "下载到本机"
+    row(1).locator("[data-channel-action='inspect']").click()
+    assert page.locator("#resource-cloud-link").is_visible()
+    assert page.locator("#resource-cloud-link").get_attribute("href") == "https://pan.quark.cn/s/fixture"
+    page.locator("#resource-close").click()
     assert "已转存夸克" not in badges(2)
     assert "转存待确认" in badges(3) and "已转存夸克" not in badges(3)
-    assert row(3).get_by_role("link", name="查看夸克").count() == 0
+    row(3).locator("[data-channel-action='inspect']").click()
+    assert page.locator("#resource-cloud-link").is_hidden()
+    page.locator("#resource-close").click()
     assert "转存失败" in badges(4) and "已转存夸克" not in badges(4)
     assert badges(5) == "未下载", "A different channel's message ID or filename matched"
     assert "已转存夸克" in badges(6) and "下载失败" in badges(6)
@@ -275,15 +283,16 @@ def check_transfers(page, address: str, result_dir: Path, unique: str, label: st
 
     status_filter = page.locator("#channel-transfer-filter")
     for status, expected in (("transferred", 2), ("downloaded", 7), ("new", 2), ("all", 9)):
-        status_filter.select_option(status)
+        page.locator(f"[data-catalog-filter='{status}']").click()
+        assert status_filter.input_value() == status
         assert page.locator(".channel-message").count() == expected
-    status_filter.select_option("transferred")
+    page.locator("[data-catalog-filter='transferred']").click()
     assert page.locator("#channel-select-all").is_disabled()
     assert not page.locator("#channel-select-all").is_checked()
     page.locator("#channel-search").fill("model-1")
     assert page.locator(".channel-message").count() == 1
     page.locator("#channel-search").fill("")
-    status_filter.select_option("all")
+    page.locator("[data-catalog-filter='all']").click()
     page.locator("#channel-select-all").check()
     assert page.locator(".channel-checkbox:checked").count() == 1
     assert row(5).locator(".channel-checkbox").is_checked()
@@ -300,14 +309,15 @@ def check_transfers(page, address: str, result_dir: Path, unique: str, label: st
     page.wait_for_function(
         "document.querySelector('[data-message-id=\"400\"]').textContent.includes('已转存夸克')")
     assert "已转存 3" in page.locator("#channel-result-count").inner_text()
-    row(1).locator("[data-channel-action='task']").click()
+    row(1).locator("[data-channel-action='inspect']").click()
+    page.locator("#resource-task").click()
     page.wait_for_function("document.getElementById('page-title').textContent === '下载任务'")
     assert page.locator("#detail-path").inner_text() == "文件位于其他设备"
     page.keyboard.press("Escape")
     page.locator(".nav-item[data-view='messages']").click()
     page.wait_for_function("document.querySelectorAll('.channel-message').length === 9")
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-    assert page.locator("#channel-transfer-filter").is_visible()
+    assert page.locator("#channel-status-tabs").is_visible()
     screenshot = result_dir / f"channel-transfers-{unique}-{label}.png"
     page.screenshot(path=str(screenshot), full_page=True)
     print(screenshot.resolve())
@@ -606,6 +616,9 @@ def check(executable: Path | None = None) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--browser", type=Path, help="Chrome/Chromium executable")
     parser.add_argument("--executable", type=Path, help="Check a packaged executable instead of source")
     args = parser.parse_args()
+    if args.browser:
+        BROWSER = args.browser
     check(args.executable)

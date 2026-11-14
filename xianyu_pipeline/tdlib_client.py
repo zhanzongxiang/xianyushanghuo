@@ -409,7 +409,12 @@ def get_client(api_id, api_hash, session_path, download_dir, proxy=None) -> TdLi
 
 def client_for_config(config, *, create=True):
     from .adapters import parse_telegram_api_proxy
-    if config.telegram_proxy_mode == "ghelper":
+    if config.telegram_proxy_mode == "auto":
+        from .telegram_proxy import proxy_for_telegram
+        proxy = proxy_for_telegram(config.telegram_ghelper_profile, config.telegram_api_proxy_url, create=create)
+        if not create and proxy is None:
+            return None
+    elif config.telegram_proxy_mode == "ghelper":
         from .ghelper_proxy import proxy_for_ghelper
         proxy = proxy_for_ghelper(config.telegram_ghelper_profile, create=create)
         if not create and proxy is None:

@@ -26,7 +26,8 @@ import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / "tests" / "artifacts"
-BROWSER = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+BROWSER = Path(os.environ.get("BROWSER_TEST_PATH") or
+               r"C:\Program Files\Google\Chrome\Application\chrome.exe")
 LONG_TITLE = "设计资料与模型素材 · Architectural Forms Collection Extended Edition 2026"
 
 
@@ -306,7 +307,7 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
     assert page.locator("#channel-picker-panel").is_hidden()
     assert_no_overflow(page, f"{label}: initial overflow")
 
-    page.locator("button[data-view='channels']").click()
+    page.locator(".nav-item[data-view='channels']").click()
     page.locator("#channels-section").wait_for(state="visible")
     assert page.locator("#saved-channel-count").inner_text() == "1"
     page.locator("#scan-joined-channels").click()
@@ -419,7 +420,7 @@ def check_view(page, fixture: Fixture, origin: str, label: str, unique: str) -> 
     page.screenshot(path=str(selected_screenshot), full_page=True)
     print(selected_screenshot.resolve())
 
-    page.locator("button[data-view='channels']").click()
+    page.locator(".nav-item[data-view='channels']").click()
     page.locator("#scan-joined-channels").click()
     page.wait_for_function("document.getElementById('scan-joined-channels').disabled")
     assert fixture.saved["active"] == "-1001002"
@@ -636,6 +637,9 @@ def check(executable: Path | None = None, *, check_callback=None) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--browser", type=Path, help="Chrome/Chromium executable")
     parser.add_argument("--executable", type=Path, help="Check a packaged executable instead of source")
     arguments = parser.parse_args()
+    if arguments.browser:
+        BROWSER = arguments.browser
     check(arguments.executable)

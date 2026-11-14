@@ -277,8 +277,8 @@ def validate_source_settings(payload: dict, existing: PipelineConfig, *, require
     if source:
         normalize_public_channel(source)
     channel_limit = payload.get("channel_message_limit", existing.channel_message_limit)
-    if type(channel_limit) is not int or not 1 <= channel_limit <= 100:
-        raise ValueError("频道消息每轮读取数量必须为 1 到 100 的整数")
+    if type(channel_limit) is not int or not 1 <= channel_limit <= 1000:
+        raise ValueError("频道消息每轮读取数量必须为 1 到 1000 的整数")
     if type(payload.get("auto_upload_after_download", existing.auto_upload_after_download)) is not bool:
         raise ValueError("下载后自动上传开关必须为布尔值")
     expiry = payload.get("quark_share_expire_days", existing.quark_share_expire_days)
@@ -304,8 +304,7 @@ def validate_telegram_settings(payload: dict, existing: PipelineConfig) -> None:
     from .ghelper_proxy import validate_settings
     mode = payload.get("telegram_proxy_mode", existing.telegram_proxy_mode)
     validate_settings(mode, payload.get("telegram_ghelper_profile", existing.telegram_ghelper_profile))
-    if mode == "manual":
-        parse_telegram_api_proxy(payload.get("telegram_api_proxy_url", existing.telegram_api_proxy_url))
+    parse_telegram_api_proxy(payload.get("telegram_api_proxy_url", existing.telegram_api_proxy_url))
     parse_telegram_dc2_server(payload.get("telegram_api_dc2_server", existing.telegram_api_dc2_server))
     engine = payload.get("telegram_download_engine", existing.telegram_download_engine)
     if not isinstance(engine, str) or engine not in {"telethon", "tdlib"}:
@@ -679,11 +678,13 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 return
             if path == "/api/telegram-proxy-check":
                 try:
-                    if set(arguments) - {"telegram_ghelper_profile"}:
-                        raise ValueError("Ghelper 检测参数无效")
+                    if set(arguments) - {"telegram_ghelper_profile", "telegram_api_proxy_url"}:
+                        raise ValueError("Telegram 代理检测参数无效")
                     config = PipelineConfig.from_json(config_path)
-                    from .ghelper_proxy import check_ghelper
-                    result = check_ghelper(arguments.get("telegram_ghelper_profile", config.telegram_ghelper_profile))
+                    from .telegram_proxy import check_telegram_proxy
+                    result = check_telegram_proxy(
+                        arguments.get("telegram_ghelper_profile", config.telegram_ghelper_profile),
+                        arguments.get("telegram_api_proxy_url", config.telegram_api_proxy_url))
                 except (ValueError, RuntimeError) as exc:
                     self.json_response({"message": str(exc)}, 400)
                     return
@@ -1637,5 +1638,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         close_clients()
         from .ghelper_proxy import close_bridges
         close_bridges()
+        from .telegram_proxy import close_bridges as close_telegram_bridges
+        close_telegram_bridges()
         if hasattr(server, "server_close"):
             server.server_close()

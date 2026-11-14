@@ -322,6 +322,31 @@ def test_paging_and_server_database_replacement_detection(tmp_path, service):
     assert status["stage"] == "offline" and "数据库已更换" in status["error"]
 
 
+def test_synced_message_keeps_full_thousand_row_catalog(tmp_path, service):
+    receiver = desktop(tmp_path / "receiver", service)
+    try:
+        receiver.catalog.merge("models", {
+            "messages": [{"message_id": mid, "chat": "models", "filename": f"{mid}.rar"}
+                         for mid in range(1, 1001)],
+            "oldest_scanned_id": 1, "has_more": True,
+        })
+        updates = [
+            {"message_id": 1000, "text": "server update"},
+            {"message_id": 1001, "chat": "models", "filename": "1001.rar"},
+        ]
+        receiver.sync.apply([
+            ({"kind": "messages", "key": f"models:{value['message_id']}",
+              "remote_value": json.dumps(value)}, value)
+            for value in updates
+        ])
+        listing = ChannelCatalog(receiver.config.output_dir).snapshot("models")
+        assert [row["message_id"] for row in listing["messages"]] == list(range(1001, 1, -1))
+        assert listing["messages"][1]["text"] == "server update"
+        assert listing["oldest_scanned_id"] == 1 and listing["has_more"]
+    finally:
+        receiver.sync.close()
+
+
 def test_disabled_sync_retains_all_local_behavior(tmp_path, service):
     app = desktop(tmp_path / "desktop", service)
     app.sync.configure(replace(app.config, data_server_enabled=False))

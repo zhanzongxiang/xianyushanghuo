@@ -3,7 +3,7 @@
   "use strict";
 
   const $ = (id) => document.getElementById(id);
-  const views = { messages: "频道消息", download: "下载任务", upload: "上传任务", library: "素材库", history: "任务记录", channels: "来源频道", settings: "设置" };
+  const views = { messages: "频道消息", download: "下载任务", upload: "上传任务", library: "素材库", drafts: "商品草稿", history: "任务记录", channels: "来源频道", settings: "设置" };
   const downloadStates = {
     queued: ["等待下载", "gray"], downloading: ["下载中", ""], validating: ["校验中", "amber"],
     completed: ["已下载", ""], failed: ["下载失败", "red"], cancelled: ["已取消", "gray"], interrupted: ["下载中断", "red"]
@@ -17,16 +17,19 @@
   const taskViews = new Set(["download", "upload", "library", "history"]);
   const actionLabels = { run: "执行流水线", download: "下载", retry: "重新下载", upload: "上传", "cloud-delete": "删除云端文件", "channel-scan": "获取频道消息", "telegram-channels-scan": "获取账号频道", "channel-download": "下载选中消息", "channel-cover": "加载高清图", "names/generate": "生成中文名称", "names/apply": "应用中文名称", "browser-check": "检查浏览器", "telegram-api-login": "Telegram API 登录", "quark-login": "夸克网页登录", "quark-cli-login": "夸克 CLI 登录", "quark-cli-check": "检查夸克 CLI", "quark-api-check": "检查夸克 API" };
   const pageActions = {
+    drafts: ["drafts/publish", "qianniu/login"],
     messages: ["channel-scan", "channel-cover", "channel-download", "channel-topics-scan"],
     download: ["run", "download", "retry", "channel-download"],
     upload: ["run", "upload"],
     library: ["upload", "cloud-delete", "names/generate", "names/apply"],
     channels: ["telegram-channels-scan", "channel-topics-scan"],
-    settings: ["browser-check", "telegram-api-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check"]
+    settings: ["browser-check", "telegram-api-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "qianniu/login"]
   };
   const numberFields = ["quark_share_expire_days", "recent_message_limit", "channel_message_limit", "download_start_timeout_seconds", "download_transfer_timeout_seconds", "download_workers", "download_file_concurrency", "quark_cli_timeout_seconds", "quark_api_file_concurrency", "quark_api_timeout_seconds"];
   numberFields.push("source_topic_id");
   actionLabels["channel-topics-scan"] = "获取群组话题";
+  actionLabels["drafts/publish"] = "保存千牛草稿";
+  actionLabels["qianniu/login"] = "千牛登录";
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
   plainFields.push("telegram_download_engine");
@@ -1339,7 +1342,7 @@
     const data = state.data;
     const source = state.config?.source_channel_url;
     const subtitle = ({ messages: sourceTitle() || "已保存频道", download: source ? sourceTitle() || channelLabel(source) : "尚未配置来源频道", upload: data?.upload_target || "上传目标尚未读取", library: "已下载或已上传的素材", history: "任务状态与运行日志", channels: `${savedChannels().length} 个已保存频道`, settings: "本地配置" })[state.view];
-    text("page-subtitle", state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
+    text("page-subtitle", state.view === "drafts" ? "已上传素材 · 商品资料 · 千牛待审核草稿" : state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
     text("page-title", state.view === "messages" ? sourceTitle() || "频道消息" : views[state.view]);
     $("page-channel-avatar").hidden = state.view !== "messages";
     if (state.view === "messages") {
@@ -1489,6 +1492,7 @@
     if (taskViews.has(state.view)) { renderMetrics(); renderList(); }
     if (state.view === "channels") renderChannels();
     renderNaming();
+    window.ProductDrafts?.render();
   }
 
   function namingIds() { return [...state.namingSelected].filter((id) => state.tasks.has(id)); }
@@ -1521,7 +1525,7 @@
   function renderNaming() {
     if (!$("naming-dialog").open) return;
     const labels = {idle: "尚未生成", generating: "正在翻译", review: "待确认", approved: "已确认，上传后应用",
-      applying: "正在改名", completed: "已改名", failed: "需处理"};
+      ready: "上传后自动应用", unchanged: "保留原名", applying: "正在改名", completed: "已改名", failed: "需处理"};
     const reviewLabels = {partial: "含未识别名称，待确认", machine: "机器译名，待确认", matched: "术语已匹配，待确认"};
     let generated = 0;
     for (const [id, row] of state.namingRows) {
@@ -1550,7 +1554,7 @@
     $("naming-select-all").disabled = isBusy();
     text("naming-summary", `已选 ${selected.length} / ${state.namingRows.size} · 已生成 ${generated}`);
     text("naming-result", state.data?.running && String(state.data.action).startsWith("names/")
-      ? "正在处理，可关闭窗口后继续查看" : "已上传文件立即改名；待上传文件在上传后应用");
+      ? "正在处理，可关闭窗口后继续查看" : "夸克 API 上传时自动翻译；可在此修正名称");
     for (const id of ["naming-generate", "naming-save", "naming-apply"]) $(id).disabled = isBusy() || !selected.length;
   }
 
@@ -1595,10 +1599,12 @@
     $("logs-section").hidden = view !== "history";
     $("settings-section").hidden = view !== "settings";
     $("channels-section").hidden = view !== "channels";
+    $("product-drafts-section").hidden = view !== "drafts";
     $("task-search").value = state.filters[view].query;
     $("channel-filter").value = state.filters[view].chat;
     render();
     if (view === "messages") void refreshCatalog();
+    if (["drafts", "settings"].includes(view)) void window.ProductDrafts?.refresh();
     requestAnimationFrame(() => window.scrollTo(0, state.scroll[view] || 0));
   }
 
@@ -1751,7 +1757,7 @@
 
   async function refreshPage() {
     const channels = refreshChannels();
-    await Promise.all([refreshWorkbench(), Promise.all([channels, configRequest]).then(() => {
+    await Promise.all([refreshWorkbench(), ...(["drafts", "settings"].includes(state.view) ? [window.ProductDrafts?.refresh()] : []), Promise.all([channels, configRequest]).then(() => {
       if (state.view === "messages") return refreshCatalog();
     })]);
   }
@@ -2873,9 +2879,13 @@
   $("quark-cli-check").addEventListener("click", () => void configuredAction("/api/quark-cli-check", "quark-cli", "已请求检查夸克 CLI 授权"));
   $("quark-api-check").addEventListener("click", () => void configuredAction("/api/quark-api-check", "quark-api", "已请求检查夸克 API 登录及目标目录"));
   window.addEventListener("popstate", () => setView(new URLSearchParams(location.search).get("view"), false));
-  window.addEventListener("beforeunload", (event) => { if (state.configDirty) { event.preventDefault(); event.returnValue = ""; } });
+  window.addEventListener("beforeunload", (event) => { if (state.configDirty || window.ProductDrafts?.hasUnsaved()) { event.preventDefault(); event.returnValue = ""; } });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) void refreshAll(); });
 
+  window.ProductDrafts?.init({
+    request, post, notice, getTasks: allTasks, isBusy, refreshWorkbench,
+    templateSaved: (value) => { if (state.config) Object.assign(state.config, value); }
+  });
   icons();
   if (!window.lucide) setError("icons", "本地图标库加载失败：/static/lucide.js");
   setView(new URLSearchParams(location.search).get("view"), false);

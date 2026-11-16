@@ -14,6 +14,9 @@ NAME = r"[a-z0-9_+\-]{1,128}"
 SCOPE = NAME + r"(?:~[1-9][0-9]{0,9})?"
 DIGEST = r"[a-f0-9]{64}"
 FIELDS = {
+    "drafts": set("""id device_id task_id shop_name filename chat message_id source_url share_url upload_remote_fid
+        title price stock category format variant description image_indices image_digests status error remote_url
+        saved_at confirmed_by revision created_at updated_at""".split()),
     "channels": set("key url name id title username public verified scam fake name_custom created_at updated_at avatar_digest kind forum topics_scanned_at".split()),
     "topics": set("key channel topic_id title closed hidden top_message_id".split()),
     "messages": set("message_id chat filename size text date source_url forwarded cover_message_id cover_quality full_cover_message_id full_quality cover_digest full_cover_digest topic_id source_kind".split()),
@@ -76,10 +79,11 @@ def validate_record(kind: str, key: str, value, device_id: str | None = None):
         raise ValueError("数据类型或记录标识无效")
     pattern = {"channels": NAME, "topics": NAME + r"~[1-9][0-9]{0,9}",
                "cursors": SCOPE, "messages": SCOPE + r":[1-9][0-9]*",
-               "tasks": r"[a-f0-9]{32}:[a-f0-9]{24}"}[kind]
+               "tasks": r"[a-f0-9]{32}:[a-f0-9]{24}",
+               "drafts": r"[a-f0-9]{32}:[a-f0-9]{24}"}[kind]
     if not re.fullmatch(pattern, key):
         raise ValueError("记录标识格式无效")
-    if kind == "tasks" and device_id is not None and not key.startswith(device_id + ":"):
+    if kind in {"tasks", "drafts"} and device_id is not None and not key.startswith(device_id + ":"):
         raise ValueError("不能修改其他设备的任务")
     if value is None:
         if kind not in {"channels", "topics"}:
@@ -91,19 +95,22 @@ def validate_record(kind: str, key: str, value, device_id: str | None = None):
         raise ValueError("单条记录过大")
     boolean_fields = {"public", "verified", "scam", "fake", "name_custom", "forwarded", "has_more", "forum", "closed", "hidden"}
     integer_fields = {"id", "message_id", "size", "received", "cover_message_id", "full_cover_message_id",
-                      "oldest_scanned_id", "upload_received", "upload_size", "topic_id", "top_message_id"}
-    list_fields = {"image_digests", "image_message_ids", "naming_untranslated"}
+                      "oldest_scanned_id", "upload_received", "upload_size", "topic_id", "top_message_id", "stock", "revision"}
+    list_fields = {"image_digests", "image_message_ids", "naming_untranslated", "image_indices"}
     for field, item in value.items():
         if field in boolean_fields:
             valid = type(item) is bool
-        elif field in integer_fields and not (field == "id" and kind == "tasks"):
+        elif field in integer_fields and not (field == "id" and kind in {"tasks", "drafts"}):
             valid = type(item) is int and item >= 0
         elif field in {"speed", "eta", "upload_speed", "upload_eta"}:
             valid = item is None or (type(item) in {int, float} and math.isfinite(item) and item >= 0)
         elif field in list_fields:
             valid = isinstance(item, list) and len(item) <= 100
             if valid:
-                valid = all(type(entry) is int and entry > 0 for entry in item) if field == "image_message_ids" else all(isinstance(entry, str) for entry in item)
+                if field in {"image_message_ids", "image_indices"}:
+                    valid = all(type(entry) is int and entry >= (0 if field == "image_indices" else 1) for entry in item)
+                else:
+                    valid = all(isinstance(entry, str) for entry in item)
         else:
             valid = isinstance(item, str)
         if not valid:
@@ -135,10 +142,21 @@ def validate_record(kind: str, key: str, value, device_id: str | None = None):
                 or value["oldest_scanned_id"] < 0 or type(value.get("has_more")) is not bool
                 or value.get("topic_id", topic_id) != topic_id or value.get("chat", peer) != peer):
             raise ValueError("频道游标无效")
-    if kind == "tasks":
+    if kind in {"tasks", "drafts"}:
         if (not isinstance(value.get("device_id"), str) or not isinstance(value.get("id"), str)
                 or value["device_id"] + ":" + value["id"] != key):
             raise ValueError("任务设备标识无效")
+    if kind == "drafts":
+        from .product_drafts import DRAFT_STATUSES, price_value, validate_qianniu_url
+        if (value.get("status") not in DRAFT_STATUSES or not re.fullmatch(r"[a-f0-9]{24}", value.get("task_id", ""))
+                or not 1 <= value.get("stock", 0) <= 999999999 or value.get("revision", 0) < 1
+                or len(value.get("title", "")) > 60 or len(value.get("description", "")) > 12000):
+            raise ValueError("商品草稿记录无效")
+        price_value(value.get("price", ""))
+        validate_qianniu_url(value.get("remote_url", ""))
+        indices = value.get("image_indices", [])
+        if len(indices) > 5 or len(set(indices)) != len(indices) or any(i > 9 for i in indices):
+            raise ValueError("草稿图片顺序无效")
     for field in ("avatar_digest", "cover_digest", "full_cover_digest"):
         if value.get(field) and (not isinstance(value[field], str) or not re.fullmatch(DIGEST, value[field])):
             raise ValueError("图片标识无效")

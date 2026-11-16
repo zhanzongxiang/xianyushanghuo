@@ -39,6 +39,18 @@ class PipelineConfig:
     cloud_folder: str = ""
     upload_provider: str = "local"
     auto_upload_after_download: bool = False
+    qianniu_shop_name: str = ""
+    qianniu_publish_url: str = ""
+    qianniu_browser_profile: Path = Path("data/qianniu_browser_profile")
+    qianniu_auto_create_draft: bool = False
+    qianniu_auto_save_draft: bool = False
+    qianniu_default_price: str = ""
+    qianniu_default_stock: int = 1
+    qianniu_default_category: str = ""
+    qianniu_default_format: str = ""
+    qianniu_default_variant: str = ""
+    qianniu_default_description: str = "【模型名称】{title}\n【文件格式】{format}\n【交付内容】{filename}\n【交付方式】数字文件"
+    qianniu_form_selectors: dict[str, str] = field(default_factory=dict)
     rename_translation_provider: str = "mymemory"
     rename_glossary: str = ""
     telegram_access_mode: str = "api"
@@ -106,6 +118,26 @@ class PipelineConfig:
     )
 
     def __post_init__(self) -> None:
+        from .product_drafts import price_value, validate_qianniu_url
+        validate_qianniu_url(self.qianniu_publish_url)
+        self.qianniu_default_price = price_value(self.qianniu_default_price)
+        for name, limit in (("qianniu_shop_name", 100), ("qianniu_default_category", 200),
+                            ("qianniu_default_format", 80), ("qianniu_default_variant", 200),
+                            ("qianniu_default_description", 12000)):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) > limit or "\x00" in value:
+                raise ValueError("千牛发布模板格式无效：" + name)
+        for name in ("qianniu_auto_create_draft", "qianniu_auto_save_draft"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(name + " 必须为布尔值")
+        if self.qianniu_auto_save_draft and not self.qianniu_auto_create_draft:
+            raise ValueError("自动保存千牛草稿前须启用自动整理资料")
+        if type(self.qianniu_default_stock) is not int or not 1 <= self.qianniu_default_stock <= 999999999:
+            raise ValueError("千牛默认库存须为 1 至 999999999 的整数")
+        if (not isinstance(self.qianniu_form_selectors, dict)
+                or set(self.qianniu_form_selectors) - {"shop", "title", "price", "stock", "category", "description", "images", "save", "success"}
+                or any(not isinstance(v, str) or not 1 <= len(v) <= 1000 for v in self.qianniu_form_selectors.values())):
+            raise ValueError("千牛页面适配配置无效")
         from .ghelper_proxy import validate_settings
         validate_settings(self.telegram_proxy_mode, self.telegram_ghelper_profile)
         self.telegram_proxy_mode = "auto"
@@ -168,7 +200,7 @@ class PipelineConfig:
         payload: dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
         # 源码配置通常位于项目 config/；便携包配置位于程序根目录。
         base_dir = config_path.parent.parent if config_path.parent.name == "config" else config_path.parent
-        for key in ("inbox_dir", "work_dir", "output_dir", "telegram_session", "telegram_browser_profile", "quark_browser_profile"):
+        for key in ("inbox_dir", "work_dir", "output_dir", "telegram_session", "telegram_browser_profile", "quark_browser_profile", "qianniu_browser_profile"):
             if key in payload:
                 value = Path(payload[key])
                 payload[key] = value if value.is_absolute() else base_dir / value
@@ -184,6 +216,11 @@ class PipelineConfig:
                 payload["telegram_session"] = str(Path(app_data) / "XianYuMaterialPipeline" / "telegram_api.session")
         if "allowed_file_extensions" in payload:
             payload["allowed_file_extensions"] = tuple(payload["allowed_file_extensions"])
+        if "qianniu_browser_profile" not in payload:
+            app_data = os.environ.get("LOCALAPPDATA")
+            payload["qianniu_browser_profile"] = (
+                Path(app_data) / "XianYuMaterialPipeline" / "qianniu_browser_profile"
+                if app_data else base_dir / "data/qianniu_browser_profile")
         return cls(**payload)
 
     def ensure_directories(self) -> None:

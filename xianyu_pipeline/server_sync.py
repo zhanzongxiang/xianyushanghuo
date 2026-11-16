@@ -77,6 +77,8 @@ class SyncJournal:
             self.device_id = db.execute("SELECT value FROM meta WHERE key='device_id'").fetchone()[0]
             db.execute("""UPDATE entries SET local_value='null' WHERE target=? AND kind='tasks'
                 AND operation IS NULL AND key NOT LIKE ?""", (self.target, self.device_id + ":%"))
+            db.execute("""UPDATE entries SET local_value='null' WHERE target=? AND kind='drafts'
+                AND operation IS NULL AND key NOT LIKE ?""", (self.target, self.device_id + ":%"))
 
     @contextmanager
     def connect(self):
@@ -197,6 +199,7 @@ class ServerSync:
     def __init__(self, config, channels, catalog, transfers, *, control_lock=None, is_busy=None):
         self.config = config
         self.channels, self.catalog, self.transfers = channels, catalog, transfers
+        self.drafts = None
         self.control_lock = control_lock or threading.Lock()
         self.is_busy = is_busy or (lambda: False)
         self.lock = threading.Lock()
@@ -227,6 +230,8 @@ class ServerSync:
             self.config = config
             if previous != self.target(config):
                 self.transfers.remote_tasks = []
+                if self.drafts:
+                    self.drafts.remote_drafts = []
             if config.data_server_enabled:
                 # Preserve existing HTTP journals; database password rotation keeps its cursor.
                 target = (encoded([config.data_server_url, config.data_server_workspace, config.data_server_token])
@@ -237,6 +242,8 @@ class ServerSync:
                 self.journal = None
                 self.status.update(stage="disabled", error="", pending=0, conflicts=0, last_sync="", conflict_rows=[])
                 self.transfers.remote_tasks = []
+                if self.drafts:
+                    self.drafts.remote_drafts = []
         self.wake.set()
 
     def snapshot(self):
@@ -343,6 +350,17 @@ class ServerSync:
             value["image_digests"] = [digest for path in row.get("image_paths", [])[:10]
                                       if (digest := self._image(path, row.get("storage_root", self.config.inbox_dir)))]
             records["tasks", f"{self.journal.device_id}:{row['id']}"] = value
+        if self.drafts:
+            with self.drafts.lock:
+                draft_rows = copy.deepcopy(list(self.drafts.rows.values()))
+            for row in draft_rows:
+                value = {field: row[field] for field in FIELDS["drafts"] if field in row}
+                value["device_id"] = self.journal.device_id
+                value["image_digests"] = [self._image(path, self.drafts.root) for path in row.get("image_paths", [])]
+                if not all(value["image_digests"]):
+                    # Preserve image positions when a local asset has disappeared.
+                    continue
+                records["drafts", f"{self.journal.device_id}:{row['id']}"] = value
         for (kind, key), value in records.items():
             validate_record(kind, key, value, self.journal.device_id)
         return records
@@ -396,11 +414,11 @@ class ServerSync:
                         target.write_bytes(image.read_bytes())
                     value[prefix + "_path"] = str(target.resolve())
                     value["full_status" if prefix == "full_cover" else "cover_status"] = "ready"
-        elif kind == "tasks":
+        elif kind in {"tasks", "drafts"}:
             digests = value.pop("image_digests", [])
             value["images"] = [] if value.get("record_removed_at") else [
-                {"url": f"/api/synced-image/{image.name}", "name": image.name}
-                for digest in digests if (image := self._download_image(client, digest))]
+                {"url": f"/api/synced-image/{image.name}", "name": image.name, "index": index}
+                for index, digest in enumerate(digests) if (image := self._download_image(client, digest))]
         return value
 
     def apply(self, staged):
@@ -441,6 +459,19 @@ class ServerSync:
                         self.transfers.tasks[value["id"]].update({field: item for field, item in value.items()
                                                                  if field not in {"images", "device_id"}})
                         self.transfers.flush()
+                elif kind == "drafts" and self.drafts:
+                    with self.drafts.lock:
+                        if value["device_id"] != self.journal.device_id or value["id"] not in self.drafts.rows:
+                            identity = "remote-" + key.replace(":", "-")
+                            records = [item for item in self.drafts.remote_drafts if item["id"] != identity]
+                            records.append({**value, "id": identity, "remote_device": True, "missing": []})
+                            self.drafts.remote_drafts = records
+                        else:
+                            original = self.drafts.rows[value["id"]]
+                            original.update({field: item for field, item in value.items() if field not in {"images", "device_id"}})
+                            if original["status"] == "saving":
+                                original.update(status="pending", error="同步的千牛保存结果待确认")
+                            self.drafts.flush()
                 self.journal.applied(kind, key, json.loads(row["remote_value"]))
 
     def resolve(self, choice):

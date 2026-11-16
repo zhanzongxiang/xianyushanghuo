@@ -85,6 +85,7 @@ def app(tmp_path, monkeypatch):
         "quark_upload_input_selector": "input", "quark_file_row_selector": "row",
         "quark_share_button_selector": "button", "quark_share_link_selector": "link",
         "quark_share_create_button_selector": "create",
+        "rename_translation_provider": "local",
     }), encoding="utf-8")
     result = SimpleNamespace(config_path=config_path, workers=[], calls=[], upload_error=False, share_error=False)
     result.store = TransferStore(PipelineConfig.from_json(config_path))
@@ -962,6 +963,215 @@ def test_upload_passes_approved_chinese_name_and_keeps_english_binding(app, monk
     assert app.store.get(identity)["filename"] == "english.zip"
     assert app.store.get(identity)["remote_filename"] == "中文模型.zip"
     assert app.store.get(identity)["upload_status"] == "completed"
+
+
+@pytest.mark.parametrize("auto_upload", [False, True])
+def test_api_upload_automatically_translates_without_manual_confirmation(app, monkeypatch, auto_upload):
+    assert api_settings(app)[0] == 200
+    original = "Dragon Warrior Bust v2.zip"
+    expected = "龙战士 胸像_v2.zip"
+    identity = app.task(original)
+    source = Path(app.store.get(identity)["local_path"])
+    original_bytes = source.read_bytes()
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            calls.append((source.name, target, values))
+            persisted = json.loads(app.store.path.read_text(encoding="utf-8"))
+            bound = next(task for task in persisted if task["id"] == identity)
+            assert bound["upload_filename"] == original
+            assert bound["rename_target"] == expected and bound["naming_status"] == "ready"
+            self._remote(remote_filename=values["new_name"], naming_status="completed")
+            return SHARE
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def fetch_messages(self, *args):
+            self.on_event({"chat": "fixture_channel", "message_id": 123, "filename": original,
+                           "local_path": str(source), "download_status": "completed"})
+            return []
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    if auto_upload:
+        app.acquire()
+        assert app.post("/api/download", {"auto_upload_after_download": True})[0] == 200
+    else:
+        assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert calls == [(original, "folder-1", {"new_name": expected})]
+    task = app.store.get(identity)
+    assert task["remote_filename"] == expected and task["chinese_filename"] == expected
+    assert task["naming_status"] == "completed" and task["upload_status"] == "completed"
+    assert task["naming_quality"] == "matched" and not app.state.error
+    assert source.name == original and source.read_bytes() == original_bytes
+    assert not (app.store.config.output_dir / "name-memory.json").exists()
+
+
+def test_saved_manual_name_overrides_previous_upload_target_without_retranslation(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = app.task("Dragon Bust.zip", rename_target="旧译名.zip")
+    assert app.post("/api/names/save", {"entries": [{"id": identity, "name": "巨龙胸像.zip"}]})[0] == 200
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            assert values == {"new_name": "巨龙胸像.zip"}
+            self._remote(remote_filename=values["new_name"], naming_status="completed")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    monkeypatch.setattr(web_ui.NameTranslator, "suggest", lambda *_: pytest.fail("Manual name was overwritten"))
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["upload_status"] == "completed" and task["remote_filename"] == "巨龙胸像.zip"
+    assert task["naming_quality"] == "manual"
+
+
+def test_automatic_translation_collision_stops_batch_before_any_upload(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identities = [app.task("Figure.zip"), app.task("Figurine.zip")]
+    monkeypatch.setattr(web_ui.QuarkAPIStorageAdapter, "upload",
+                        lambda *_args, **_kwargs: pytest.fail("Conflicting names reached cloud upload"))
+    assert app.post("/api/upload", {"ids": identities})[0] == 200
+    app.run()
+    assert "同名" in app.state.error
+    assert all(app.store.get(identity)["rename_target"] == "手办.zip" for identity in identities)
+    assert all(app.store.get(identity)["upload_status"] == "waiting" for identity in identities)
+
+
+def test_editing_automatic_translation_conflict_allows_batch_retry(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identities = [app.task("Figure.zip"), app.task("Figurine.zip")]
+    assert app.post("/api/upload", {"ids": identities})[0] == 200
+    app.run()
+    assert "同名" in app.state.error
+    assert app.post("/api/names/save", {"entries": [
+        {"id": identities[0], "name": "人物模型.zip"},
+    ]})[0] == 200
+    names = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            names.append(values["new_name"])
+            self._remote(remote_filename=values["new_name"], naming_status="completed")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": identities})[0] == 200
+    app.run()
+    assert set(names) == {"人物模型.zip", "手办.zip"}
+    assert not app.state.error
+    assert all(app.store.get(identity)["upload_status"] == "completed" for identity in identities)
+
+
+@pytest.mark.parametrize("failure", ["online", "memory"])
+def test_translation_failure_falls_back_without_failing_upload(app, monkeypatch, failure):
+    assert api_settings(app, rename_translation_provider="mymemory")[0] == 200
+    identity = app.task("Mystery Castle.zip")
+    calls = []
+    if failure == "memory":
+        (app.store.config.output_dir / "name-memory.json").write_text("[]", encoding="utf-8")
+    else:
+        def unavailable(*args):
+            raise ValueError("fixture translation unavailable")
+        monkeypatch.setattr(web_ui.NameTranslator, "_online", unavailable)
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            calls.append((source.name, values))
+            self._remote(remote_filename=source.name)
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert calls == [("Mystery Castle.zip", {})]
+    assert task["upload_status"] == "completed" and not app.state.error
+    assert task["remote_filename"] == "Mystery Castle.zip" and not task["rename_target"]
+    if failure == "memory":
+        assert task["naming_status"] == "failed" and "名称记忆" in task["naming_error"]
+    else:
+        assert task["naming_status"] == "unchanged"
+        assert task["naming_quality"] == "partial" and "translation unavailable" in task["naming_note"]
+
+
+def test_retry_pending_upload_reuses_translation_and_original_remote_binding(app, monkeypatch):
+    from xianyu_pipeline.browser_download import DownloadCancelled
+    assert api_settings(app)[0] == 200
+    identity = app.task("Dragon.zip")
+    source = Path(app.store.get(identity)["local_path"])
+    size = source.stat().st_size
+    calls = []
+
+    class API(web_ui.QuarkAPIStorageAdapter):
+        def upload(self, source, target, **values):
+            calls.append(("upload", values))
+            self._stage("link_pending")
+            self._remote(upload_remote_fid="original-fid", remote_filename="龙.zip",
+                         rename_pending_name="龙.zip", naming_status="applying")
+            raise DownloadCancelled("fixture confirmation interrupted")
+
+        def share_existing(self, source, target, **values):
+            calls.append(("recover", values))
+            assert source.name == "Dragon.zip" and target == "folder-1"
+            assert values["remote_fid"] == "original-fid" and values["size"] == size
+            assert values["rename_to"] == "龙.zip" and values["pending_name"] == "龙.zip"
+            self._remote(remote_filename="龙.zip", rename_pending_name="", naming_status="completed")
+            return SHARE
+
+    monkeypatch.setattr(web_ui, "QuarkAPIStorageAdapter", API)
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert app.store.get(identity)["upload_status"] == "link_pending"
+    source.unlink()
+    monkeypatch.setattr(web_ui.NameTranslator, "suggest", lambda *_: pytest.fail("Retry changed saved translation"))
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    assert [call[0] for call in calls] == ["upload", "recover"]
+    assert app.store.get(identity)["upload_status"] == "completed"
+    assert app.store.get(identity)["naming_status"] == "completed"
+
+
+def test_cancel_during_automatic_translation_does_not_start_cloud_upload(app, monkeypatch):
+    from xianyu_pipeline.browser_download import DownloadCancelled
+    assert api_settings(app)[0] == 200
+    identity = app.task("Dragon.zip")
+
+    def cancelled(*args):
+        app.state.stop_event.set()
+        raise DownloadCancelled("fixture translation stopped")
+
+    monkeypatch.setattr(web_ui.NameTranslator, "suggest", cancelled)
+    monkeypatch.setattr(web_ui.QuarkAPIStorageAdapter, "upload",
+                        lambda *_args, **_kwargs: pytest.fail("Cancelled translation started upload"))
+    assert app.post("/api/upload", {"ids": [identity]})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["upload_status"] == "waiting"
+    assert task["naming_status"] == "failed" and "stopped" in task["naming_error"]
+    assert not app.state.error
+
+
+def test_download_only_does_not_trigger_automatic_translation(app, monkeypatch):
+    assert api_settings(app)[0] == 200
+    identity = app.task("Dragon.zip")
+
+    class Telegram(web_ui.TelethonTelegramAdapter):
+        def fetch_messages(self, *args):
+            self.on_event({"chat": "fixture_channel", "message_id": 123, "filename": "Dragon.zip",
+                           "local_path": app.store.get(identity)["local_path"], "download_status": "completed"})
+            return []
+
+    monkeypatch.setattr(web_ui, "TelethonTelegramAdapter", Telegram)
+    monkeypatch.setattr(web_ui.NameTranslator, "suggest", lambda *_: pytest.fail("Download translated a name"))
+    app.acquire()
+    assert app.post("/api/download", {"auto_upload_after_download": False})[0] == 200
+    app.run()
+    task = app.store.get(identity)
+    assert task["download_status"] == "completed" and task["upload_status"] == "waiting"
+    assert task["naming_status"] == "idle" and not task["chinese_filename"]
 
 
 def test_download_updates_do_not_change_approved_names(app):

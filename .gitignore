@@ -28,6 +28,8 @@ telegram-settings.json
 *.part
 **/telegram_browser_profile*/
 **/quark_browser_profile*/
+**/qianniu_browser_profile*/
+**/.product-drafts/
 **/.browser-downloads/
 **/.telegram-api-downloads/
 **/.unverified/

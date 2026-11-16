@@ -44,6 +44,16 @@ from .workbench import TransferStore, channel_key, image_type, image_version, is
 from .admin_auth import AuthHandlerMixin, AdminAuth, LOGOUT_HTML
 from .download_diagnostics import export_diagnostics
 from .naming import NameTranslator, validate_name, validate_naming_settings
+from .product_drafts import ProductDraftStore, DraftConflict, missing_fields, validate_qianniu_url
+from .qianniu_browser import QianniuDraftAdapter, QianniuSavePending, validate_adapter
+from .qianniu_shop import shop_name
+
+
+QIANNU_TEMPLATE_FIELDS = {
+    "qianniu_shop_name", "qianniu_publish_url", "qianniu_auto_create_draft", "qianniu_auto_save_draft",
+    "qianniu_default_price", "qianniu_default_stock", "qianniu_default_category", "qianniu_default_format",
+    "qianniu_default_variant", "qianniu_default_description", "qianniu_form_selectors",
+}
 
 
 class MemoryLogHandler(logging.Handler):
@@ -72,6 +82,7 @@ class WebState:
         self.telegram_channels = {"stage": "idle", "scanned_at": "", "error": "",
                                   "found": 0, "added": 0, "updated": 0}
         self.telegram_topics = {"stage": "idle", "channel": "", "found": 0, "error": ""}
+        self.qianniu_shop = {"stage": "idle", "ticket": "", "candidates": [], "error": ""}
         self.lock = threading.Lock()
         # Serialize configuration saves and validated starts without holding the log lock.
         self.control_lock = threading.Lock()
@@ -91,7 +102,8 @@ class WebState:
                     "task_id": self.task_id, "stop_requested": self.running and self.stop_event.is_set(),
                     "error": self.error, "channel_scan": scan,
                     "channel_requests_open": self.channel_requests_open,
-                    "telegram_channels": telegram_channels, "telegram_topics": dict(self.telegram_topics)}
+                    "telegram_channels": telegram_channels, "telegram_topics": dict(self.telegram_topics),
+                    "qianniu_shop": dict(self.qianniu_shop)}
 
     def take_channel_request(self) -> dict | None:
         with self.lock:
@@ -172,6 +184,7 @@ def config_payload(config: PipelineConfig) -> dict:
         "quark_headless": config.quark_headless,
         "quark_share_expire_days": config.quark_share_expire_days,
         "auto_upload_after_download": config.auto_upload_after_download,
+        **{key: getattr(config, key) for key in QIANNU_TEMPLATE_FIELDS},
         "rename_translation_provider": config.rename_translation_provider,
         "rename_glossary": config.rename_glossary,
         "quark_cli_mode": config.quark_cli_mode,
@@ -216,6 +229,19 @@ def write_config(path: Path, payload: dict) -> None:
     remember_telegram_settings(path, existing)
 
 
+def save_product_template(path: Path, config: PipelineConfig, drafts: ProductDraftStore, values: dict) -> int:
+    saved = replace(config, **values)
+    if saved.qianniu_auto_save_draft:
+        validate_adapter(saved)
+    write_config(path, values)
+    try:
+        return drafts.bind_unassigned_shop(saved.qianniu_shop_name) if saved.qianniu_shop_name.strip() else 0
+    except OSError:
+        # Keep confirmation retryable when the independent draft file cannot be saved.
+        write_config(path, {key: getattr(config, key) for key in values})
+        raise
+
+
 def prepare_download_directory(value: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("请填写下载保存目录")
@@ -239,7 +265,9 @@ def validate_upload_batch_names(tasks: list[dict]) -> None:
     for task in tasks:
         name = (task.get("upload_filename", "") if task["upload_status"] == "link_pending"
                 else Path(task.get("local_path", "")).name)
-        keys = {value.casefold() for value in (name, task.get("rename_target", "")) if value}
+        target = (task.get("chinese_filename") if task.get("naming_quality") == "manual"
+                  and task.get("chinese_filename") else task.get("rename_target", ""))
+        keys = {value.casefold() for value in (name, target) if value}
         if keys & names:
             raise ValueError("本批次包含同名文件，请分批上传并核对内容，避免在目标目录生成重名文件")
         names.update(keys)
@@ -325,6 +353,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     state = WebState(config_path)
     configure_logging(PipelineConfig.from_json(config_path).output_dir / "logs", MemoryLogHandler(state))
     transfers = TransferStore(PipelineConfig.from_json(config_path))
+    drafts = ProductDraftStore(transfers.config.output_dir)
     catalog = ChannelCatalog(PipelineConfig.from_json(config_path).output_dir)
     recovered_images = catalog.recover_interrupted()
     if recovered_images:
@@ -335,6 +364,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         channels.ensure(initial_config.source_channel_url)
     server_sync = ServerSync(initial_config, channels, catalog, transfers,
                              control_lock=state.control_lock, is_busy=lambda: state.running)
+    server_sync.drafts = drafts
     if initial_config.data_server_enabled:
         server_sync.start()
     logging.info("Telegram API 频道工作台; 配置文件=%s", config_path)
@@ -520,6 +550,11 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 self.json_response({**transfers.snapshot(), **{key: value for key, value in state.snapshot().items() if key != "logs"},
                                     "data_sync": server_sync.snapshot(), "cloud_delete_supported": True,
                                     "record_remove_supported": True})
+            elif path == "/api/drafts":
+                self.json_response({**drafts.snapshot(), "template": {
+                    key: getattr(config, key) for key in QIANNU_TEMPLATE_FIELDS},
+                    "running": state.running, "action": state.action,
+                    "qianniu_shop": state.snapshot()["qianniu_shop"]})
             elif path == "/api/data-sync":
                 self.json_response(server_sync.snapshot())
             elif path == "/api/tdlib/status":
@@ -554,10 +589,42 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 else:
                     self.json_response({"channel": "", "messages": [], "oldest_scanned_id": 0,
                                         "has_more": False, "scanned_at": ""})
-            elif path in {"/static/workbench.css", "/static/workbench.js", "/static/lucide.js"}:
+            elif path in {"/static/workbench.css", "/static/workbench.js", "/static/lucide.js",
+                          "/static/product-drafts.css", "/static/product-drafts.js"}:
                 asset = Path(__file__).parent / "static" / Path(path).name
                 content_type = "text/css" if asset.suffix == ".css" else "text/javascript"
                 self.file_response(asset, content_type + "; charset=utf-8")
+            elif re.fullmatch(r"/api/product-drafts/[a-f0-9]{24}/images/[0-9]+", path):
+                try:
+                    parts = path.split("/")
+                    asset, content_type = drafts.preview(parts[3], int(parts[5]))
+                    self.file_response(asset, content_type)
+                except (ValueError, OSError):
+                    self.send_error(404)
+            elif re.fullmatch(r"/api/product-drafts/[a-f0-9]{24}/export", path):
+                try:
+                    import io
+                    row = drafts.get(path.split("/")[3])
+                    stream = io.BytesIO()
+                    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+                        archive.writestr("product.json", json.dumps(
+                            {key: row[key] for key in ("title", "price", "stock", "category", "format", "variant", "description")},
+                            ensure_ascii=False, indent=2))
+                        archive.writestr("delivery.txt", row["filename"] + "\n" + row["share_url"])
+                        for index, selected in enumerate(row["image_indices"]):
+                            image, _ = drafts.preview(row["id"], selected)
+                            archive.write(image, f"images/{index + 1}{image.suffix}")
+                    body = stream.getvalue()
+                except (ValueError, OSError):
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", 'attachment; filename="product-draft.zip"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             elif re.fullmatch(r"/api/preview/[a-f0-9]{24}/[0-9]+", path):
                 try:
                     _, _, _, identity, index = path.split("/")
@@ -736,6 +803,79 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     except (ValueError, RuntimeError, OSError, TimeoutError) as exc:
                         self.json_response({"message": str(exc)}, 400)
                 return
+            if path in {"/api/drafts/create", "/api/drafts/save", "/api/drafts/template",
+                        "/api/drafts/confirm", "/api/qianniu/shop/confirm"}:
+                with state.control_lock:
+                    try:
+                        config = PipelineConfig.from_json(config_path)
+                        if path == "/api/drafts/template":
+                            if state.running:
+                                self.json_response({"message": "任务运行中，暂时不能修改发布模板"}, 409)
+                                return
+                            if set(arguments) - QIANNU_TEMPLATE_FIELDS:
+                                raise ValueError("发布模板字段无效")
+                            save_product_template(config_path, config, drafts, arguments)
+                            result = {"message": "发布模板已保存"}
+                        elif path == "/api/qianniu/shop/confirm":
+                            if state.running:
+                                self.json_response({"message": "请等待店铺识别任务结束后确认"}, 409)
+                                return
+                            if set(arguments) != {"ticket", "index"} or type(arguments["index"]) is not int:
+                                raise ValueError("店铺确认参数无效")
+                            with state.lock:
+                                detected = dict(state.qianniu_shop)
+                            index = arguments["index"]
+                            if (not detected.get("ticket") or arguments["ticket"] != detected["ticket"]
+                                    or detected["stage"] != "detected"
+                                    or time.time() - detected.get("detected_at", 0) > 900
+                                    or not 0 <= index < len(detected["candidates"])):
+                                raise DraftConflict("识别结果已失效，请重新登录识别店铺")
+                            if config.qianniu_shop_name != detected.get("base_shop", ""):
+                                raise DraftConflict("目标店铺已修改，请重新识别后确认")
+                            name = shop_name(detected["candidates"][index].get("name"))
+                            if not name:
+                                raise ValueError("未取得有效店铺名称，请重新识别")
+                            count = save_product_template(config_path, config, drafts, {"qianniu_shop_name": name})
+                            with state.lock:
+                                state.qianniu_shop.update(stage="confirmed", selected=index, error="")
+                            result = {"message": f"已绑定店铺：{name}", "shop_name": name, "bound_drafts": count}
+                        elif path == "/api/drafts/create":
+                            if set(arguments) != {"ids"}:
+                                raise ValueError("请选择要整理的素材")
+                            ids = arguments["ids"]
+                            if (not isinstance(ids, list) or not 1 <= len(ids) <= 100
+                                    or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids)):
+                                raise ValueError("请选择 1 至 100 个不重复的素材")
+                            tasks = [transfers.get(i) for i in ids]
+                            if any(t.get("remote_device") or t.get("record_removed_at") or t.get("upload_status") != "completed"
+                                   or not t.get("share_url") or t.get("upload_provider") not in {"quark_api", "quark_browser", "quark_cli"}
+                                   for t in tasks):
+                                raise ValueError("只能添加本机已上传夸克并取得分享链接的素材")
+                            created = [drafts.create(task, config)["id"] for task in tasks]
+                            result = {"message": "商品资料已整理，已有草稿保留原编辑内容", "ids": created}
+                        elif path == "/api/drafts/save":
+                            if set(arguments) != {"id", "revision", "values"}:
+                                raise ValueError("商品资料保存参数无效")
+                            row = drafts.edit(arguments["id"], arguments["revision"], arguments["values"])
+                            result = {"message": "商品资料已保存", "id": row["id"], "revision": row["revision"]}
+                        else:
+                            if set(arguments) != {"id", "revision", "remote_url", "confirm"} or arguments["confirm"] is not True:
+                                raise ValueError("请在千牛核对后确认")
+                            row = drafts.get(arguments["id"])
+                            if type(arguments["revision"]) is not int or arguments["revision"] != row["revision"] or row["status"] != "pending":
+                                raise DraftConflict("草稿状态已变化，请重新读取")
+                            url = validate_qianniu_url(arguments["remote_url"], required=True)
+                            drafts.update_status(row["id"], "saved", remote_url=url, saved_at=utc_now(),
+                                                 confirmed_by="manual", error="")
+                            result = {"message": "已记录人工核对结果"}
+                    except DraftConflict as exc:
+                        self.json_response({"message": str(exc)}, 409)
+                        return
+                    except (ValueError, RuntimeError, OSError, TypeError) as exc:
+                        self.json_response({"message": str(exc)}, 400)
+                        return
+                self.json_response(result)
+                return
             if path == "/api/config":
                 with state.control_lock:
                     with state.lock:
@@ -767,7 +907,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             raise ValueError("仅支持 Telegram API 抓取一次")
                         validate_source_settings({**config_payload(existing), **payload}, existing)
                         replace(existing, **{key: value for key, value in payload.items()
-                                             if key.startswith("data_server_") and
+                                             if (key.startswith("data_server_") or key in QIANNU_TEMPLATE_FIELDS) and
                                              (key not in {"data_server_token", "data_server_db_password"} or value)})
                         if "inbox_dir" in payload:
                             payload["inbox_dir"] = str(prepare_download_directory(payload["inbox_dir"]))
@@ -950,7 +1090,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                           "/api/telegram-channels-scan", "/api/channel-topics-scan",
                           "/api/channel-download", "/api/channel-cover", "/api/quark-login", "/api/quark-cli-login",
                           "/api/quark-cli-check", "/api/quark-api-check",
-                          "/api/telegram-api-login", "/api/browser-check"}:
+                          "/api/telegram-api-login", "/api/browser-check",
+                          "/api/drafts/publish", "/api/qianniu/login"}:
                 with state.control_lock:
                     with state.lock:
                         busy = state.running
@@ -976,7 +1117,38 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 if config.upload_provider == "quark_browser":
                                     validate_browser_path(config.browser_executable_path)
                                 cloud_adapter(config)
-                        if path == "/api/cloud-delete":
+                        if path == "/api/drafts/publish":
+                            validate_adapter(config)
+                            entries = arguments.get("entries")
+                            if (set(arguments) != {"entries"} or not isinstance(entries, list) or not 1 <= len(entries) <= 20):
+                                raise ValueError("请选择 1 至 20 条商品草稿")
+                            seen = set()
+                            for entry in entries:
+                                if not isinstance(entry, dict) or set(entry) != {"id", "revision"}:
+                                    raise ValueError("草稿参数无效")
+                                row = drafts.get(entry["id"])
+                                if row["id"] in seen:
+                                    raise ValueError("请勿重复选择商品草稿")
+                                seen.add(row["id"])
+                                if type(entry["revision"]) is not int or entry["revision"] != row["revision"]:
+                                    raise DraftConflict("商品资料已变化，请刷新列表")
+                                validate_publishable(row, config)
+                        elif path == "/api/qianniu/login":
+                            if set(arguments) - {"url", "shop_selector"}:
+                                raise ValueError("千牛登录参数无效")
+                            if "shop_selector" in arguments and (
+                                    not isinstance(arguments["shop_selector"], str) or len(arguments["shop_selector"]) > 1000):
+                                raise ValueError("店铺名称控件无效")
+                            selectors = dict(config.qianniu_form_selectors)
+                            if arguments.get("shop_selector"):
+                                selectors["shop"] = arguments["shop_selector"]
+                            elif "shop_selector" in arguments:
+                                selectors.pop("shop", None)
+                            config = replace(config, qianniu_publish_url=arguments.get("url", config.qianniu_publish_url),
+                                             qianniu_form_selectors=selectors)
+                            validate_browser_path(config.browser_executable_path)
+                            validate_qianniu_url(config.qianniu_publish_url)
+                        elif path == "/api/cloud-delete":
                             if arguments.get("confirm") is not True or not isinstance(arguments.get("id"), str):
                                 raise ValueError("请先确认要删除的云端文件")
                             task = transfers.get(arguments["id"])
@@ -1206,6 +1378,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         if path == "/api/channel-topics-scan":
                             state.telegram_topics = {"stage": "loading", "channel": channel_key(arguments["key"]),
                                                      "found": 0, "error": ""}
+                        if path == "/api/qianniu/login":
+                            state.qianniu_shop = {"stage": "starting", "ticket": uuid4().hex,
+                                                 "base_shop": config.qianniu_shop_name, "candidates": [], "error": ""}
                 if registration_error:
                     for request in prepared:
                         try:
@@ -1226,7 +1401,45 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             logging.info("Web %s", format % args)
 
     def upload_tasks(identities: list[str], config: PipelineConfig) -> None:
+        automatic_drafts = []
         if config.upload_provider == "quark_api":
+            translator = None
+            for identity in identities:
+                if state.stop_event.is_set():
+                    return
+                task = transfers.get(identity)
+                manual_draft = task.get("chinese_filename") and task.get("naming_quality") == "manual"
+                if task.get("rename_target") and not manual_draft:
+                    validate_name(task["rename_target"], task["filename"])
+                    continue
+                try:
+                    transfers.update(identity, naming_status="generating", naming_error="")
+                    if task.get("chinese_filename") and task.get("naming_quality") in {"manual", "confirmed"}:
+                        suggestion = {"chinese_filename": task["chinese_filename"],
+                                      "naming_note": task.get("naming_note", "")}
+                    else:
+                        if translator is None:
+                            translator = NameTranslator(config, state.stop_event)
+                        suggestion = translator.suggest(task["filename"])
+                    candidate = validate_name(suggestion["chinese_filename"], task["filename"])
+                    if state.stop_event.is_set():
+                        raise DownloadCancelled("上传前自动翻译已停止")
+                    changed = candidate != task["filename"]
+                    transfers.update(
+                        identity, **{**suggestion, "rename_target": candidate if changed else "",
+                                     "naming_status": "ready" if changed else "unchanged", "naming_error": "",
+                                     "naming_note": suggestion["naming_note"] + (
+                                         "；上传后自动应用" if changed else "；保留原文件名")},
+                    )
+                    logging.info("上传自动命名：%s → %s", task["filename"], candidate)
+                except DownloadCancelled as exc:
+                    transfers.update(identity, naming_status="failed", naming_error=str(exc))
+                    raise
+                except Exception as exc:
+                    transfers.update(identity, naming_status="failed", naming_error=str(exc),
+                                     naming_note="自动翻译未完成，本次按原文件名上传，可稍后编辑中文名称")
+                    logging.warning("上传自动翻译未完成，保留原名：%s，%s", task["filename"], exc)
+            # Translations may collide even when the original names are distinct.
             validate_upload_batch_names([transfers.get(identity) for identity in identities])
 
         def upload_one(identity: str) -> None:
@@ -1304,6 +1517,17 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     with state.lock:
                         state.error = "部分素材上传未完成，请查看任务错误信息"
                     logging.exception("素材上传未完成: %s", task["filename"])
+                return
+            if final_status == "completed" and config.qianniu_auto_create_draft:
+                try:
+                    row = drafts.create(transfers.get(identity), config)
+                    automatic_drafts.append(row["id"])
+                    logging.info("上传后商品资料已整理：%s", source.name)
+                except Exception:
+                    # Editorial failures must never roll back or repeat successful uploads.
+                    logging.exception("文件已上传，商品资料整理未完成：%s", source.name)
+                    with state.lock:
+                        state.error = "文件已上传，但商品资料整理失败，请在商品草稿中重试"
 
         concurrency = config.quark_api_file_concurrency if config.upload_provider == "quark_api" else 1
         logging.info("开始批量上传：%d 个素材，同时上传数=%d", len(identities), concurrency)
@@ -1313,6 +1537,57 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         else:
             with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="QuarkUpload") as pool:
                 list(pool.map(upload_one, identities))
+        if config.qianniu_auto_save_draft and automatic_drafts and not state.stop_event.is_set():
+            with state.lock:
+                state.action = "drafts/publish"
+            save_product_drafts(automatic_drafts, config)
+
+    def validate_publishable(row, config):
+        if row["status"] not in {"ready", "attention", "editing"} or row.get("remote_url"):
+            raise ValueError("仅可保存尚未提交千牛的商品；保存结果待确认时请先核对")
+        missing = missing_fields(row, require_shop=True)
+        if missing:
+            raise ValueError("请补充：" + "、".join(missing))
+        if row["shop_name"] != config.qianniu_shop_name.strip():
+            raise ValueError("草稿所属店铺与当前发布模板不一致")
+        task = transfers.get(row["task_id"])
+        if (task.get("upload_status") != "completed" or task.get("share_url") != row["share_url"]
+                or task.get("upload_remote_fid", "") != row.get("upload_remote_fid", "")):
+            raise ValueError("关联的网盘文件或链接已变化，请先核对交付资料")
+        for index in row["image_indices"]:
+            drafts.preview(row["id"], index)
+
+    def save_product_drafts(identities, config, revisions=None):
+        adapter = QianniuDraftAdapter(config, state.stop_event)
+        for identity in identities:
+            if state.stop_event.is_set():
+                break
+            receipt_received = False
+            try:
+                with drafts.lock:
+                    row = drafts.get(identity)
+                    if revisions and row["revision"] != revisions[identity]:
+                        logging.warning("商品资料已编辑，跳过本次千牛提交：%s", identity)
+                        continue
+                    # Automatic runs skip records which have already been submitted.
+                    if row["status"] in {"saved", "pending"}:
+                        continue
+                    validate_publishable(row, config)
+                    drafts.update_status(identity, "saving", error="")
+                    images = [drafts.preview(identity, i)[0] for i in row["image_indices"]]
+                result = adapter.save(row, images)
+                receipt_received = True
+                drafts.update_status(identity, "saved", remote_url=result["remote_url"],
+                                     confirmed_by=result["confirmed_by"], saved_at=utc_now(), error="")
+                logging.info("千牛草稿保存已确认：%s", row["title"])
+            except Exception as exc:
+                drafts.update_status(identity, "pending" if receipt_received or isinstance(exc, QianniuSavePending) else "attention",
+                                     error=str(exc))
+                with state.lock:
+                    state.error = "部分商品草稿需要处理，请查看草稿详情"
+                logging.warning("千牛草稿未确认保存：%s，%s", identity, exc)
+                if isinstance(exc, DownloadCancelled):
+                    break
 
     def delete_cloud_file(arguments, config):
         identity = arguments["id"]
@@ -1403,6 +1678,23 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         auto_upload_candidates.clear()
         try:
             logging.info("开始任务，上传方式=%s", config.upload_provider)
+            if action == "/api/drafts/publish":
+                save_product_drafts([entry["id"] for entry in arguments["entries"]], config,
+                                    {entry["id"]: entry["revision"] for entry in arguments["entries"]})
+                return
+            if action == "/api/qianniu/login":
+                def detected_shop(progress):
+                    with state.lock:
+                        state.qianniu_shop.update(progress)
+                        if progress.get("stage") == "detected":
+                            state.qianniu_shop["detected_at"] = time.time()
+
+                candidates = QianniuDraftAdapter(config, state.stop_event).login(on_status=detected_shop)
+                if not candidates:
+                    raise ValueError("未识别到店铺，请重新登录或手动填写")
+                detected_shop({"stage": "detected", "candidates": candidates, "error": ""})
+                logging.info("已识别 %d 个店铺名称，等待用户确认", len(candidates))
+                return
             if action == "/api/cloud-delete":
                 delete_cloud_file(arguments, config)
                 return
@@ -1549,6 +1841,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             for item in candidates:
                 logging.info("%s status=%s share=%s warnings=%s", item.candidate_id, item.status, item.share_url, item.warnings)
         except DownloadCancelled:
+            if action == "/api/qianniu/login":
+                with state.lock:
+                    state.qianniu_shop.update(stage="cancelled", candidates=[], error="店铺识别已停止")
             if action == "/api/channel-scan":
                 state.scan_progress({"stage": "cancelled"})
                 logging.info("频道加载已停止，已读取的消息保留")
@@ -1563,6 +1858,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             else:
                 logging.info("任务已停止")
         except Exception as exc:
+            if action == "/api/qianniu/login":
+                with state.lock:
+                    state.qianniu_shop.update(stage="failed", candidates=[], error=str(exc))
             if action == "/api/channel-scan":
                 state.scan_progress({"stage": "failed"})
             elif action == "/api/telegram-channels-scan":

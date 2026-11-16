@@ -7,7 +7,9 @@
   <link rel="icon" href="data:,">
   <title>素材工作台</title>
   <link rel="stylesheet" href="/static/workbench.css">
+  <link rel="stylesheet" href="/static/product-drafts.css">
   <script src="/static/lucide.js" defer></script>
+  <script src="/static/product-drafts.js" defer></script>
   <script src="/static/workbench.js" defer></script>
 </head>
 <body>
@@ -24,6 +26,7 @@
         <a class="nav-item" href="?view=download" data-view="download" title="下载任务"><i data-lucide="arrow-down-to-line"></i><span>下载任务</span><small id="nav-download">—</small></a>
         <a class="nav-item" href="?view=upload" data-view="upload" title="上传任务"><i data-lucide="cloud-upload"></i><span>上传任务</span><small id="nav-upload">—</small></a>
         <a class="nav-item" href="?view=library" data-view="library" title="素材库"><i data-lucide="library"></i><span>素材库</span><small id="nav-library">—</small></a>
+        <a class="nav-item" href="?view=drafts" data-view="drafts" title="商品草稿"><i data-lucide="notebook-pen"></i><span>商品草稿</span><small id="nav-drafts">—</small></a>
         <a class="nav-item" href="?view=history" data-view="history" title="任务记录"><i data-lucide="history"></i><span>任务记录</span></a>
         <div class="divider"></div><p class="nav-caption">工作空间</p>
         <a class="nav-item" href="?view=channels" data-view="channels" title="来源频道"><i data-lucide="radio-tower"></i><span>来源频道</span></a>
@@ -62,9 +65,64 @@
           <button id="open-naming" type="button" hidden><i data-lucide="languages"></i>中文命名</button>
           <button id="add-channel" type="button" hidden><i data-lucide="plus"></i>添加频道</button>
           <button id="edit-channel" type="button" hidden><i data-lucide="pencil"></i>编辑来源</button>
+          <button id="draft-open-template" type="button" hidden><i data-lucide="sliders-horizontal"></i>发布模板</button>
+          <button id="draft-import" type="button" hidden><i data-lucide="plus"></i>从素材库添加</button>
         </div>
       </section>
       <section id="metrics" class="metrics" aria-label="任务统计"></section>
+      <section id="product-drafts-section" class="product-drafts-section" aria-label="商品草稿" hidden>
+        <div class="draft-automation">
+          <div><i data-lucide="workflow"></i><strong>自动草稿</strong><span id="draft-auto-summary">夸克上传完成后整理商品资料</span></div>
+          <label class="draft-switch"><span>自动整理</span><input id="draft-auto-create" type="checkbox" role="switch"></label>
+        </div>
+        <p id="draft-error" class="error-note" role="alert" hidden></p>
+        <div class="drafts-workspace">
+          <section class="draft-queue" aria-label="草稿队列">
+            <div id="draft-tabs" class="draft-tabs" role="group" aria-label="筛选草稿状态"></div>
+            <div class="draft-search"><i data-lucide="search"></i><input id="draft-search" type="search" placeholder="搜索商品、文件或消息 ID" aria-label="搜索商品草稿"></div>
+            <div class="draft-selection"><label><input id="draft-select-all" type="checkbox">全选当前列表</label><span id="draft-list-count"></span></div>
+            <div id="draft-list" class="draft-list"></div>
+            <div id="draft-list-empty" class="draft-empty" hidden><i data-lucide="notebook-pen"></i><h2>暂无商品草稿</h2><p>从已上传的素材中添加</p></div>
+            <div class="draft-batch"><span id="draft-selection-count">已选 0 项</span><button id="draft-publish-selected" type="button" disabled><i data-lucide="notebook-pen"></i>批量保存千牛草稿</button></div>
+          </section>
+          <section class="draft-editor" aria-label="商品资料">
+            <div id="draft-editor-empty" class="draft-empty"><i data-lucide="panel-right"></i><h2>选择商品资料</h2></div>
+            <form id="draft-editor-form" hidden>
+              <div class="draft-editor-head"><div><h2>商品资料</h2><small id="draft-identity"></small></div><span id="draft-status" class="badge"></span></div>
+              <div class="draft-editor-body">
+                <ol id="draft-stages" class="draft-stages" aria-label="处理阶段"></ol>
+                <div class="draft-form-columns">
+                  <section class="draft-media" aria-label="商品图片">
+                    <div class="draft-field-head"><h3>商品图片</h3><span id="draft-image-count"></span></div>
+                    <button id="draft-hero" type="button" class="draft-hero" title="放大商品图片" aria-label="放大商品图片"><img id="draft-hero-image" alt="商品展示图" hidden><i data-lucide="image"></i></button>
+                    <div id="draft-image-list" class="draft-image-list"></div>
+                    <button id="draft-set-cover" class="text-button" type="button"><i data-lucide="image-up"></i>设为主图</button>
+                    <h3 class="draft-source-heading">关联素材</h3>
+                    <p id="draft-source-file" class="draft-source-file"></p>
+                    <p id="draft-source-message" class="draft-muted"></p>
+                    <div class="draft-cloud-receipt"><i data-lucide="cloud-check"></i><div><strong>夸克上传已完成</strong><small id="draft-shop"></small></div></div>
+                    <a id="draft-delivery-link" class="text-button" target="_blank" rel="noopener noreferrer"><i data-lucide="link-2"></i>交付资料</a>
+                    <small class="draft-muted">网盘链接单独保存在交付资料中</small>
+                  </section>
+                  <section class="draft-fields" aria-label="商品基本资料">
+                    <label>商品标题<textarea id="draft-title" rows="2" maxlength="60"></textarea></label>
+                    <div class="draft-field-foot"><span>目标平台：千牛</span><span id="draft-title-count"></span></div>
+                    <div class="draft-field-pair"><label>商品价格<input id="draft-price" type="number" min="0.01" max="99999999.99" step="0.01" placeholder="待填写"></label><label>库存数量<input id="draft-stock" type="number" min="1" max="999999999" step="1" required></label></div>
+                    <label>商品类目<input id="draft-category" type="text" maxlength="200" placeholder="填写店铺可发布的类目"></label>
+                    <div class="draft-field-pair"><label>文件格式<input id="draft-format" type="text" maxlength="80" placeholder="按实际文件填写"></label><label>商品规格<input id="draft-variant" type="text" maxlength="200"></label></div>
+                    <label>商品详情<textarea id="draft-description" rows="6" maxlength="12000"></textarea></label>
+                  </section>
+                </div>
+                <p id="draft-validation" class="draft-validation" role="status"></p>
+                <p id="draft-record-error" class="error-note" role="alert" hidden></p>
+                <p id="draft-receipt" class="draft-muted"></p>
+                <div class="draft-record-actions"><a id="draft-export" class="text-button"><i data-lucide="package"></i>导出发布资料</a><a id="draft-remote" class="text-button" target="_blank" rel="noopener noreferrer" hidden><i data-lucide="external-link"></i>查看千牛</a><button id="draft-confirm" class="text-button" type="button" hidden><i data-lucide="badge-check"></i>核对保存结果</button></div>
+              </div>
+              <footer class="draft-editor-footer"><span id="draft-save-note" role="status"></span><div><button id="draft-reload" type="button" hidden><i data-lucide="refresh-cw"></i>重新读取</button><button id="draft-save-local" type="submit"><i data-lucide="save"></i>保存资料</button><button id="draft-publish" type="button" class="primary"><i data-lucide="notebook-pen"></i>保存到千牛草稿</button></div></footer>
+            </form>
+          </section>
+        </div>
+      </section>
       <section id="channel-messages-section" class="channel-messages-section" aria-label="频道消息" hidden>
         <div id="channel-catalog-pane" class="channel-catalog-pane">
         <div class="channel-switcher">
@@ -286,8 +344,9 @@
                 <p class="field-hint wide">首次使用前请在 WSL 中完成夸克 CLI 授权。目标目录 FID 由夸克 CLI 的目录浏览结果提供，不是网页 URL。</p>
               </div>
             </div><dl class="paths"><dt>下载目录</dt><dd id="config-download-dir">—</dd><dt>待检查目录</dt><dd id="config-unverified-dir">—</dd><dt>日志文件</dt><dd id="config-log-path">—</dd></dl></section>
+            <section class="form-section"><h2>千牛商品草稿</h2><div class="inline-actions"><button id="draft-settings-template" type="button"><i data-lucide="sliders-horizontal"></i>发布模板与千牛配置</button><button id="draft-login-settings" type="button"><i data-lucide="scan-line"></i>登录并识别店铺</button><output id="draft-shop-settings-status" class="field-hint" role="status">店铺未绑定</output></div></section>
             <section class="form-section"><h2>中文命名</h2><div class="form-grid">
-              <label>翻译方式<select id="rename_translation_provider"><option value="mymemory">作品/角色术语 + MyMemory（免密钥）</option><option value="local">仅作品/角色及本地术语</option></select><span class="field-hint">在线模式会将文件名发送给翻译服务，有使用配额；未识别名称保留原文，所有候选名均需确认。</span></label>
+              <label>翻译方式<select id="rename_translation_provider"><option value="mymemory">作品/角色术语 + MyMemory（免密钥）</option><option value="local">仅作品/角色及本地术语</option></select><span class="field-hint">夸克 API 上传时自动翻译，上传成功后应用中文名；手动名称优先。本地文件名保留。在线模式有使用配额，未识别内容保留原文。</span></label>
               <label class="wide">自定义术语<textarea id="rename_glossary" rows="5" maxlength="12000" spellcheck="false" placeholder="每行一条，例如：&#10;Dragon Warrior=龙战士&#10;Kurisu Makise=牧濑红莉栖"></textarea></label>
             </div></section>
           </fieldset>
@@ -312,6 +371,32 @@
           <div class="form-actions"><button id="tdlib-save-config" type="button" class="primary" hidden><i data-lucide="save"></i>保存配置并继续</button><button id="tdlib-auth-submit" type="submit" class="primary" hidden><i data-lucide="check"></i>确认</button></div>
         </form>
       </dialog>
+      <dialog id="draft-template-dialog" class="draft-dialog" aria-labelledby="draft-template-title">
+        <form id="draft-template-form">
+          <div class="draft-dialog-head"><h2 id="draft-template-title">发布模板</h2><button type="button" class="icon-button" data-draft-close title="关闭" aria-label="关闭发布模板"><i data-lucide="x"></i></button></div>
+          <div class="draft-dialog-body">
+            <label>目标店铺名称<input id="dt-shop" type="text" maxlength="100" placeholder="登录识别，或手动填写" autocomplete="off"></label>
+            <div class="draft-shop-discovery">
+              <div class="draft-shop-status"><output id="dt-shop-status" role="status">尚未识别店铺</output><button id="dt-shop-detect" type="button"><i data-lucide="scan-line"></i>登录并识别</button></div>
+              <div id="dt-shop-result" class="draft-shop-result" hidden><label>识别到的店铺<select id="dt-shop-candidate" aria-label="识别到的店铺"></select></label><button id="dt-shop-use" type="button"><i data-lucide="check"></i>确认使用</button></div>
+            </div>
+            <label>默认商品类目<input id="dt-category" type="text" maxlength="200" placeholder="店铺中的实际类目"></label>
+            <div class="draft-field-pair"><label>默认价格<input id="dt-price" type="number" min="0.01" max="99999999.99" step="0.01" placeholder="留空时逐条填写"></label><label>默认库存<input id="dt-stock" type="number" min="1" max="999999999" step="1" required value="1"></label></div>
+            <div class="draft-field-pair"><label>默认文件格式<input id="dt-format" type="text" maxlength="80"></label><label>默认规格<input id="dt-variant" type="text" maxlength="200"></label></div>
+            <label>默认商品详情<textarea id="dt-description" rows="5" maxlength="12000"></textarea></label>
+            <p class="draft-muted">可用变量：{title}、{filename}、{format}。修改模板仅影响后续新增资料。</p>
+            <label class="draft-check"><input id="dt-auto-create" type="checkbox">夸克上传成功后自动整理商品资料</label>
+            <label class="draft-check"><input id="dt-auto-save" type="checkbox">资料完整后自动保存到千牛草稿</label>
+            <label>千牛商品发布页面<input id="dt-url" type="url" placeholder="https://" maxlength="2048"></label>
+            <details class="draft-adapter-settings"><summary>千牛页面适配</summary><p class="draft-muted">自动保存需要实际店铺页面的控件选择器及草稿成功回执。未配置时可先编辑并导出资料。</p><label>页面控件（JSON）<textarea id="dt-selectors" rows="7" spellcheck="false" placeholder='{"shop":"","title":"","price":"","stock":"","category":"","description":"","images":"","save":"","success":""}'></textarea></label></details>
+            <p id="dt-error" class="error-note" role="alert" hidden></p>
+          </div>
+          <div class="draft-dialog-foot"><button id="draft-login" type="button"><i data-lucide="log-in"></i>重新登录识别</button><button id="dt-save" type="submit" class="primary"><i data-lucide="save"></i>保存模板</button></div>
+        </form>
+      </dialog>
+      <dialog id="draft-import-dialog" class="draft-dialog" aria-labelledby="draft-import-title"><div class="draft-dialog-head"><h2 id="draft-import-title">从素材库添加</h2><button type="button" class="icon-button" data-draft-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div><div class="draft-dialog-body"><p id="draft-import-note" class="draft-muted"></p><div id="draft-import-list"></div><p id="draft-import-error" class="error-note" role="alert" hidden></p></div><div class="draft-dialog-foot"><button type="button" data-draft-close>取消</button><button id="draft-import-confirm" type="button" class="primary"><i data-lucide="plus"></i>整理商品资料</button></div></dialog>
+      <dialog id="draft-image-dialog" class="draft-dialog draft-image-dialog" aria-label="商品大图"><div class="draft-dialog-head"><h2>商品图片</h2><button type="button" class="icon-button" data-draft-close title="关闭大图" aria-label="关闭大图"><i data-lucide="x"></i></button></div><img id="draft-large-image" alt="商品大图"></dialog>
+      <dialog id="draft-confirm-dialog" class="draft-dialog" aria-labelledby="draft-confirm-title"><form id="draft-confirm-form"><div class="draft-dialog-head"><h2 id="draft-confirm-title">核对千牛保存结果</h2><button type="button" class="icon-button" data-draft-close title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div><div class="draft-dialog-body"><label>千牛中的草稿页面地址<input id="draft-confirm-url" type="url" required></label><label class="draft-check"><input id="draft-confirm-checked" type="checkbox" required>已在千牛核对商品标题、店铺和草稿内容</label><p id="draft-confirm-error" class="error-note" hidden></p></div><div class="draft-dialog-foot"><button type="button" data-draft-close>取消</button><button type="submit" class="primary"><i data-lucide="check"></i>记录核对结果</button></div></form></dialog>
       <footer class="footer"><span id="footer-context">本地工作空间</span><span id="last-sync">尚未同步</span></footer>
     </main>
   </div>

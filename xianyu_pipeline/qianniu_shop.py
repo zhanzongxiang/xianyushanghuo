@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 QIANNIU_HOME_URL = "https://myseller.taobao.com/home.htm"
 SELLER_HOSTS = {"myseller.taobao.com", "qn.taobao.com", "sellercenter.taobao.com",
-                "sell.taobao.com", "item.publish.taobao.com"}
+                "sell.taobao.com", "item.publish.taobao.com", "item.upload.taobao.com"}
 LOGIN_HOSTS = {"loginmyseller.taobao.com", "login.taobao.com", "login.tmall.com",
                "havanlogin.taobao.com", "passport.taobao.com"}
 GENERIC_NAMES = {"我的店铺", "进入店铺", "查看店铺", "店铺首页", "店铺名称", "店铺",
@@ -115,6 +115,11 @@ DOM_SHOPS = r"""() => {
     '#qn-workbench-inner-container [class*="ShopInfo_name__"], #qn-worbench-container [class*="ShopInfo_name__"]');
   for (const el of shopNames) {
     if (visible(el)) add(el.getAttribute("title") || el.innerText.trim());
+  }
+  if (location.hostname === 'item.upload.taobao.com') {
+    for (const el of document.querySelectorAll('[class*="UserArea_accountWrap__"] [class*="UserArea_shopName__"]')) {
+      if (visible(el)) add(el.innerText.trim());
+    }
   }
   const headers = document.querySelectorAll("header, nav, [role=banner], #header, #J_Header, .header, .top-header, .seller-header");
   for (const root of headers) {

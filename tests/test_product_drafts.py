@@ -107,6 +107,27 @@ def test_upload_creates_draft_without_overwriting_previous_edits(app):
     assert app.get("/api/drafts")[1]["drafts"][0]["title"] == "编辑保留"
 
 
+def test_warehouse_template_without_selectors_persists_and_records_actual_target(app, monkeypatch):
+    identity, row = imported(app)
+    settings = {
+        "qianniu_save_target": "warehouse", "qianniu_form_selectors": {},
+        "qianniu_publish_url": "https://item.upload.taobao.com/sell/v2/publish.htm?copyItem=true&itemId=123456",
+    }
+    assert app.post("/api/drafts/template", settings)[0] == 200
+    assert app.get("/api/drafts")[1]["template"]["qianniu_save_target"] == "warehouse"
+    assert PipelineConfig.from_json(app.config_path).qianniu_save_target == "warehouse"
+    monkeypatch.setattr(web_ui.QianniuDraftAdapter, "save", lambda *args: {
+        "remote_url": "https://upload.taobao.com/auction/publish/edit.htm?item_num_id=654321&auto=false",
+        "confirmed_by": "warehouse_receipt",
+    })
+    assert app.post("/api/drafts/publish", {"entries": [{"id": row["id"], "revision": row["revision"]}]})[0] == 200
+    app.run()
+    saved = app.get("/api/drafts")[1]["drafts"][0]
+    assert saved["status"] == "saved" and saved["confirmed_by"] == "warehouse_receipt"
+    assert app.store.get(identity)["upload_status"] == "completed"
+    assert app.post("/api/drafts/publish", {"entries": [{"id": row["id"], "revision": saved["revision"]}]})[0] == 400
+
+
 def test_editorial_failure_does_not_reclassify_successful_upload(app, monkeypatch):
     assert app.post("/api/drafts/template", {**TEMPLATE, "qianniu_auto_create_draft": True})[0] == 200
     identity = app.task()

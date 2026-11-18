@@ -7,7 +7,7 @@
   const labels = { editing: "待完善", ready: "待生成", saving: "保存中", saved: "已保存", attention: "需处理", pending: "结果待确认" };
   const fields = ["title", "price", "stock", "category", "format", "variant", "description"];
   const templateFields = { shop: "shop_name", price: "default_price", stock: "default_stock", category: "default_category",
-    format: "default_format", variant: "default_variant", description: "default_description", url: "publish_url" };
+    format: "default_format", variant: "default_variant", description: "default_description", url: "publish_url", target: "save_target" };
   let api;
   const state = { rows: [], template: {}, selected: new Set(), filter: "all", active: "", form: null,
     dirty: false, pending: false, request: null, image: 0, error: "", fetched: false, shop: {} };
@@ -22,6 +22,7 @@
     try { const u = new URL(value); return u.protocol === "https:" && !u.username && !u.password ? u.href : ""; } catch { return ""; }
   }
   const activeRow = () => state.rows.find((r) => r.id === state.active);
+  const warehouse = () => state.template.qianniu_save_target === "warehouse";
   const readonly = () => !state.form || state.form.remote_device || ["saving", "saved", "pending"].includes(state.form.status) || Boolean(state.form.remote_url);
   const busy = () => state.pending || api.isBusy();
   function visibleRows() {
@@ -96,7 +97,7 @@
     const rows = ids.map((id) => state.rows.find((r) => r.id === id));
     if (rows.some((r) => !r || r.remote_device || ["saving", "saved", "pending"].includes(r.status))) throw new Error("请选择尚未提交千牛的本机资料");
     await api.post("/api/drafts/publish", { entries: rows.map((r) => ({ id: r.id, revision: r.revision })) });
-    api.notice("已开始填写并保存千牛草稿");
+    api.notice(warehouse() ? "已开始填写并保存到千牛仓库" : "已开始填写并保存千牛草稿");
     await api.refreshWorkbench();
   }
   function renderEditor() {
@@ -109,7 +110,8 @@
     $("draft-identity").textContent = `${row.shop_name || "待绑定店铺"} · ${row.id.slice(0, 8)}`;
     $("draft-status").textContent = `${labels[latest?.status || row.status] || row.status}${row.remote_device ? " · 其他设备" : ""}`;
     $("draft-status").className = `badge ${["pending", "attention", "editing"].includes(latest?.status) ? "amber" : ""}`;
-    const stages = ["上传夸克", "整理资料", "填写千牛", "草稿保存"];
+    const storedInWarehouse = row.confirmed_by === "warehouse_receipt";
+    const stages = ["上传夸克", "整理资料", "填写千牛", storedInWarehouse || row.status !== "saved" && warehouse() ? "保存仓库" : "草稿保存"];
     markup("draft-stages", stages.map((label, i) => `<li class="${i === 0 || i === 1 && !(row.missing || []).length || row.status === "saved" ? "done" : i === 2 && row.status === "saving" ? "current" : ""}"><span>${i + 1}</span>${label}</li>`).join(""));
     $("draft-source-file").textContent = row.filename;
     $("draft-source-message").textContent = row.message_id > 0 ? `${row.chat} · 消息 #${row.message_id}` : "本地素材";
@@ -135,7 +137,7 @@
     $("draft-validation").textContent = missing.length ? `待补充：${missing.join("、")}` : row.shop_name ? "商品资料已就绪" : "商品资料已就绪 · 待绑定店铺";
     $("draft-validation").classList.toggle("incomplete", Boolean(missing.length));
     note("draft-record-error", latest?.error || "");
-    $("draft-receipt").textContent = row.saved_at ? `${row.confirmed_by === "manual" ? "人工核对已记录" : "千牛保存回执已确认"} · ${new Date(row.saved_at).toLocaleString("zh-CN")}` : "";
+    $("draft-receipt").textContent = row.saved_at ? `${row.confirmed_by === "manual" ? "人工核对已记录" : storedInWarehouse ? "已保存到千牛仓库（未上架）" : "千牛保存回执已确认"} · ${new Date(row.saved_at).toLocaleString("zh-CN")}` : "";
     $("draft-save-note").textContent = conflict ? "资料已变化，请重新读取后编辑" : state.dirty ? "有未保存的修改" : row.remote_device ? "其他设备的草稿，仅可查看" : "资料已保存至工作台";
     $("draft-reload").hidden = !conflict;
     $("draft-save-local").disabled = readonly() || state.pending || conflict || !state.dirty;
@@ -184,10 +186,12 @@
     $("draft-import").hidden = !shown;
     $("nav-drafts").textContent = state.fetched ? state.rows.length : "—";
     renderShop();
+    markup("draft-publish", `${icon("notebook-pen")}${warehouse() ? "保存到千牛仓库" : "保存到千牛草稿"}`);
+    markup("draft-publish-selected", `${icon("notebook-pen")}${warehouse() ? "批量保存千牛仓库" : "批量保存千牛草稿"}`);
     if (!shown) return;
     $("draft-auto-create").checked = state.template.qianniu_auto_create_draft === true;
     $("draft-auto-create").disabled = busy() || !state.fetched;
-    $("draft-auto-summary").textContent = state.template.qianniu_auto_save_draft ? "夸克上传完成 → 整理资料 → 保存千牛草稿" : "夸克上传完成后整理商品资料";
+    $("draft-auto-summary").textContent = state.template.qianniu_auto_save_draft ? `夸克上传完成 → 整理资料 → ${warehouse() ? "保存千牛仓库" : "保存千牛草稿"}` : "夸克上传完成后整理商品资料";
     if (state.error) note("draft-error", state.error);
     markup("draft-tabs", [["all", "全部"], ["ready", "待生成"], ["saving", "保存中"], ["saved", "已保存"], ["attention", "需处理"]].map(([status, title]) => {
       const count = state.rows.filter((r) => status === "all" || status === "ready" && ["editing", "ready"].includes(r.status) || status === "attention" && ["pending", "attention"].includes(r.status) || r.status === status).length;
@@ -209,16 +213,20 @@
   async function openTemplate() {
     await refresh();
     if (!state.fetched) throw new Error("发布模板尚未读取");
-    for (const [id, key] of Object.entries(templateFields)) $(`dt-${id}`).value = state.template[`qianniu_${key}`] ?? "";
+    for (const [id, key] of Object.entries(templateFields)) $(`dt-${id}`).value = state.template[`qianniu_${key}`] ?? (id === "target" ? "draft" : "");
     $("dt-auto-create").checked = Boolean(state.template.qianniu_auto_create_draft);
     $("dt-auto-save").checked = Boolean(state.template.qianniu_auto_save_draft);
     $("dt-selectors").value = JSON.stringify(state.template.qianniu_form_selectors || {}, null, 2);
+    $("dt-selectors").closest("details").hidden = $("dt-target").value === "warehouse";
     note("dt-error", "");
     $("draft-template-dialog").showModal();
     renderShop();
   }
   function init(bridge) {
     api = bridge;
+    $("dt-target").addEventListener("change", () => {
+      $("dt-selectors").closest("details").hidden = $("dt-target").value === "warehouse";
+    });
     for (const f of fields) $(`draft-${f}`).addEventListener("input", () => { state.dirty = true; renderEditor(); });
     $("draft-editor-form").addEventListener("submit", (event) => {
       event.preventDefault(); void perform(async () => { await saveLocal(); api.notice("商品资料已保存"); });

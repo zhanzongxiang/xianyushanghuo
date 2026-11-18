@@ -41,6 +41,7 @@ class PipelineConfig:
     auto_upload_after_download: bool = False
     qianniu_shop_name: str = ""
     qianniu_publish_url: str = ""
+    qianniu_save_target: str = "draft"
     qianniu_browser_profile: Path = Path("data/qianniu_browser_profile")
     qianniu_auto_create_draft: bool = False
     qianniu_auto_save_draft: bool = False
@@ -120,6 +121,8 @@ class PipelineConfig:
     def __post_init__(self) -> None:
         from .product_drafts import price_value, validate_qianniu_url
         validate_qianniu_url(self.qianniu_publish_url)
+        if self.qianniu_save_target not in {"draft", "warehouse"}:
+            raise ValueError("千牛保存位置须为草稿或仓库")
         self.qianniu_default_price = price_value(self.qianniu_default_price)
         for name, limit in (("qianniu_shop_name", 100), ("qianniu_default_category", 200),
                             ("qianniu_default_format", 80), ("qianniu_default_variant", 200),

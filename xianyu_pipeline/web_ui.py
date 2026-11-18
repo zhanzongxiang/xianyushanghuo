@@ -52,7 +52,7 @@ from .qianniu_shop import shop_name
 QIANNU_TEMPLATE_FIELDS = {
     "qianniu_shop_name", "qianniu_publish_url", "qianniu_auto_create_draft", "qianniu_auto_save_draft",
     "qianniu_default_price", "qianniu_default_stock", "qianniu_default_category", "qianniu_default_format",
-    "qianniu_default_variant", "qianniu_default_description", "qianniu_form_selectors",
+    "qianniu_default_variant", "qianniu_default_description", "qianniu_form_selectors", "qianniu_save_target",
 }
 
 
@@ -1579,13 +1579,13 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 receipt_received = True
                 drafts.update_status(identity, "saved", remote_url=result["remote_url"],
                                      confirmed_by=result["confirmed_by"], saved_at=utc_now(), error="")
-                logging.info("千牛草稿保存已确认：%s", row["title"])
+                logging.info("千牛%s保存已确认：%s", "仓库商品" if result["confirmed_by"] == "warehouse_receipt" else "草稿", row["title"])
             except Exception as exc:
                 drafts.update_status(identity, "pending" if receipt_received or isinstance(exc, QianniuSavePending) else "attention",
                                      error=str(exc))
                 with state.lock:
                     state.error = "部分商品草稿需要处理，请查看草稿详情"
-                logging.warning("千牛草稿未确认保存：%s，%s", identity, exc)
+                logging.warning("千牛商品未确认保存：%s，%s", identity, exc)
                 if isinstance(exc, DownloadCancelled):
                     break
 

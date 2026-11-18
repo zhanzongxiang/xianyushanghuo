@@ -386,8 +386,9 @@
             <label>默认商品详情<textarea id="dt-description" rows="5" maxlength="12000"></textarea></label>
             <p class="draft-muted">可用变量：{title}、{filename}、{format}。修改模板仅影响后续新增资料。</p>
             <label class="draft-check"><input id="dt-auto-create" type="checkbox">夸克上传成功后自动整理商品资料</label>
-            <label class="draft-check"><input id="dt-auto-save" type="checkbox">资料完整后自动保存到千牛草稿</label>
+            <label class="draft-check"><input id="dt-auto-save" type="checkbox">资料完整后自动保存到所选千牛位置</label>
             <label>千牛商品发布页面<input id="dt-url" type="url" placeholder="https://" maxlength="2048"></label>
+            <label>保存位置<select id="dt-target"><option value="draft">千牛草稿（自定义页面）</option><option value="warehouse">仓库中的未上架商品（淘宝复制商品页）</option></select></label>
             <details class="draft-adapter-settings"><summary>千牛页面适配</summary><p class="draft-muted">自动保存需要实际店铺页面的控件选择器及草稿成功回执。未配置时可先编辑并导出资料。</p><label>页面控件（JSON）<textarea id="dt-selectors" rows="7" spellcheck="false" placeholder='{"shop":"","title":"","price":"","stock":"","category":"","description":"","images":"","save":"","success":""}'></textarea></label></details>
             <p id="dt-error" class="error-note" role="alert" hidden></p>
           </div>

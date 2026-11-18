@@ -27,6 +27,10 @@ def validate_adapter(config):
         raise ValueError("请先登录千牛识别并确认目标店铺，或在发布模板中填写店铺名称")
     validate_browser_path(config.browser_executable_path)
     validate_qianniu_url(config.qianniu_publish_url, required=True)
+    if config.qianniu_save_target == "warehouse":
+        from .qianniu_warehouse import validate_publish_url
+        validate_publish_url(config.qianniu_publish_url)
+        return
     required = {"shop", "title", "price", "stock", "category", "description", "images", "save", "success"}
     if required - set(config.qianniu_form_selectors):
         raise ValueError("千牛发布页面尚未适配：请在设置中配置并核验页面控件，再执行自动保存")
@@ -140,6 +144,9 @@ class QianniuDraftAdapter:
 
     def fill_and_save(self, page, row, images):
         self.check_stop()
+        if self.config.qianniu_save_target == "warehouse":
+            from .qianniu_warehouse import TaobaoWarehouseAdapter
+            return TaobaoWarehouseAdapter(self.config, self.stop_event).save(page, row, images)
         selectors = self.config.qianniu_form_selectors
 
         def unique(name):

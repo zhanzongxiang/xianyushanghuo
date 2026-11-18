@@ -28,7 +28,7 @@
   const numberFields = ["quark_share_expire_days", "recent_message_limit", "channel_message_limit", "download_start_timeout_seconds", "download_transfer_timeout_seconds", "download_workers", "download_file_concurrency", "quark_cli_timeout_seconds", "quark_api_file_concurrency", "quark_api_timeout_seconds"];
   numberFields.push("source_topic_id");
   actionLabels["channel-topics-scan"] = "获取群组话题";
-  actionLabels["drafts/publish"] = "保存千牛草稿";
+  actionLabels["drafts/publish"] = "保存千牛商品";
   actionLabels["qianniu/login"] = "千牛登录";
   const booleanFields = ["quark_headless", "exclude_forwarded_posts", "auto_upload_after_download"];
   const plainFields = ["source_channel_url", "telegram_api_proxy_url", "telegram_api_dc2_server", "inbox_dir", "browser_executable_path", "archive_test_executable_path", "upload_provider", "quark_folder_url", "quark_cli_mode", "quark_cli_executable_path", "quark_cli_wsl_distribution", "quark_cli_node_command", "quark_cli_script_path", "quark_cli_parent_fid", "quark_api_parent_fid", "rename_translation_provider", "rename_glossary"];
@@ -1342,7 +1342,7 @@
     const data = state.data;
     const source = state.config?.source_channel_url;
     const subtitle = ({ messages: sourceTitle() || "已保存频道", download: source ? sourceTitle() || channelLabel(source) : "尚未配置来源频道", upload: data?.upload_target || "上传目标尚未读取", library: "已下载或已上传的素材", history: "任务状态与运行日志", channels: `${savedChannels().length} 个已保存频道`, settings: "本地配置" })[state.view];
-    text("page-subtitle", state.view === "drafts" ? "已上传素材 · 商品资料 · 千牛待审核草稿" : state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
+    text("page-subtitle", state.view === "drafts" ? "已上传素材 · 商品资料 · 千牛待审核商品" : state.configLoaded || state.view !== "download" ? subtitle : "来源配置尚未读取");
     text("page-title", state.view === "messages" ? sourceTitle() || "频道消息" : views[state.view]);
     $("page-channel-avatar").hidden = state.view !== "messages";
     if (state.view === "messages") {

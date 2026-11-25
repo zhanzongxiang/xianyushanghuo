@@ -27,6 +27,7 @@ from .adapters import (LocalCloudStorageAdapter, LocalTelegramAdapter,
 from .config import PipelineConfig
 from .pipeline import run_pipeline
 from .quark_browser import QuarkBrowserStorageAdapter
+from .quark_login import login_and_capture_cookie
 from .quark_cli import QuarkCLIStorageAdapter, validate_quark_cli_settings
 from .quark_api import (FID, QuarkAPIError, QuarkAPIStorageAdapter, QuarkDeletePending,
                         validate_cookie, validate_quark_api_settings)
@@ -84,6 +85,7 @@ class WebState:
                                   "found": 0, "added": 0, "updated": 0}
         self.telegram_topics = {"stage": "idle", "channel": "", "found": 0, "error": ""}
         self.qianniu_shop = {"stage": "idle", "ticket": "", "candidates": [], "error": ""}
+        self.quark_login = {"stage": "idle", "message": "", "saved_at": ""}
         self.lock = threading.Lock()
         # Serialize configuration saves and validated starts without holding the log lock.
         self.control_lock = threading.Lock()
@@ -104,7 +106,7 @@ class WebState:
                     "error": self.error, "channel_scan": scan,
                     "channel_requests_open": self.channel_requests_open,
                     "telegram_channels": telegram_channels, "telegram_topics": dict(self.telegram_topics),
-                    "qianniu_shop": dict(self.qianniu_shop)}
+                    "qianniu_shop": dict(self.qianniu_shop), "quark_login": dict(self.quark_login)}
 
     def take_channel_request(self) -> dict | None:
         with self.lock:
@@ -290,7 +292,8 @@ def validate_browser_settings(payload: dict, require_browser: bool = True) -> No
         find_archive_tester(payload["archive_test_executable_path"])
 
 
-def validate_source_settings(payload: dict, existing: PipelineConfig, *, require_upload: bool = True) -> None:
+def validate_source_settings(payload: dict, existing: PipelineConfig, *, require_upload: bool = True,
+                             require_quark_cookie: bool = True) -> None:
     mode = payload.get("telegram_access_mode", existing.telegram_access_mode)
     if mode != "api":
         raise ValueError("仅支持 Telegram API 获取消息，请先保存 API 配置")
@@ -318,7 +321,8 @@ def validate_source_settings(payload: dict, existing: PipelineConfig, *, require
         raise ValueError("上传方式必须为本地模拟、夸克网页、夸克 CLI / WSL 或夸克 API")
     if "quark_cookie" in payload:
         validate_cookie(payload["quark_cookie"], required=False)
-    validate_quark_api_settings(payload, existing, require_cookie=require_upload and provider == "quark_api")
+    validate_quark_api_settings(payload, existing, require_cookie=require_upload and provider == "quark_api"
+                                and require_quark_cookie)
     validate_naming_settings(payload, existing)
     validate_browser_settings(payload, require_browser=require_upload and provider == "quark_browser")
     if require_upload and provider == "quark_cli":
@@ -950,7 +954,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             payload["data_server_backend"] = "http"
                         if arguments.get("telegram_access_mode", "api") != "api" or arguments.get("telegram_run_mode", "once") != "once":
                             raise ValueError("仅支持 Telegram API 抓取一次")
-                        validate_source_settings({**config_payload(existing), **payload}, existing)
+                        validate_source_settings({**config_payload(existing), **payload}, existing,
+                                                 require_quark_cookie=False)
                         replace(existing, **{key: value for key, value in payload.items()
                                              if (key.startswith("data_server_") or key in QIANNU_TEMPLATE_FIELDS) and
                                              (key not in {"data_server_token", "data_server_db_password"} or value)})
@@ -1278,8 +1283,11 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                                 if config.upload_provider != "quark_api":
                                     raise ValueError("当前上传方式不是夸克 API")
                                 validate_quark_api_settings({}, config)
-                            elif path == "/api/quark-login" and config.upload_provider != "quark_browser":
-                                raise ValueError("当前上传方式不是夸克网页上传")
+                            elif path == "/api/quark-login":
+                                if arguments:
+                                    raise ValueError("夸克登录不接受请求参数")
+                                if config.upload_provider not in {"quark_api", "quark_browser"}:
+                                    raise ValueError("请先选择夸克 API 或夸克网页上传")
                             if path in {"/api/quark-cli-login", "/api/quark-cli-check"} and config.upload_provider != "quark_cli":
                                 raise ValueError("当前上传方式不是夸克 CLI / WSL")
                             if path in {"/api/browser-check", "/api/quark-login"}:
@@ -1429,6 +1437,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                         if path == "/api/qianniu/login":
                             state.qianniu_shop = {"stage": "starting", "ticket": uuid4().hex,
                                                  "base_shop": config.qianniu_shop_name, "candidates": [], "error": ""}
+                        if path == "/api/quark-login" and config.upload_provider == "quark_api":
+                            state.quark_login = {"stage": "opening", "message": "正在打开夸克登录窗口", "saved_at": ""}
                 if registration_error:
                     for request in prepared:
                         try:
@@ -1759,8 +1769,23 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 check_browser(config.quark_browser_profile, config.browser_executable_path)
                 return
             if action == "/api/quark-login":
-                if config.upload_provider != "quark_browser":
-                    raise ValueError("当前上传方式不是夸克网页上传")
+                if config.upload_provider == "quark_api":
+                    def login_status(progress):
+                        with state.lock:
+                            state.quark_login.update(progress)
+
+                    cookie = login_and_capture_cookie(
+                        config.quark_browser_profile, config.browser_executable_path,
+                        stop_event=state.stop_event, on_status=login_status)
+                    with state.control_lock:
+                        if state.stop_event.is_set():
+                            raise DownloadCancelled("夸克登录已取消，原 Cookie 已保留")
+                        write_config(config_path, {"quark_cookie": validate_cookie(cookie)})
+                        transfers.use_config(PipelineConfig.from_json(config_path))
+                        login_status({"stage": "completed", "message": "扫码登录成功，Cookie 已验证并保存到本机",
+                                      "saved_at": utc_now()})
+                    logging.info("夸克扫码登录成功，API Cookie 已保存在本机")
+                    return
                 from .quark_browser import login_and_inspect
                 login_and_inspect(config.quark_folder_url, config.quark_browser_profile, config.browser_executable_path)
                 logging.info("夸克登录流程结束")
@@ -1878,6 +1903,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             for item in candidates:
                 logging.info("%s status=%s share=%s warnings=%s", item.candidate_id, item.status, item.share_url, item.warnings)
         except DownloadCancelled:
+            if action == "/api/quark-login" and config.upload_provider == "quark_api":
+                with state.lock:
+                    state.quark_login.update(stage="cancelled", message="夸克登录已取消，原 Cookie 已保留")
             if action == "/api/qianniu/login":
                 with state.lock:
                     state.qianniu_shop.update(stage="cancelled", candidates=[], error="店铺识别已停止")
@@ -1895,6 +1923,9 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             else:
                 logging.info("任务已停止")
         except Exception as exc:
+            if action == "/api/quark-login" and config.upload_provider == "quark_api":
+                with state.lock:
+                    state.quark_login.update(stage="failed", message="夸克登录未完成，请重试；原 Cookie 已保留")
             if action == "/api/qianniu/login":
                 with state.lock:
                     state.qianniu_shop.update(stage="failed", candidates=[], error=str(exc))

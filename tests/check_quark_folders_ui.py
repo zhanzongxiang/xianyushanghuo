@@ -13,6 +13,7 @@ def check_view(page, fixture, origin, label, unique):
                           quark_api_parent_fid="old", quark_api_folder_path="/原目录")
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.route("**/api/**", fixture.route)
+    page.route("**/api/drafts", lambda route: route.fulfill(json={"drafts": [], "template": {}, "running": False}))
     behavior = {"hold": True, "fail": False}
     long_name = "模型素材" * 25 + "<script>window.unsafeFolder=true</script>"
 

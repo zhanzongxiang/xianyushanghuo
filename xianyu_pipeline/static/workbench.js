@@ -46,7 +46,7 @@
     images: new Map(), brokenImages: new Set(), filters: {}, errors: new Map(), config: null,
     configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false, dataTokenConfigured: false, dataPasswordConfigured: false,
     configDirty: false, formRevision: 0, pending: false, logs: null, workbenchOK: false,
-    lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null,
+    lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null, quarkLoginSavedAt: "",
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
     catalogMode: "grid", resourceId: null, resourceReturnFocus: null, channelViews: new Map(),
     restoredScope: "", restoreCatalogScroll: null, sidebarTopics: new Map(),
@@ -1387,13 +1387,16 @@
     $("channel-add-section").disabled = channelDirectoryBusy();
     $("destination").hidden = state.view !== "upload";
     $("download-settings").hidden = state.view !== "download";
-    for (const id of ["save-config", "telegram-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "browser-check"]) $(id).disabled = isBusy() || !state.configLoaded;
+    for (const id of ["save-config", "telegram-login", "quark-login", "quark-api-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "browser-check"]) $(id).disabled = isBusy() || !state.configLoaded;
     $("telegram-login").disabled = state.pending || !state.configLoaded || !state.workbenchOK || Boolean(state.data?.running);
     $("quark-api-check").hidden = $("upload_provider").value !== "quark_api";
     $("quark-folder-browse").disabled = !state.configLoaded;
     $("quark-login").hidden = $("upload_provider").value !== "quark_browser";
     $("quark-cli-login").hidden = $("upload_provider").value !== "quark_cli";
     $("quark-cli-check").hidden = $("upload_provider").value !== "quark_cli";
+    const quarkLogin = data?.quark_login;
+    text("quark-api-login-status", quarkLogin?.message || (state.quarkConfigured ? "已保存登录凭证" : "尚未登录"));
+    $("quark-api-login-status").setAttribute("aria-busy", String(Boolean(data?.running && data.action === "quark-login")));
     $("config-fields").disabled = !state.configLoaded || state.pending;
     text("nav-download", data ? state.tasks.size : "—");
     text("nav-messages", state.catalog ? state.catalog.messages.length : "—");
@@ -1661,6 +1664,15 @@
           state.browserRefreshPending = false;
           void refreshBrowserInfo();
         }
+        if (data.quark_login?.stage === "completed" && data.quark_login.saved_at) {
+          state.quarkConfigured = true;
+          text("quark-cookie-status", "已保存");
+          if (data.quark_login.saved_at !== state.quarkLoginSavedAt) {
+            state.quarkLoginSavedAt = data.quark_login.saved_at;
+            if (!$("quark_cookie").value.trim() || $("quark_cookie").value === savedHashMask) $("quark_cookie").value = savedHashMask;
+            notice("夸克登录成功，Cookie 已自动保存");
+          }
+        }
       } catch (error) {
         state.workbenchOK = false;
         setError("workbench", `${error.message}${state.data ? "；当前保留上次成功数据。" : ""}`, "workbench");
@@ -1785,7 +1797,6 @@
     if (quark) required.add("browser_executable_path");
     if (quarkAPI) {
       required.add("quark_api_parent_fid");
-      if (!state.quarkConfigured) required.add("quark_cookie");
     }
     const database = $("data_server_backend").value !== "http";
     $("data-db-fields").hidden = !database;
@@ -1799,9 +1810,9 @@
       $(id).required = required.has(id);
       $(id).setAttribute("aria-required", String(required.has(id)));
     }
-    $("browser-path-field").hidden = !quark;
-    $("browser-info").parentElement.hidden = !quark;
-    $("browser-check").hidden = !quark;
+    $("browser-path-field").hidden = !quark && !quarkAPI;
+    $("browser-info").parentElement.hidden = !quark && !quarkAPI;
+    $("browser-check").hidden = !quark && !quarkAPI;
     $("quark-fields").hidden = !quark;
     $("quark-cli-fields").hidden = !quarkCLI;
     $("quark-api-fields").hidden = !quarkAPI;
@@ -2104,14 +2115,14 @@
     const quarkCLI = $("upload_provider").value === "quark_cli";
     const quarkAPI = $("upload_provider").value === "quark_api";
     const cookie = $("quark_cookie").value.trim();
-    if (quarkAPI && !cookie && !state.quarkConfigured) return failField("quark_cookie", "请填写夸克 Cookie");
+    if (quarkAPI && !cookie && !state.quarkConfigured && !["save", "quark-api-login", "browser"].includes(purpose)) return failField("quark_cookie", "请先扫码登录夸克或填写 Cookie");
     if (cookie && cookie !== savedHashMask && (!cookie.includes("=") || /[^\x20-\x7e]/.test(cookie))) return failField("quark_cookie", "请粘贴有效的 Cookie 请求头值");
     if (quarkAPI && !/^[A-Za-z0-9_-]{1,128}$/.test($("quark_api_parent_fid").value.trim())) return failField("quark_api_parent_fid", "请填写有效目录 FID，根目录填 0");
     for (const id of numberFields) {
       const value = Number($(id).value);
       if (!$(id).value || !Number.isInteger(value) || value < Number($(id).min) || value > Number($(id).max)) return failField(id, `请填写 ${$(id).min} 到 ${$(id).max} 的整数：${$(id).closest("label").firstChild.textContent.trim()}`);
     }
-    if ((quark || purpose === "browser" || purpose === "quark") && !$("browser_executable_path").value.trim()) return failField("browser_executable_path", "请填写浏览器程序路径");
+    if ((quark || ["browser", "quark", "quark-api-login"].includes(purpose)) && !$("browser_executable_path").value.trim()) return failField("browser_executable_path", "请填写浏览器程序路径");
     if ((purpose === "quark-cli" || quarkCLI) && !$("quark_cli_executable_path").value.trim()) return failField("quark_cli_executable_path", "请填写夸克 CLI 执行程序或命令");
     if ((purpose === "quark-cli" || quarkCLI) && $("quark_cli_mode").value === "wsl"
         && !$("quark_cli_script_path").value.trim()
@@ -2888,6 +2899,7 @@
     })();
   });
   $("quark-login").addEventListener("click", () => void configuredAction("/api/quark-login", "quark", "已请求打开夸克网页登录"));
+  $("quark-api-login").addEventListener("click", () => void configuredAction("/api/quark-login", "quark-api-login", "请在打开的夸克窗口使用夸克 App 扫码登录"));
   $("quark-cli-login").addEventListener("click", () => void configuredAction("/api/quark-cli-login", "quark-cli", "已请求打开夸克 CLI 登录"));
   $("quark-cli-check").addEventListener("click", () => void configuredAction("/api/quark-cli-check", "quark-cli", "已请求检查夸克 CLI 授权"));
   $("quark-api-check").addEventListener("click", () => void configuredAction("/api/quark-api-check", "quark-api", "已请求检查夸克 API 登录及目标目录"));

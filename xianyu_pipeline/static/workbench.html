@@ -312,7 +312,7 @@
             <section class="form-section"><h2>浏览器与下载</h2><div class="form-grid">
               <label class="wide">下载保存目录<input id="inbox_dir" type="text" placeholder="D:\TelegramDownloads" spellcheck="false" autocomplete="off"><span class="field-hint">更改后仅新下载使用新目录，已有素材保留在原位置。</span></label>
               <label id="browser-path-field" class="wide">浏览器程序路径（Chrome / Edge / Chromium）<input id="browser_executable_path" placeholder="浏览器可执行文件的完整路径" spellcheck="false"></label>
-              <div class="wide browser-info-field"><span>夸克上传浏览器</span><output id="browser-info">尚未读取</output></div>
+              <div class="wide browser-info-field"><span>夸克浏览器</span><output id="browser-info">尚未读取</output></div>
               <label>下载启动 / 无进展等待（秒）<input id="download_start_timeout_seconds" type="number" min="1" max="86400" step="1"></label>
               <label>下载传输时限（秒）<input id="download_transfer_timeout_seconds" type="number" min="1" max="604800" step="1"></label>
               <label>同时下载文件数<input id="download_file_concurrency" type="number" min="1" max="2" step="1"></label>
@@ -327,7 +327,8 @@
               <label class="toggle-field"><span>默认下载后自动上传（分卷除外）</span><input id="auto_upload_after_download" type="checkbox" role="switch"></label>
               <label>分享有效期<select id="quark_share_expire_days"><option value="7">7天（默认）</option><option value="1">1天</option><option value="30">30天</option><option value="0">永久有效</option></select></label>
               <div id="quark-api-fields" class="wide form-grid" hidden>
-                <label class="wide">夸克 Cookie<input id="quark_cookie" type="password" autocomplete="new-password" spellcheck="false" placeholder="__uid=...; __pus=...; __puus=..."><span id="quark-cookie-status" class="field-hint">未配置</span></label>
+                <label class="wide">夸克 Cookie（可扫码获取）<input id="quark_cookie" type="password" autocomplete="new-password" spellcheck="false" placeholder="扫码登录或粘贴 Cookie"><span id="quark-cookie-status" class="field-hint">未配置</span></label>
+                <div class="wide browser-info-field"><button id="quark-api-login" type="button" disabled><i data-lucide="qr-code"></i>夸克扫码登录</button><output id="quark-api-login-status" role="status">尚未登录</output></div>
                 <div class="wide quark-folder-setting"><label>上传目标目录<input id="quark_api_folder_path" type="text" readonly placeholder="根目录"></label><button id="quark-folder-browse" type="button" disabled><i data-lucide="folder-open"></i>选择目录</button></div>
                 <label>目标目录 FID<input id="quark_api_parent_fid" type="text" placeholder="0" spellcheck="false"></label>
                 <label>同时上传文件数<input id="quark_api_file_concurrency" type="number" min="1" max="3" step="1"></label>

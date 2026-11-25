@@ -394,6 +394,10 @@ fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 #tdlib-auth-status, #tdlib-auth-error { overflow-wrap: anywhere; }
 #tdlib-login-methods { flex-wrap: wrap; }
 #tdlib-controls { flex-wrap: wrap; }
+.telegram-auth-dialog { max-height: 92dvh; overflow: auto; }
+#telegram-auth-methods { flex-wrap: wrap; }
+#telegram-auth-status, #telegram-auth-error { overflow-wrap: anywhere; }
+#telegram-auth-expiry { text-align: center; }
 .skip-link { position: fixed; top: -60px; left: 12px; background: #fff; z-index: 100; padding: 10px; }
 .skip-link:focus { top: 8px; }
 .noscript { position: fixed; top: 0; left: 0; right: 0; background: #fff0ee; padding: 20px; }

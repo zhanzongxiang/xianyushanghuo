@@ -182,7 +182,7 @@
     : task.cloud_delete_status === "failed" ? "重试删除云端文件" : "删除云端文件";
   const canRetry = (task) => !task.remote_device && retryable.has(task.download_status);
   const selectedUploadTasks = () => [...state.selected].map((id) => state.tasks.get(id)).filter((task) => task && canUpload(task));
-  const isBusy = () => state.pending || !state.workbenchOK || Boolean(state.data?.running);
+  const isBusy = () => state.pending || !state.workbenchOK || Boolean(state.data?.running) || Boolean(state.data?.telegram_login?.active);
   const channelDirectoryBusy = () => state.pending || !state.workbenchOK
     || Boolean(state.data?.running && ["telegram-channels-scan", "channel-topics-scan"].includes(state.data.action));
   const taskBelongsToPage = () => state.data?.running
@@ -1388,6 +1388,7 @@
     $("destination").hidden = state.view !== "upload";
     $("download-settings").hidden = state.view !== "download";
     for (const id of ["save-config", "telegram-login", "quark-login", "quark-cli-login", "quark-cli-check", "quark-api-check", "browser-check"]) $(id).disabled = isBusy() || !state.configLoaded;
+    $("telegram-login").disabled = state.pending || !state.configLoaded || !state.workbenchOK || Boolean(state.data?.running);
     $("quark-api-check").hidden = $("upload_provider").value !== "quark_api";
     $("quark-folder-browse").disabled = !state.configLoaded;
     $("quark-login").hidden = $("upload_provider").value !== "quark_browser";
@@ -2873,7 +2874,19 @@
     void mutation(async () => { if (await saveConfig()) notice("配置已保存"); });
   });
   $("browser-check").addEventListener("click", () => void configuredAction("/api/browser-check", "browser", "已请求检查浏览器"));
-  $("telegram-login").addEventListener("click", () => void configuredAction("/api/telegram-api-login", "telegram", "已请求打开 Telegram 登录"));
+  window.TelegramLogin.init({ request, post, notice, refresh: refreshAll });
+  $("telegram-login").addEventListener("click", () => {
+    if (state.pending || !state.workbenchOK || state.data?.running || !state.configLoaded || !validate("telegram")) return;
+    void (async () => {
+      state.pending = true;
+      render();
+      try {
+        if (state.configDirty && !await saveConfig()) return;
+        await window.TelegramLogin.open();
+      } catch (error) { setError("action", error.message); }
+      finally { state.pending = false; render(); }
+    })();
+  });
   $("quark-login").addEventListener("click", () => void configuredAction("/api/quark-login", "quark", "已请求打开夸克网页登录"));
   $("quark-cli-login").addEventListener("click", () => void configuredAction("/api/quark-cli-login", "quark-cli", "已请求打开夸克 CLI 登录"));
   $("quark-cli-check").addEventListener("click", () => void configuredAction("/api/quark-cli-check", "quark-cli", "已请求检查夸克 CLI 授权"));

@@ -47,6 +47,7 @@ from .naming import NameTranslator, validate_name, validate_naming_settings
 from .product_drafts import ProductDraftStore, DraftConflict, missing_fields, validate_qianniu_url
 from .qianniu_browser import QianniuDraftAdapter, QianniuSavePending, validate_adapter
 from .qianniu_shop import shop_name
+from .telegram_login import TelegramLogin, TelegramLoginBusy
 
 
 QIANNU_TEMPLATE_FIELDS = {
@@ -351,6 +352,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     config_path = Path(config_path).resolve()
     restore_telegram_settings(config_path)
     state = WebState(config_path)
+    telegram_login = TelegramLogin()
     configure_logging(PipelineConfig.from_json(config_path).output_dir / "logs", MemoryLogHandler(state))
     transfers = TransferStore(PipelineConfig.from_json(config_path))
     drafts = ProductDraftStore(transfers.config.output_dir)
@@ -363,7 +365,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     if initial_config.source_channel_url and (not initial_config.data_server_enabled or not channels.path.exists()):
         channels.ensure(initial_config.source_channel_url)
     server_sync = ServerSync(initial_config, channels, catalog, transfers,
-                             control_lock=state.control_lock, is_busy=lambda: state.running)
+                             control_lock=state.control_lock, is_busy=lambda: state.running or telegram_login.active)
     server_sync.drafts = drafts
     if initial_config.data_server_enabled:
         server_sync.start()
@@ -549,7 +551,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
             elif path == "/api/workbench":
                 self.json_response({**transfers.snapshot(), **{key: value for key, value in state.snapshot().items() if key != "logs"},
                                     "data_sync": server_sync.snapshot(), "cloud_delete_supported": True,
-                                    "record_remove_supported": True})
+                                    "record_remove_supported": True, "telegram_login": telegram_login.status()})
             elif path == "/api/drafts":
                 self.json_response({**drafts.snapshot(), "template": {
                     key: getattr(config, key) for key in QIANNU_TEMPLATE_FIELDS},
@@ -557,6 +559,22 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     "qianniu_shop": state.snapshot()["qianniu_shop"]})
             elif path == "/api/data-sync":
                 self.json_response(server_sync.snapshot())
+            elif path == "/api/telegram-auth/status":
+                self.json_response(telegram_login.status())
+            elif path == "/api/telegram-auth/qr":
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    body = telegram_login.qr_png(query.get("ticket", [""])[0], query.get("v", [""])[0])
+                except ValueError:
+                    self.json_response({"message": "Telegram 登录二维码已失效，请等待自动刷新"}, 404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/api/tdlib/status":
                 from .tdlib_client import status_for_config
                 self.json_response(status_for_config(config))
@@ -590,7 +608,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     self.json_response({"channel": "", "messages": [], "oldest_scanned_id": 0,
                                         "has_more": False, "scanned_at": ""})
             elif path in {"/static/workbench.css", "/static/workbench.js", "/static/lucide.js",
-                          "/static/product-drafts.css", "/static/product-drafts.js"}:
+                          "/static/product-drafts.css", "/static/product-drafts.js", "/static/telegram-login.js"}:
                 asset = Path(__file__).parent / "static" / Path(path).name
                 content_type = "text/css" if asset.suffix == ".css" else "text/javascript"
                 self.file_response(asset, content_type + "; charset=utf-8")
@@ -776,9 +794,36 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                     return
                 self.json_response(result)
                 return
+            if path in {"/api/telegram-api-login", "/api/telegram-auth/auth", "/api/telegram-auth/cancel"}:
+                with state.control_lock:
+                    try:
+                        if path == "/api/telegram-auth/cancel":
+                            if set(arguments) != {"ticket"}:
+                                raise ValueError("Telegram 登录参数无效")
+                            result = telegram_login.cancel(arguments["ticket"])
+                        elif path == "/api/telegram-auth/auth":
+                            if set(arguments) != {"ticket", "field", "value"}:
+                                raise ValueError("Telegram 登录参数无效")
+                            result = telegram_login.submit(arguments["ticket"], arguments["field"], arguments["value"])
+                        else:
+                            if state.running:
+                                raise TelegramLoginBusy("请在当前任务结束后登录 Telegram")
+                            if set(arguments) - {"method"}:
+                                raise ValueError("Telegram 登录参数无效")
+                            config = PipelineConfig.from_json(config_path)
+                            validate_telegram_settings({}, config)
+                            result = telegram_login.start(lambda: api_adapter(config), arguments.get("method", "qr"))
+                    except TelegramLoginBusy as exc:
+                        self.json_response({"message": str(exc)}, 409)
+                        return
+                    except (ValueError, RuntimeError) as exc:
+                        self.json_response({"message": str(exc)}, 400)
+                        return
+                self.json_response(result)
+                return
             if path in {"/api/tdlib/login", "/api/tdlib/auth"}:
                 with state.control_lock:
-                    if state.running:
+                    if state.running or telegram_login.active:
                         self.json_response({"message": "请在当前任务结束后登录 TDLib"}, 409)
                         return
                     try:
@@ -880,8 +925,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 with state.control_lock:
                     with state.lock:
                         busy = state.running
-                    if busy:
-                        self.json_response({"message": "任务运行中，不能修改配置"}, 409)
+                    if busy or telegram_login.active:
+                        self.json_response({"message": "任务或 Telegram 登录进行中，不能修改配置"}, 409)
                         return
                     try:
                         existing = PipelineConfig.from_json(config_path)
@@ -1090,9 +1135,12 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                           "/api/telegram-channels-scan", "/api/channel-topics-scan",
                           "/api/channel-download", "/api/channel-cover", "/api/quark-login", "/api/quark-cli-login",
                           "/api/quark-cli-check", "/api/quark-api-check",
-                          "/api/telegram-api-login", "/api/browser-check",
+                          "/api/browser-check",
                           "/api/drafts/publish", "/api/qianniu/login"}:
                 with state.control_lock:
+                    if telegram_login.active:
+                        self.json_response({"message": "Telegram 正在登录，请完成或关闭登录窗口后再开始任务"}, 409)
+                        return
                     with state.lock:
                         busy = state.running
                         can_enqueue = (state.channel_requests_open and not state.stop_event.is_set()
@@ -1244,7 +1292,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                             if config.telegram_access_mode != "api":
                                 raise ValueError("旧配置使用 Telegram Web，请在设置中保存 API 配置后重试")
                             if path in {"/api/telegram-channels-scan", "/api/channel-topics-scan",
-                                        "/api/telegram-api-login", "/api/retry"}:
+                                        "/api/retry"}:
                                 validate_telegram_settings(config_payload(config), config)
                             else:
                                 validate_source_settings(
@@ -1747,17 +1795,6 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
                 ).check()
                 logging.info("夸克 CLI 检查流程结束")
                 return
-            if action == "/api/telegram-api-login":
-                command = ([sys.executable] if getattr(sys, "frozen", False) else
-                           [sys.executable, str(Path(__file__).resolve().parents[1] / "run_pipeline.py")])
-                command += ["--config", str(config_path), "--telegram-api-login"]
-                logging.info("正在打开 Telegram API 交互登录终端")
-                process = subprocess.Popen(command, cwd=config_path.parent,
-                                           creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0)
-                if process.wait() != 0:
-                    raise RuntimeError("Telegram API 登录未完成，请查看交互终端中的提示")
-                logging.info("Telegram API 登录成功")
-                return
             if action == "/api/telegram-channels-scan":
                 rows = api_adapter(config).list_joined_channels(
                     avatar_dir=config.output_dir / ".channel-avatars")
@@ -1931,6 +1968,7 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
     except KeyboardInterrupt:
         pass
     finally:
+        telegram_login.close()
         server_sync.close()
         from .tdlib_client import close_clients
         close_clients()

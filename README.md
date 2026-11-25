@@ -138,7 +138,7 @@ Copy-Item config\test.example.json config\test.local.json
 .\.venv\Scripts\python.exe run_pipeline.py --config config\test.local.json --web-ui
 ```
 
-本地界面仅使用 Telegram API。填写 API ID/Hash 后点击“首次登录 Telegram”，在新终端完成账号授权。夸克网页上传仍需浏览器程序路径；夸克 CLI/WSL 上传需要在设置页填写 CLI 执行参数并先完成夸克 CLI 授权。API Hash、Telegram 会话和夸克 CLI 授权只保存在本机，不会从界面读取接口返回。旧 Web 模式配置需在设置中保存一次以迁移。
+本地界面仅使用 Telegram API。填写 API ID/Hash 后点击“首次登录 Telegram”，默认在页面弹窗显示二维码，使用已登录的手机 Telegram 扫码确认。二维码到期自动刷新，也可切换到手机号及验证码登录；开启两步验证时在同一弹窗输入密码。授权成功后复用原有本机会话，频道读取和 Telethon 下载无需分别登录。关闭弹窗取消未完成的授权，登录期间暂停新任务和配置修改；命令行 `--telegram-api-login` 仍保留终端登录方式。TDLib 使用单独的“登录 TDLib”入口。夸克网页上传仍需浏览器程序路径；夸克 CLI/WSL 上传需要在设置页填写 CLI 执行参数并先完成夸克 CLI 授权。API Hash、Telegram 会话和夸克 CLI 授权只保存在本机，不会从界面读取接口返回；验证码、密码和二维码令牌不写入配置或日志。旧 Web 模式配置需在设置中保存一次以迁移。
 
 ## TDLib 下载引擎
 

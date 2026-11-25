@@ -47,6 +47,7 @@
     configLoaded: false, apiConfigured: false, apiIdConfigured: false, proxyProtected: false, quarkConfigured: false, dataTokenConfigured: false, dataPasswordConfigured: false,
     configDirty: false, formRevision: 0, pending: false, logs: null, workbenchOK: false,
     lastSync: null, scroll: {}, browserRefreshPending: false, returnFocus: null, quarkLoginSavedAt: "",
+    quarkLoginStarting: false, quarkLoginError: "",
     catalog: null, catalogRows: new Map(), catalogSelection: new Set(), scanRequested: false,
     catalogMode: "grid", resourceId: null, resourceReturnFocus: null, channelViews: new Map(),
     restoredScope: "", restoreCatalogScroll: null, sidebarTopics: new Map(),
@@ -1395,8 +1396,9 @@
     $("quark-cli-login").hidden = $("upload_provider").value !== "quark_cli";
     $("quark-cli-check").hidden = $("upload_provider").value !== "quark_cli";
     const quarkLogin = data?.quark_login;
-    text("quark-api-login-status", quarkLogin?.message || (state.quarkConfigured ? "已保存登录凭证" : "尚未登录"));
-    $("quark-api-login-status").setAttribute("aria-busy", String(Boolean(data?.running && data.action === "quark-login")));
+    text("quark-api-login-status", state.quarkLoginError || (state.quarkLoginStarting
+      ? "正在请求打开夸克登录窗口" : quarkLogin?.message || (state.quarkConfigured ? "已保存登录凭证" : "尚未登录")));
+    $("quark-api-login-status").setAttribute("aria-busy", String(state.quarkLoginStarting || Boolean(data?.running && data.action === "quark-login")));
     $("config-fields").disabled = !state.configLoaded || state.pending;
     text("nav-download", data ? state.tasks.size : "—");
     text("nav-messages", state.catalog ? state.catalog.messages.length : "—");
@@ -2201,6 +2203,39 @@
     });
   }
 
+  async function startQuarkAPILogin() {
+    if (isBusy() || !state.configLoaded) return;
+    state.quarkLoginError = "";
+    if (!$("browser_executable_path").value.trim()) {
+      failField("browser_executable_path", "请填写浏览器程序路径");
+      state.quarkLoginError = "请填写浏览器程序路径";
+      renderHeader();
+      return;
+    }
+    const needsSave = state.configDirty;
+    if (needsSave && !validate("quark-api-login")) {
+      state.quarkLoginError = $("form-error").textContent;
+      renderHeader();
+      return;
+    }
+    state.quarkLoginStarting = true;
+    try {
+      await mutation(async () => {
+        try {
+          if (needsSave && !await saveConfig()) throw new Error("配置已保存，但重新读取失败，请检查本地服务后重试");
+          await post("/api/quark-login");
+          notice("请在打开的夸克窗口使用夸克 App 扫码登录");
+        } catch (error) {
+          state.quarkLoginError = redact(error.message);
+          throw error;
+        }
+      });
+    } finally {
+      state.quarkLoginStarting = false;
+      renderHeader();
+    }
+  }
+
   async function uploadTasks(tasks) {
     if (isBusy() || !tasks.length) return;
     if (state.configDirty) {
@@ -2899,7 +2934,7 @@
     })();
   });
   $("quark-login").addEventListener("click", () => void configuredAction("/api/quark-login", "quark", "已请求打开夸克网页登录"));
-  $("quark-api-login").addEventListener("click", () => void configuredAction("/api/quark-login", "quark-api-login", "请在打开的夸克窗口使用夸克 App 扫码登录"));
+  $("quark-api-login").addEventListener("click", () => void startQuarkAPILogin());
   $("quark-cli-login").addEventListener("click", () => void configuredAction("/api/quark-cli-login", "quark-cli", "已请求打开夸克 CLI 登录"));
   $("quark-cli-check").addEventListener("click", () => void configuredAction("/api/quark-cli-check", "quark-cli", "已请求检查夸克 CLI 授权"));
   $("quark-api-check").addEventListener("click", () => void configuredAction("/api/quark-api-check", "quark-api", "已请求检查夸克 API 登录及目标目录"));

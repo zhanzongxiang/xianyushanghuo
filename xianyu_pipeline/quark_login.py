@@ -32,6 +32,26 @@ def api_cookie_header(cookies: list[dict]) -> str:
     return validate_cookie("; ".join(f"{name}={value}" for name, value in values.items()), required=False)
 
 
+def show_login_window(context, page) -> None:
+    session = None
+    try:
+        session = context.new_cdp_session(page)
+        window = session.send("Browser.getWindowForTarget")
+        if window["bounds"].get("windowState") == "minimized":
+            session.send("Browser.setWindowBounds", {
+                "windowId": window["windowId"], "bounds": {"windowState": "normal"},
+            })
+    except Exception as exc:
+        logging.warning("恢复夸克登录窗口失败，错误类型=%s", type(exc).__name__)
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+    page.bring_to_front()
+
+
 def login_and_capture_cookie(profile_dir: Path, browser_executable_path: str, *,
                              stop_event: Event | None = None, on_status=None,
                              timeout_seconds: float = LOGIN_TIMEOUT) -> str:
@@ -61,6 +81,7 @@ def login_and_capture_cookie(profile_dir: Path, browser_executable_path: str, *,
             try:
                 check_stop()
                 page = context.pages[0] if context.pages else context.new_page()
+                show_login_window(context, page)
                 page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
                 report("waiting", "请在打开的夸克窗口使用夸克 App 扫码登录")
                 while time.monotonic() < deadline:

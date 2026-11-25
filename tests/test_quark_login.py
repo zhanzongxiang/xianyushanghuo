@@ -11,7 +11,7 @@ from xianyu_pipeline import quark_login, web_ui
 from xianyu_pipeline.browser_download import DownloadCancelled
 from xianyu_pipeline.config import PipelineConfig
 from xianyu_pipeline.quark_api import API_URL, QuarkAPIError
-from xianyu_pipeline.quark_login import QuarkLoginError, api_cookie_header, login_and_capture_cookie
+from xianyu_pipeline.quark_login import QuarkLoginError, api_cookie_header, login_and_capture_cookie, show_login_window
 from test_workbench_actions import app
 
 
@@ -36,12 +36,50 @@ def test_cookie_format_errors_do_not_expose_credentials(value):
     assert "PRIVATE" not in str(error.value)
 
 
+@pytest.mark.parametrize("window_state", ["normal", "minimized", "maximized"])
+def test_login_restores_minimized_window_and_activates_page(window_state):
+    calls = []
+
+    class Session:
+        def send(self, method, params=None):
+            calls.append((method, params))
+            return {"windowId": 7, "bounds": {"windowState": window_state}}
+
+        def detach(self):
+            calls.append("detach")
+
+    page = SimpleNamespace(bring_to_front=lambda: calls.append("front"))
+    context = SimpleNamespace(new_cdp_session=lambda target: Session())
+    show_login_window(context, page)
+    assert calls[0] == ("Browser.getWindowForTarget", None)
+    if window_state == "minimized":
+        assert calls[1] == ("Browser.setWindowBounds", {"windowId": 7, "bounds": {"windowState": "normal"}})
+    else:
+        assert len(calls) == 3
+    assert calls[-2:] == ["detach", "front"]
+
+
+def test_window_restore_failure_does_not_block_login_or_expose_error(caplog):
+    calls = []
+
+    def unavailable(page):
+        raise RuntimeError("PRIVATE-COOKIE")
+
+    show_login_window(SimpleNamespace(new_cdp_session=unavailable),
+                      SimpleNamespace(bring_to_front=lambda: calls.append("front")))
+    assert calls == ["front"]
+    assert "PRIVATE" not in caplog.text
+
+
 @pytest.fixture
 def browser(monkeypatch, tmp_path):
     state = SimpleNamespace(now=0.0, stages=[], stop=Event(), cookies=[cookie()], checks=[],
                             closed=False, calls=[], wait=None, verify=None, context_closed=False)
 
     class Page:
+        def bring_to_front(self):
+            state.calls.append("front")
+
         def goto(self, url, **options):
             state.calls.append(("goto", url, options))
 
@@ -55,6 +93,10 @@ def browser(monkeypatch, tmp_path):
 
     class Context:
         pages = [Page()]
+
+        def new_cdp_session(self, page):
+            return SimpleNamespace(send=lambda method: {"windowId": 7, "bounds": {"windowState": "normal"}},
+                                   detach=lambda: None)
 
         def cookies(self, urls):
             assert urls == [API_URL + "file/sort"]
@@ -105,6 +147,7 @@ def test_existing_browser_session_is_verified_and_rotated_cookie_returned(browse
     assert browser.run() == "__pus=PRIVATE-REFRESHED"
     assert browser.checks == ["__pus=PRIVATE-COOKIE"]
     assert browser.context_closed and browser.calls[-1] == "playwright_closed"
+    assert browser.calls[0] == "front" and browser.calls[1][0] == "goto"
     assert [row["stage"] for row in browser.stages] == ["opening", "waiting", "verifying"]
     assert "PRIVATE" not in caplog.text + json.dumps(browser.stages)
 

@@ -14,6 +14,7 @@ def check_login(page, fixture, origin, label, unique):
     page.route("**/api/drafts", lambda route: route.fulfill(json={"drafts": [], "template": {}, "running": False}))
 
     def start(route):
+        assert "正在请求打开" in page.locator("#quark-api-login-status").inner_text()
         starts.append(route.request.post_data_json)
         fixture.workbench.update(running=True, action="quark-login", error="",
                                  task_id=f"fixture-quark-login-{len(starts)}", stop_requested=False)
@@ -29,15 +30,18 @@ def check_login(page, fixture, origin, label, unique):
     assert not page.locator("#quark_cookie").get_attribute("required")
     page.locator("#quark-api-login").click()
     assert "浏览器程序路径" in page.locator("#form-error").inner_text()
+    assert "浏览器程序路径" in page.locator("#quark-api-login-status").inner_text()
     assert not starts
     page.locator("#browser_executable_path").fill(str(BROWSER))
     page.locator("#save-config").click()
     page.wait_for_function("document.getElementById('config-dirty').textContent === ''")
     assert fixture.posts[-1][0] == "/api/config"
     assert "quark_cookie" not in fixture.posts[-1][1]
+    saved_count = len(fixture.posts)
     page.locator("#quark-api-login").click()
     page.wait_for_function("document.getElementById('quark-api-login-status').textContent.includes('扫码登录')")
     assert starts == [{}]
+    assert len(fixture.posts) == saved_count, "Login with saved settings must not rewrite the full config"
     assert page.locator("#quark-api-login").is_disabled()
     assert page.locator("#save-config").is_disabled()
     assert page.locator("#stop").is_visible()
@@ -77,9 +81,23 @@ def check_login(page, fixture, origin, label, unique):
     fixture.workbench["quark_login"].update(stage="failed", message="夸克登录未完成，请重试；原 Cookie 已保留")
     refresh(page, fixture)
     assert "重试" in page.locator("#quark-api-login-status").inner_text()
+
+    page.locator("#quark_api_timeout_seconds").fill("0")
+    page.locator("#quark-api-login").click()
+    assert page.locator("#quark-api-login-status").inner_text() == page.locator("#form-error").inner_text()
+    assert "整数" in page.locator("#quark-api-login-status").inner_text()
+    assert len(starts) == 2
+    page.locator("#quark_api_timeout_seconds").fill("60")
+
+    page.unroute("**/api/quark-login", start)
+    page.route("**/api/quark-login", lambda route: route.fulfill(status=400, json={"error": "浏览器程序不存在"}))
+    page.locator("#quark-api-login").click()
+    page.wait_for_function("document.getElementById('quark-api-login-status').textContent.includes('浏览器程序不存在')")
+    assert page.locator("#quark-api-login").is_enabled()
+    assert page.locator("#quark-api-login-status").get_attribute("aria-busy") == "false"
     assert all(path in {"/api/config", "/api/stop"} for path, _ in fixture.posts)
     assert not errors, errors
-    print(f"{label}: first login, browser path, status, masking, unsaved edits, cancel and retry PASS")
+    print(f"{label}: login feedback, saved config, validation and API errors, masking, unsaved edits, cancel and retry PASS")
 
 
 if __name__ == "__main__":

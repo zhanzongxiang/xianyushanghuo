@@ -27,7 +27,7 @@ from .adapters import (LocalCloudStorageAdapter, LocalTelegramAdapter,
 from .config import PipelineConfig
 from .pipeline import run_pipeline
 from .quark_browser import QuarkBrowserStorageAdapter
-from .quark_login import login_and_capture_cookie
+from .quark_login import QuarkLoginError, login_and_capture_cookie
 from .quark_cli import QuarkCLIStorageAdapter, validate_quark_cli_settings
 from .quark_api import (FID, QuarkAPIError, QuarkAPIStorageAdapter, QuarkDeletePending,
                         validate_cookie, validate_quark_api_settings)
@@ -1925,7 +1925,8 @@ def start_web_ui(config_path: str | Path, host: str = "127.0.0.1", port: int = 8
         except Exception as exc:
             if action == "/api/quark-login" and config.upload_provider == "quark_api":
                 with state.lock:
-                    state.quark_login.update(stage="failed", message="夸克登录未完成，请重试；原 Cookie 已保留")
+                    state.quark_login.update(stage="failed", message=(str(exc) if isinstance(exc, QuarkLoginError)
+                        else "夸克登录未完成，请重试；原 Cookie 已保留"))
             if action == "/api/qianniu/login":
                 with state.lock:
                     state.qianniu_shop.update(stage="failed", candidates=[], error=str(exc))

@@ -82,6 +82,8 @@ def browser(monkeypatch, tmp_path):
 
         def goto(self, url, **options):
             state.calls.append(("goto", url, options))
+            if getattr(state, "goto", None):
+                state.goto()
 
         def is_closed(self):
             return state.closed
@@ -104,6 +106,7 @@ def browser(monkeypatch, tmp_path):
 
         def close(self):
             state.context_closed = True
+            state.closed = True
 
     context = Context()
 
@@ -148,7 +151,7 @@ def test_existing_browser_session_is_verified_and_rotated_cookie_returned(browse
     assert browser.checks == ["__pus=PRIVATE-COOKIE"]
     assert browser.context_closed and browser.calls[-1] == "playwright_closed"
     assert browser.calls[0] == "front" and browser.calls[1][0] == "goto"
-    assert [row["stage"] for row in browser.stages] == ["opening", "waiting", "verifying"]
+    assert [row["stage"] for row in browser.stages] == ["opening", "navigating", "waiting", "verifying"]
     assert "PRIVATE" not in caplog.text + json.dumps(browser.stages)
 
 
@@ -205,6 +208,37 @@ def test_browser_error_is_sanitized_and_context_released(browser, caplog):
     with pytest.raises(QuarkLoginError) as error:
         browser.run()
     assert browser.context_closed
+    assert "PRIVATE" not in str(error.value) + caplog.text + json.dumps(browser.stages)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "network", "closed"])
+def test_navigation_failure_is_not_cancelled_by_cleanup(browser, caplog, failure):
+    def fail_navigation():
+        if failure == "closed":
+            browser.closed = True
+        error = playwright.sync_api.TimeoutError if failure == "timeout" else playwright.sync_api.Error
+        raise error("PRIVATE-COOKIE")
+
+    browser.goto = fail_navigation
+    with pytest.raises(QuarkLoginError) as error:
+        browser.run()
+    expected = {"timeout": "加载超时", "network": "加载失败", "closed": "意外关闭"}[failure]
+    assert expected in str(error.value)
+    assert browser.context_closed and browser.closed
+    assert not browser.checks
+    assert "阶段=navigating" in caplog.text
+    assert "PRIVATE" not in str(error.value) + caplog.text + json.dumps(browser.stages)
+
+
+def test_launch_failure_reports_executable_problem_without_exposing_error(browser, monkeypatch, caplog):
+    def fail_launch(*args, **kwargs):
+        raise RuntimeError("PRIVATE-COOKIE")
+
+    monkeypatch.setattr(quark_login, "launch_browser_context", fail_launch)
+    with pytest.raises(QuarkLoginError, match="Chrome / Edge 主程序") as error:
+        browser.run()
+    assert not browser.context_closed
+    assert "阶段=opening" in caplog.text
     assert "PRIVATE" not in str(error.value) + caplog.text + json.dumps(browser.stages)
 
 
@@ -268,6 +302,8 @@ def test_failed_or_cancelled_login_keeps_previous_cookie(app, monkeypatch, outco
     app.run()
     assert app.config_path.read_bytes() == before
     assert app.state.quark_login["stage"] == ("failed" if outcome == "failed" else "cancelled")
+    if outcome == "failed":
+        assert app.state.quark_login["message"] == "验证未通过"
 
 
 def test_login_checks_browser_and_rejects_unexpected_parameters(app):

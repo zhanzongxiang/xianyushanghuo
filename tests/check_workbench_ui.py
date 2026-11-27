@@ -435,7 +435,7 @@ def exercise_browser(args, root, config_path, original, tasks, api, budget):
             page.locator("#upload_provider").select_option("quark_api")
             require(page.locator("#quark-api-fields").is_visible(), "Quark API settings did not appear")
             require(not page.locator("#quark-cli-fields").is_visible(), "Unselected CLI settings remained visible")
-            require(not page.locator("#browser-path-field").is_visible(), "API mode requires a browser")
+            require(page.locator("#browser-path-field").is_visible(), "Quark API QR login browser path field missing")
             require(page.locator("#quark-api-check").is_visible(), "Quark API check action missing")
             page.locator("#quark_cookie").fill("__uid=offline-fixture; __pus=offline-fake-cookie")
             page.locator("#quark_api_parent_fid").fill("fixture-folder")

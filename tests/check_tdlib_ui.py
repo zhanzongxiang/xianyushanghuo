@@ -14,6 +14,7 @@ def check_tdlib(page, fixture, origin, label, unique):
     fail_login, fail_save, fail_status = True, True, False
     page.on("pageerror", lambda error: errors.append(str(error)))
     page.route("**/api/**", fixture.route)
+    page.route("**/api/drafts", lambda route: route.fulfill(json={"drafts": [], "template": {}, "running": False}))
 
     def route(request):
         path = request.request.url.split("?", 1)[0].split(origin)[-1]

@@ -56,19 +56,23 @@ def login_and_capture_cookie(profile_dir: Path, browser_executable_path: str, *,
                              stop_event: Event | None = None, on_status=None,
                              timeout_seconds: float = LOGIN_TIMEOUT) -> str:
     stop = stop_event if stop_event is not None else Event()
+    current_stage = "opening"
+    window_closed_before_cleanup = False
 
     def check_stop():
         if stop.is_set():
             raise DownloadCancelled("夸克登录已取消，原 Cookie 已保留")
 
     def report(stage, message):
+        nonlocal current_stage
+        current_stage = stage
         if on_status is not None:
             on_status({"stage": stage, "message": message})
 
     check_stop()
     report("opening", "正在打开夸克登录窗口")
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import TimeoutError as BrowserTimeoutError, sync_playwright
     except ImportError:
         raise QuarkLoginError("缺少 Playwright，请安装 requirements.txt 后重试") from None
 
@@ -82,6 +86,7 @@ def login_and_capture_cookie(profile_dir: Path, browser_executable_path: str, *,
                 check_stop()
                 page = context.pages[0] if context.pages else context.new_page()
                 show_login_window(context, page)
+                report("navigating", "正在加载夸克登录页面")
                 page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
                 report("waiting", "请在打开的夸克窗口使用夸克 App 扫码登录")
                 while time.monotonic() < deadline:
@@ -103,13 +108,29 @@ def login_and_capture_cookie(profile_dir: Path, browser_executable_path: str, *,
                             return validate_cookie(api.cookie)
                     page.wait_for_timeout(500)
                 raise QuarkLoginError("夸克登录等待超时或 API 验证未通过，请重新扫码；原 Cookie 已保留")
+            except Exception:
+                # Capture this before our own cleanup closes an otherwise healthy page.
+                window_closed_before_cleanup = "page" in locals() and page.is_closed()
+                raise
             finally:
                 context.close()
     except (DownloadCancelled, QuarkLoginError):
         raise
     except Exception as exc:
         # Browser/HTTP errors can carry headers or tokens; never expose their text.
-        logging.warning("夸克扫码登录失败，错误类型=%s", type(exc).__name__)
-        if stop.is_set() or ("page" in locals() and page.is_closed()):
+        logging.warning("夸克扫码登录失败，阶段=%s；错误类型=%s", current_stage, type(exc).__name__)
+        if stop.is_set():
             raise DownloadCancelled("夸克登录已取消，原 Cookie 已保留") from None
-        raise QuarkLoginError("夸克登录窗口异常，请检查浏览器路径和网络后重试；原 Cookie 已保留") from None
+        if window_closed_before_cleanup:
+            if current_stage in {"waiting", "verifying"}:
+                raise DownloadCancelled("夸克登录窗口已关闭，原 Cookie 已保留") from None
+            message = "浏览器在加载夸克登录页前意外关闭，请确认所选 EXE 是 Chrome / Edge 主程序，并检查 Chromium 诊断日志"
+        elif current_stage == "opening":
+            message = "浏览器启动失败，请确认所选 EXE 是 Chrome / Edge 主程序，并检查浏览器权限和 Chromium 诊断日志"
+        elif current_stage == "navigating" and isinstance(exc, BrowserTimeoutError):
+            message = "夸克登录页加载超时（30 秒），请检查这台电脑能否正常打开 pan.quark.cn"
+        elif current_stage == "navigating":
+            message = "夸克登录页加载失败，请检查这台电脑的网络连接及 Chromium 诊断日志"
+        else:
+            message = "夸克登录验证异常，请检查网络连接后重试"
+        raise QuarkLoginError(f"{message}；错误类型={type(exc).__name__}；原 Cookie 已保留") from None
